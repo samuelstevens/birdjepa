@@ -19,6 +19,7 @@ dependencies = [
     "timm>=1.0.22",
     "torch>=2.9.1",
     "torchaudio>=2.9.1",
+    "torchcodec>=0.9.1",
     "torchvision>=0.24.1",
     "tqdm>=4.67.0",
     "tyro>=1.0.2",

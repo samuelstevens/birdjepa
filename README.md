@@ -15,3 +15,7 @@ MAE reconstructs raw spectrograms, forcing the model to predict irrelevant low-l
 - [LeJEPA](https://arxiv.org/abs/2511.08544): Provable and scalable JEPA training via SIGReg (sketched isotropic Gaussian regularization)
 - [SongMAE](https://openreview.net/forum?id=8mluzLyvyV): Masked autoencoder for birdsong with 2ms patches enabling syllable-level analysis
 - [Bird-MAE](https://arxiv.org/abs/2504.12880): Domain-specialized MAE pretrained on BirdSet for bird sound classification
+
+## Installing
+
+On OSC, we need ffmpeg, which can be loaded with `module load ffmpeg/6.1.1`.

@@ -51,6 +51,7 @@ def launch_benchmark(cfg: tp.Annotated[benchmark.Config, tyro.conf.arg(name="")]
             cpus_per_task=4,
             stderr_to_stdout=True,
             account=cfg.slurm_acct,
+            setup=["module load ffmpeg/6.1.1"],
         )
         job = executor.submit(benchmark.worker_fn, cfg)
         logger.info("Submitted job %s.", job.job_id)
