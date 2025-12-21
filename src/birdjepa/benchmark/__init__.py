@@ -2,10 +2,11 @@
 Benchmark package for evaluating audio backbones on BirdSet tasks.
 
 Tasks: pow, per, nes, uhh, hsn, nbp, ssw, sne
-Classifiers: linear, prototypical
+Classifiers: linear, mlp, centroid
 """
 
 import dataclasses
+import importlib.util
 import logging
 import pathlib
 
@@ -20,12 +21,13 @@ import torch.utils.data
 from jaxtyping import Float
 from torch import Tensor
 
-from . import registry
+from . import registry, reporting
 from .. import helpers
 
 logger = logging.getLogger("benchmark")
 
 
+@jaxtyping.jaxtyped(typechecker=beartype.beartype)
 class AsymmetricLoss(torch.nn.Module):
     """Asymmetric loss for multi-label classification.
 
@@ -46,7 +48,6 @@ class AsymmetricLoss(torch.nn.Module):
         self.clip = clip
         self.eps = eps
 
-    @jaxtyping.jaxtyped(typechecker=beartype.beartype)
     def forward(
         self, logits: Float[Tensor, "b c"], targets: Float[Tensor, "b c"]
     ) -> Float[Tensor, ""]:
@@ -72,18 +73,37 @@ class AsymmetricLoss(torch.nn.Module):
         return -loss.mean()
 
 
+# BirdSet uses this column name for multi-label class indices
+BIRDSET_LABEL_COL = "ebird_code_multilabel"
+
+
 @beartype.beartype
-def sample_per_class(dataset, n_per_class: int, seed: int = 42):
+def sample_per_class(
+    dataset: datasets.Dataset,
+    n_per_class: int,
+    label_col: str = BIRDSET_LABEL_COL,
+    seed: int = 42,
+) -> datasets.Dataset:
     """Sample up to n_per_class examples for each class, return their union.
 
     For multi-label data, a sample can belong to multiple classes. We iterate through each class, find all samples containing that class, and randomly select up to n_per_class of them. The final dataset is the union of all selected indices.
+
+    Args:
+        dataset: HuggingFace dataset with a multi-label column.
+        n_per_class: Max samples to select per class.
+        label_col: Column containing list of class indices per example.
+        seed: Random seed for reproducibility.
     """
+    assert label_col in dataset.features, (
+        f"'{label_col}' not in {list(dataset.features)}"
+    )
+
     rng = np.random.default_rng(seed)
-    n_classes = len(dataset.features["ebird_code_multilabel"].feature.names)
-    selected = set()
+    n_classes = len(dataset.features[label_col].feature.names)
+    selected: set[int] = set()
 
     # Build index: for each class, which samples contain it?
-    labels = dataset["ebird_code_multilabel"]
+    labels = dataset[label_col]
     class_to_samples: dict[int, list[int]] = {c: [] for c in range(n_classes)}
     for i, label in enumerate(labels):
         for c in label:
@@ -107,6 +127,7 @@ def sample_per_class(dataset, n_per_class: int, seed: int = 42):
     return dataset.select(indices)
 
 
+@beartype.beartype
 @dataclasses.dataclass(frozen=True)
 class Config:
     """Benchmark configuration."""
@@ -118,7 +139,7 @@ class Config:
     model_ckpt: str = "Bird-MAE-Base"
     """Model checkpoint."""
     classifier: str = "linear"
-    """Classifier: linear, prototypical."""
+    """Classifier: linear, mlp, centroid."""
     n_train: int = -1
     """Number of training samples per class. -1 for all."""
     # Training
@@ -133,7 +154,11 @@ class Config:
     # Paths
     report_to: pathlib.Path = pathlib.Path("./results")
     """Directory for results database."""
-    # Slurm
+    # Execution
+    sweep: str = ""
+    """Sweep file path, e.g. 'sweeps/hsn_classifiers.py'. Runs make_cfgs()."""
+    dry_run: bool = True
+    """If True, only print what would run. Use --no-dry-run to execute."""
     slurm_acct: str = ""
     """Slurm account string. Empty means run locally."""
     slurm_partition: str = ""
@@ -145,20 +170,27 @@ class Config:
 
 
 @beartype.beartype
-def worker_fn(cfg: Config):
-    """Run a single benchmark experiment."""
+def make_exp_key(cfg: Config) -> reporting.ExpKey:
+    """Create an ExpKey from a Config."""
+    return reporting.ExpKey(
+        task_name=cfg.task,
+        model_org=cfg.model_org,
+        model_ckpt=cfg.model_ckpt,
+        clf=cfg.classifier,
+        n_train=cfg.n_train,
+    )
+
+
+@beartype.beartype
+def worker_fn(cfg: Config) -> reporting.Report:
+    """Run a single benchmark experiment. Returns the Report (caller writes to DB)."""
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
     )
-    logger.info(
-        "Benchmarking task=%s model=%s/%s classifier=%s n_train=%d",
-        cfg.task,
-        cfg.model_org,
-        cfg.model_ckpt,
-        cfg.classifier,
-        cfg.n_train,
-    )
+
+    key = make_exp_key(cfg)
+    logger.info("Benchmarking %s", key)
 
     # 1. Load backbone
     backbone = registry.load(cfg.model_org, cfg.model_ckpt)
@@ -176,8 +208,7 @@ def worker_fn(cfg: Config):
     if cfg.n_train > 0:
         train_ds = sample_per_class(train_ds, cfg.n_train)
 
-    # Get number of classes from the dataset
-    n_classes = len(train_ds.features["ebird_code_multilabel"].feature.names)
+    n_classes = len(train_ds.features[BIRDSET_LABEL_COL].feature.names)
     logger.info(
         "Task %s: %d train, %d test, %d classes",
         cfg.task,
@@ -188,65 +219,249 @@ def worker_fn(cfg: Config):
 
     # 3. Extract features
     logger.info("Extracting train features...")
-    train_features, train_labels = extract_features(
+    train = extract_features(
         backbone, transform, train_ds, cfg.device, cfg.batch_size, n_classes
     )
 
     logger.info("Extracting test features...")
-    test_features, test_labels = extract_features(
+    test = extract_features(
         backbone, transform, test_ds, cfg.device, cfg.batch_size, n_classes
     )
 
     # 4. Train classifier
+    logger.info("Training %s probe...", cfg.classifier)
     if cfg.classifier == "linear":
-        logger.info("Training linear probe...")
-        probe = train_linear_probe(train_features, train_labels, n_classes, cfg)
+        probe = train_linear_probe(train.features, train.labels, n_classes, cfg)
+    elif cfg.classifier == "mlp":
+        probe = train_mlp_probe(train.features, train.labels, n_classes, cfg)
+    elif cfg.classifier == "centroid":
+        probe = train_centroid_probe(train.features, train.labels, n_classes, cfg)
     else:
         raise NotImplementedError(f"Classifier '{cfg.classifier}' not implemented")
 
     # 5. Evaluate
     logger.info("Evaluating...")
-    metrics = evaluate(probe, test_features, test_labels, cfg.device)
-    logger.info("Results: cmAP=%.4f", metrics["cmAP"])
+    cmap, n_classes_eval, predictions = evaluate(probe, test, cfg.device)
+    logger.info("Results: cmAP=%.4f", cmap)
 
-    return metrics
+    # 6. Build report
+    exp_cfg = dataclasses.asdict(cfg)
+    for k, v in exp_cfg.items():
+        if isinstance(v, pathlib.Path):
+            exp_cfg[k] = str(v)
+
+    return reporting.Report(
+        key=key,
+        cmap=cmap,
+        n_classes=n_classes_eval,
+        predictions=predictions,
+        exp_cfg=exp_cfg,
+    )
+
+
+@beartype.beartype
+def get_skip_reason(db, cfg: Config) -> str | None:
+    """Return a reason to skip this experiment, or None if it should run."""
+    key = make_exp_key(cfg)
+    if reporting.already_ran(db, key):
+        return "done"
+    if reporting.is_claimed(db, key):
+        return "claimed"
+    return None
+
+
+@beartype.beartype
+def load_sweep_cfgs(sweep_fpath: str) -> list[dict]:
+    """Load a sweep file and return make_cfgs() result."""
+    spec = importlib.util.spec_from_file_location("sweep", sweep_fpath)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.make_cfgs()
+
+
+@beartype.beartype
+def print_results_table(db, cfgs: list[Config]):
+    """Print a table of results for the given configs."""
+    # Get dimensions from configs
+    tasks = sorted({c.task for c in cfgs})
+    clfs = sorted({c.classifier for c in cfgs})
+    n_trains = sorted({c.n_train for c in cfgs})
+    models = sorted({c.model_ckpt for c in cfgs})
+
+    # Query results
+    query = "SELECT task_name, model_ckpt, clf, n_train, cmap FROM experiments"
+    rows = db.execute(query).fetchall()
+    results: dict[tuple[str, str, str, int], float] = {}
+    for task_name, model_ckpt, clf, n_train, cmap in rows:
+        results[(task_name, model_ckpt, clf, n_train)] = cmap
+
+    # Print table for each model
+    for model in models:
+        print(f"\n=== {model} ===")
+        # Header
+        header = ["clf", "n"] + tasks
+        print(" | ".join(f"{h:>10}" for h in header))
+        print("-" * (12 * len(header)))
+        # Rows: clf × n_train
+        for clf in clfs:
+            for n_train in n_trains:
+                n_str = "all" if n_train == -1 else str(n_train)
+                row = [clf, n_str]
+                for task in tasks:
+                    key = (task, model, clf, n_train)
+                    if key in results:
+                        row.append(f"{results[key]:.4f}")
+                    else:
+                        row.append("-")
+                print(" | ".join(f"{v:>10}" for v in row))
+
+
+@beartype.beartype
+def cli(cfg: Config):
+    """CLI entrypoint: check DB, then run locally or submit to Slurm."""
+    log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_format)
+
+    db = reporting.get_db(cfg.report_to)
+
+    # Clear stale claims
+    cleared = reporting.clear_stale_claims(db, max_age_hours=24 * 5)
+    if cleared:
+        logger.info("Cleared %d stale claims.", cleared)
+
+    # Collect all configs to run
+    if cfg.sweep:
+        sweep_cfgs = load_sweep_cfgs(cfg.sweep)
+        logger.info("Loaded %d configs from %s", len(sweep_cfgs), cfg.sweep)
+        cfgs = [dataclasses.replace(cfg, sweep="", **s) for s in sweep_cfgs]
+    else:
+        cfgs = [cfg]
+
+    # Dry run: show table and what would run
+    if cfg.dry_run:
+        print_results_table(db, cfgs)
+        print("\nWould run:")
+        for c in cfgs:
+            key = make_exp_key(c)
+            reason = get_skip_reason(db, c)
+            if reason:
+                print(f"  [skip: {reason}] {key}")
+            else:
+                print(f"  [pending] {key}")
+        return
+
+    # Filter to configs that should actually run
+    to_run: list[Config] = []
+    for c in cfgs:
+        key = make_exp_key(c)
+        reason = get_skip_reason(db, c)
+        if reason:
+            logger.info("Skipping %s: %s", key, reason)
+            continue
+        if not reporting.claim_run(db, key):
+            logger.info("Run %s just claimed by another worker, skipping.", key)
+            continue
+        to_run.append(c)
+
+    if not to_run:
+        return
+
+    if cfg.slurm_acct:
+        import submitit
+
+        executor = submitit.SlurmExecutor(folder=cfg.log_to)
+        executor.update_parameters(
+            time=int(cfg.n_hours * 60),
+            partition=cfg.slurm_partition,
+            gpus_per_node=1,
+            ntasks_per_node=1,
+            cpus_per_task=4,
+            stderr_to_stdout=True,
+            account=cfg.slurm_acct,
+            setup=["module load ffmpeg/6.1.1"],
+        )
+
+        # Batch submit all jobs
+        with executor.batch():
+            jobs = [executor.submit(worker_fn, c) for c in to_run]
+
+        for job, c in zip(jobs, to_run):
+            logger.info("Submitted job %s for %s", job.job_id, make_exp_key(c))
+
+        # Wait for all results and write to DB
+        for job, c in zip(jobs, to_run):
+            key = make_exp_key(c)
+            try:
+                report = job.result()
+                report.write(db)
+                logger.info("Finished %s: cmAP=%.4f", key, report.cmap)
+            finally:
+                reporting.release_run(db, key)
+    else:
+        # Run locally (sequentially)
+        for c in to_run:
+            key = make_exp_key(c)
+            try:
+                report = worker_fn(c)
+                report.write(db)
+                logger.info("Finished %s: cmAP=%.4f", key, report.cmap)
+            finally:
+                reporting.release_run(db, key)
+
+
+@jaxtyping.jaxtyped(typechecker=beartype.beartype)
+@dataclasses.dataclass
+class ExtractedFeatures:
+    """Features extracted from a dataset."""
+
+    features: Float[Tensor, "n d"]
+    labels: Float[Tensor, "n c"]
+    ids: list[str]
+
+    def __post_init__(self):
+        assert len(self.ids) == len(self.features), (
+            f"{len(self.ids)} != {len(self.features)}"
+        )
 
 
 @jaxtyping.jaxtyped(typechecker=beartype.beartype)
 @torch.inference_mode()
 def extract_features(
     backbone, transform, dataset, device: str, batch_size: int, n_classes: int
-) -> tuple[Float[Tensor, "n d"], Float[Tensor, "n c"]]:
+) -> ExtractedFeatures:
     """Extract features from a dataset using the backbone."""
     all_features = []
     all_labels = []
+    all_ids = []
 
     batches = range(0, len(dataset), batch_size)
     for i in helpers.progress(batches, every=10, desc="extract"):
         batch = dataset[i : i + batch_size]
 
-        # Transform audio to spectrograms
         specs = []
         for audio in batch["audio"]:
-            waveform = audio["array"]
-            spec = transform(waveform)
+            spec = transform(audio["array"])
             specs.append(spec)
 
         specs = torch.stack(specs).to(device)
         encoded = backbone.audio_encode(specs)
         all_features.append(encoded.features.cpu())
 
-        # Multi-label: convert list of class indices to binary vector
-        batch_labels = batch["ebird_code_multilabel"]
+        batch_labels = batch[BIRDSET_LABEL_COL]
         labels = torch.zeros(len(batch_labels), n_classes, dtype=torch.float32)
         for j, class_indices in enumerate(batch_labels):
             for c in class_indices:
                 labels[j, c] = 1.0
         all_labels.append(labels)
 
-    features = torch.cat(all_features, dim=0)
-    labels = torch.cat(all_labels, dim=0)
-    return features, labels
+        all_ids.extend(batch["filepath"])
+
+    return ExtractedFeatures(
+        features=torch.cat(all_features, dim=0),
+        labels=torch.cat(all_labels, dim=0),
+        ids=all_ids,
+    )
 
 
 @jaxtyping.jaxtyped(typechecker=beartype.beartype)
@@ -268,8 +483,9 @@ def train_linear_probe(
 
     # Mini-batch training with DataLoader
     dataset = torch.utils.data.TensorDataset(features, labels)
+    batch_size = min(cfg.batch_size, len(features))
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=cfg.batch_size, shuffle=True, drop_last=True
+        dataset, batch_size=batch_size, shuffle=True, drop_last=False
     )
 
     # AdamW with Bird-MAE's hyperparameters
@@ -307,26 +523,137 @@ def train_linear_probe(
 
 
 @jaxtyping.jaxtyped(typechecker=beartype.beartype)
-@torch.inference_mode()
-def evaluate(
-    probe,
+def train_mlp_probe(
     features: Float[Tensor, "n d"],
     labels: Float[Tensor, "n c"],
-    device: str,
-) -> dict:
-    """Evaluate and compute cmAP (class mean average precision)."""
+    n_classes: int,
+    cfg: Config,
+):
+    """Train a 2-layer MLP probe (like DINOv3 task heads).
+
+    Architecture: LayerNorm -> Linear -> GELU -> Dropout -> Linear
+    """
+    dim = features.shape[1]
+    hidden_dim = dim * 2
+    probe = torch.nn.Sequential(
+        torch.nn.LayerNorm(dim),
+        torch.nn.Linear(dim, hidden_dim),
+        torch.nn.GELU(),
+        torch.nn.Dropout(0.1),
+        torch.nn.Linear(hidden_dim, n_classes),
+    )
+    probe = probe.to(cfg.device)
+
+    dataset = torch.utils.data.TensorDataset(features, labels)
+    batch_size = min(cfg.batch_size, len(features))
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, drop_last=False
+    )
+
+    optimizer = torch.optim.AdamW(
+        probe.parameters(), lr=4e-4, weight_decay=3e-4, betas=(0.9, 0.95)
+    )
+    n_epochs = 30
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    criterion = AsymmetricLoss()
+
+    for epoch in range(n_epochs):
+        probe.train()
+        total_loss = 0.0
+        for x, y in loader:
+            x, y = x.to(cfg.device), y.to(cfg.device)
+            logits = probe(x)
+            loss = criterion(logits, y)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(probe.parameters(), max_norm=2.0)
+            optimizer.step()
+            total_loss += loss.item()
+        scheduler.step()
+        if (epoch + 1) % 5 == 0:
+            avg_loss = total_loss / len(loader)
+            logger.info(
+                "Epoch %d: loss=%.4f lr=%.2e",
+                epoch + 1,
+                avg_loss,
+                scheduler.get_last_lr()[0],
+            )
+
+    return probe
+
+
+@jaxtyping.jaxtyped(typechecker=beartype.beartype)
+class CentroidClassifier(torch.nn.Module):
+    """Multi-label nearest-centroid classifier using cosine similarity.
+
+    Like SimpleShot but adapted for multi-label: computes per-class centroids and classifies by cosine similarity independently for each class.
+    """
+
+    def __init__(self, centroids: Float[Tensor, "c d"]):
+        super().__init__()
+        self.register_buffer("centroids", centroids)
+
+    def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b c"]:
+        # L2 normalize
+        x_norm = x / x.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        c_norm = self.centroids / self.centroids.norm(dim=1, keepdim=True).clamp(
+            min=1e-8
+        )
+        # Cosine similarity as logits (scale by temperature)
+        return x_norm @ c_norm.T * 10.0  # temperature=0.1 -> scale by 10
+
+
+@jaxtyping.jaxtyped(typechecker=beartype.beartype)
+def train_centroid_probe(
+    features: Float[Tensor, "n d"],
+    labels: Float[Tensor, "n c"],
+    n_classes: int,
+    cfg: Config,
+) -> CentroidClassifier:
+    """Build a centroid classifier by computing per-class means.
+
+    For multi-label, each class centroid is the mean of all examples containing that class.
+    """
+    dim = features.shape[1]
+    centroids = torch.zeros(n_classes, dim)
+
+    for c in range(n_classes):
+        mask = labels[:, c] > 0
+        if mask.sum() > 0:
+            centroids[c] = features[mask].mean(dim=0)
+        else:
+            logger.warning("Class %d has no positive examples, using zero centroid.", c)
+
+    return CentroidClassifier(centroids).to(cfg.device)
+
+
+@jaxtyping.jaxtyped(typechecker=beartype.beartype)
+@torch.inference_mode()
+def evaluate(
+    probe, test: ExtractedFeatures, device: str
+) -> tuple[float, int, list[reporting.Prediction]]:
+    """Evaluate and return cmAP along with per-example predictions."""
     probe.eval()
-    features = features.to(device)
+    features = test.features.to(device)
     logits = probe(features)
     probs = torch.sigmoid(logits).cpu().numpy()
-    labels = labels.numpy()
+    labels = test.labels.numpy()
 
     # cmAP: average AP across classes
     aps = []
     for c in range(labels.shape[1]):
-        if labels[:, c].sum() > 0:  # skip classes with no positive samples
+        if labels[:, c].sum() > 0:
             ap = sklearn.metrics.average_precision_score(labels[:, c], probs[:, c])
             aps.append(ap)
 
-    cmAP = np.mean(aps) if aps else 0.0
-    return {"cmAP": cmAP, "n_classes_evaluated": len(aps)}
+    cmap = float(np.mean(aps)) if aps else 0.0
+
+    # Build predictions list
+    predictions = []
+    for i, example_id in enumerate(test.ids):
+        y_true = [int(c) for c in range(labels.shape[1]) if labels[i, c] > 0]
+        y_pred = [int(c) for c in range(probs.shape[1]) if probs[i, c] > 0.5]
+        y_score = [float(probs[i, c]) for c in range(probs.shape[1])]
+        predictions.append(reporting.Prediction(example_id, y_true, y_pred, y_score))
+
+    return cmap, len(aps), predictions

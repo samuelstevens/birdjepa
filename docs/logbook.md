@@ -105,8 +105,123 @@ This explains the gap with reported results. The foundation models paper (arxiv.
 2. Different linear probe training (they use early stopping based on validation)
 3. Different evaluation protocol
 
-Next steps:
-- Check preprocessing against HuggingFace Bird-MAE reference
-- Try prototypical probing (reported +37% over linear)
-- Compare against other models (Perch, ConvNeXt)
+JEPA evaluation protocols: linear vs attentive probing
 
+Reviewed I-JEPA, V-JEPA, and V-JEPA 2 papers to understand what probes work with JEPA architectures.
+
+| Model | Probe Type | Notes |
+|-------|-----------|-------|
+| I-JEPA | Linear | Works well for images, outperforms MAE on ImageNet linear probing |
+| V-JEPA | Attentive (4-layer) | +16 pts over avg pooling on SSv2 |
+| V-JEPA 2 | Attentive (4-layer) | Same approach as V-JEPA |
+
+Key findings:
+- I-JEPA (images): Linear probes work well
+- V-JEPA (video): Attentive probes are essential, especially for motion/temporal tasks
+- V-JEPA 2 ablation: "Using adaptive pooling with a learnable cross-attention layer leads to +16.1 points on SSv2" vs average pooling
+- Single-layer vs 4-layer attentive probe: only +1-1.4 points difference
+- The big gain is attentive pooling vs average pooling, not probe depth
+
+The attentive probe architecture (from V-JEPA 2):
+- 4 transformer blocks with 16 attention heads
+- First 3 blocks: standard self-attention
+- Last block: cross-attention with learnable query token
+- Output fed to linear classifier
+
+Implications for BirdJEPA: Since bird vocalizations have temporal structure (syllables, phrases), we may face similar issues to V-JEPA where attentive probing is important. Simple mean pooling + linear probe may lose temporal information.
+
+Sources:
+- I-JEPA: https://arxiv.org/abs/2301.08243
+- V-JEPA: https://openreview.net/forum?id=WFYbBOEOtv
+- V-JEPA 2: https://arxiv.org/abs/2506.09985
+
+
+BEANS benchmark (https://arxiv.org/abs/2210.12300)
+
+BEANS (BEnchmark of ANimal Sounds) from Earth Species Project. Broader than BirdSet - covers birds, marine mammals, bats, dogs, mosquitoes.
+
+Classification tasks (7):
+| Dataset | Classes | Sample Rate | Duration | Species |
+|---------|---------|-------------|----------|---------|
+| cbi | 264 | 44100 Hz | 10s | Cornell Bird ID |
+| watkins | 31 | 44100 Hz | 3s | Marine mammals (dolphins, whales, seals) |
+| bats | 10 | 250000 Hz | 5s | Egyptian fruit bats |
+| dogs | 10 | 44100 Hz | 10s | Individual dog ID |
+| humbugdb | 14 | 44100 Hz | 3s | Mosquito species |
+| esc50 | 50 | 44100 Hz | 5s | Environmental sounds |
+| speech-commands | 35 | 16000 Hz | 1s | Human speech |
+
+Detection tasks (5):
+| Dataset | Classes | Sample Rate | Window |
+|---------|---------|-------------|--------|
+| dcase | 18 | 16000 Hz | 2s |
+| enabirds | 34 | 32000 Hz | 2s |
+| hiceas | 1 | 22050 Hz | 10s |
+| rfcx | 24 | 48000 Hz | 10s |
+| hainan-gibbons | 3 | 9600 Hz | 4s |
+
+Metrics:
+- Classification: Accuracy
+- Detection: mAP
+
+Key differences from BirdSet:
+- Single-label classification (not multi-label)
+- Includes detection tasks (temporal localization)
+- More diverse taxa (not just birds)
+- CBI (264 classes) is the most challenging - no overlapping recordists between train/test
+
+Source: https://github.com/earthspecies/beans
+
+
+# 12/20/2025
+
+Pretraining data: BirdSet XCM
+
+XCM is the medium-sized pretraining split from BirdSet, suitable for training BirdJEPA:
+- ~90k focal recordings (directional mic at bird, not soundscapes)
+- 409 species (matching all test dataset species)
+- 89.3 GB, 32kHz audio in .ogg format
+- Train split only (no test)
+
+Focal recordings are cleaner than soundscapes - single bird vocalization with less background noise. This is good for pretraining since the model learns from clear examples.
+
+Loading: `datasets.load_dataset("samuelstevens/BirdSet", "XCM")`
+
+Data pipeline plan:
+1. Random 5s crop from variable-length recordings
+2. Compute log-mel spectrogram on-the-fly (no caching)
+3. Use Bird-MAE spectrogram config: 32kHz, 512 time frames x 128 mel bins, 10ms frame shift
+4. Return (512, 128) tensor ready for patching
+
+Asymmetric patch sizes for fine temporal resolution
+
+Bird-MAE uses 16x16 square patches (32 time x 8 mel = 256 patches). This gives ~160ms temporal resolution per patch, which is coarse for syllable-level structure.
+
+SongMAE uses asymmetric patches - narrow in time, wide in frequency - to capture fine-grained temporal patterns while each patch sees the full frequency band at that time slice.
+
+Patch size experiments to run:
+| Patch (time x mel) | Time patches | Mel patches | Total | Temporal resolution |
+|--------------------|--------------|-------------|-------|---------------------|
+| 16 x 16 | 32 | 8 | 256 | ~160ms |
+| 8 x 32 | 64 | 4 | 256 | ~80ms |
+| 4 x 64 | 128 | 2 | 256 | ~40ms |
+
+All three configurations give 256 patches total (same sequence length for transformer), but with progressively finer temporal resolution. The 4x64 patches each span half the frequency range but only 40ms of time, which should better capture rapid frequency modulations in bird syllables.
+
+Note: 4x64 means 4 time frames x 64 mel bins per patch, so each patch is tall (covers more frequency) but narrow (covers less time).
+
+Pixio paper notes (arxiv.org/abs/2512.15715)
+
+Key improvements over vanilla MAE:
+1. **Deeper decoder**: 32 blocks instead of 8. The shallow MAE decoder forced encoder's later blocks to handle reconstruction details instead of learning good representations.
+2. **Block masking**: 4x4 patch blocks instead of single patches (75% mask ratio). Prevents reconstruction shortcuts from nearby visible patches.
+3. **Multiple class tokens**: 8 instead of 1. Captures diverse global properties (scene type, style, camera pose). Unlike register tokens, these are used directly for downstream tasks.
+
+For BirdJEPA, we could adapt:
+- Deeper decoder for richer reconstruction signal
+- Block masking in time dimension (mask contiguous time regions, not scattered patches)
+- Multiple class tokens could capture different acoustic properties (species, call type, recording quality)
+
+Other papers to read:
+- NEPA (sihanxu.me/nepa)
+- Perception Encoder (arxiv.org/abs/2504.13181)
