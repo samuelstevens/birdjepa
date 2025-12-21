@@ -85,3 +85,13 @@ The key for these suffixes:
 - c: Number of classes
 
 For example, an activation tensor with shape (batch, width, height d_vit) is `acts_bwhd`.
+
+# Benchmarks
+
+We evaluate on two bioacoustics benchmarks:
+
+BirdSet (https://arxiv.org/abs/2403.10380): 8 bird soundscape datasets for multi-label classification. Tasks: POW, PER, NES, UHH, HSN, NBP, SSW, SNE. Primary metric: cmAP. Uses 5-second clips at 32kHz.
+
+BEANS (https://arxiv.org/abs/2210.12300): 12 diverse bioacoustics tasks from Earth Species Project. 7 classification tasks (birds, marine mammals, bats, dogs, mosquitoes) and 5 detection tasks. Primary metrics: accuracy (classification), mAP (detection).
+
+See docs/logbook.md for experiment logs and findings.

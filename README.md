@@ -19,3 +19,23 @@ MAE reconstructs raw spectrograms, forcing the model to predict irrelevant low-l
 ## Installing
 
 On OSC, we need ffmpeg, which can be loaded with `module load ffmpeg/6.1.1`.
+
+## TODO
+
+### Pretraining
+- [ ] Move train.py to src/birdjepa/pretrain.py
+- [ ] Create src/birdjepa/data/ for XCM dataloader (random 5s crops, on-the-fly spectrograms)
+- [ ] Implement checkpointing (save/resume model, optimizer, scheduler, epoch)
+- [ ] Auto-resubmit with submitit for long training runs (JEPA doesn't need massive batch sizes, so we can train longer with smaller batches across multiple jobs)
+- [ ] Deepen understanding of LeJEPA (SIGReg, invariance loss, projection head design)
+- [ ] muP
+- [ ] Muon over Adam
+- [ ] Read modern ViT pretraining papers for training improvements:
+  - [ ] Pixio ([arxiv.org/abs/2512.15715](https://arxiv.org/abs/2512.15715)): deeper decoder (32 blocks), 4x4 block masking, multiple class tokens
+  - [ ] NEPA ([sihanxu.me/nepa](https://sihanxu.me/nepa)): modern ViT training tricks
+  - [ ] Perception Encoder ([arxiv.org/abs/2504.13181](https://arxiv.org/abs/2504.13181)): modern ViT training tricks
+- [ ] Implement asymmetric patch sizes (16x16, 8x32, 4x64)
+
+### Benchmark
+- [ ] Add Perch2 to benchmark registry (requires TensorFlow, see [arxiv.org/abs/2508.04665](https://arxiv.org/abs/2508.04665))
+- [ ] Add benchmark result visualization/summarization (bootstrap CIs, comparison tables, plots)
