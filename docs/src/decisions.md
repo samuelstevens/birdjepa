@@ -67,6 +67,27 @@ Spectrogram computation uses torchaudio's Kaldi-compatible filterbank with htk_c
 
 </details>
 
+<details>
+<summary>XenoCanto is loaded from samuelstevens/BirdSet with ebird_code labels</summary>
+
+The XenoCanto dataset is always loaded from the HuggingFace dataset `samuelstevens/BirdSet`, and labels are read from the `ebird_code` field. The dataset index is treated as the source ID.
+
+</details>
+
+<details>
+<summary>CIFAR-100 is stored under ./data and downloads automatically</summary>
+
+The CIFAR-100 dataset always uses root "./data" with download=True when initialized via torchvision.
+
+</details>
+
+<details>
+<summary>CIFAR-100 class names are hardcoded</summary>
+
+The 100 fine-grained CIFAR-100 class names are a fixed list in the codebase.
+
+</details>
+
 ## Model
 
 <details>
@@ -232,6 +253,27 @@ Both train and test dataloaders use pin_memory=True for faster GPU transfer.
 
 </details>
 
+<details>
+<summary>Weights & Biases is always enabled with project "birdjepa"</summary>
+
+Training always initializes WandB logging and hardcodes the project name to "birdjepa".
+
+</details>
+
+<details>
+<summary>Online probe loss is always added to objective loss</summary>
+
+The total loss is always the sum of the objective loss terms and the online probe cross-entropy. There is no config to disable or reweight the probe loss.
+
+</details>
+
+<details>
+<summary>Evaluation uses top-1 accuracy</summary>
+
+Per-epoch evaluation computes top-1 accuracy by argmax over probe logits.
+
+</details>
+
 ## Objectives
 
 <details>
@@ -252,52 +294,6 @@ LeJEPA computes invariance loss against the mean projection over all views, not 
 <summary>Pixio masking enforces exact mask count by adding patches</summary>
 
 Pixio block masking first masks full blocks up to a floor of the target mask count, then adds individual patches to reach the exact target. It never removes patches after block masking.
-
-</details>
-
-## Data (additional)
-
-<details>
-<summary>XenoCanto is loaded from samuelstevens/BirdSet with ebird_code labels</summary>
-
-The XenoCanto dataset is always loaded from the HuggingFace dataset `samuelstevens/BirdSet`, and labels are read from the `ebird_code` field. The dataset index is treated as the source ID.
-
-</details>
-
-<details>
-<summary>CIFAR-100 is stored under ./data and downloads automatically</summary>
-
-The CIFAR-100 dataset always uses root "./data" with download=True when initialized via torchvision.
-
-</details>
-
-<details>
-<summary>CIFAR-100 class names are hardcoded</summary>
-
-The 100 fine-grained CIFAR-100 class names are a fixed list in the codebase.
-
-</details>
-
-## Training (additional)
-
-<details>
-<summary>Weights & Biases is always enabled with project "birdjepa"</summary>
-
-Training always initializes WandB logging and hardcodes the project name to "birdjepa".
-
-</details>
-
-<details>
-<summary>Online probe loss is always added to objective loss</summary>
-
-The total loss is always the sum of the objective loss terms and the online probe cross-entropy. There is no config to disable or reweight the probe loss.
-
-</details>
-
-<details>
-<summary>Evaluation uses top-1 accuracy</summary>
-
-Per-epoch evaluation computes top-1 accuracy by argmax over probe logits.
 
 </details>
 
