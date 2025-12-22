@@ -447,3 +447,41 @@ Fix applied:
 Note: CLS has no positional embedding in the decoder (it's a global token, not a spatial one). Patches get positional embeddings.
 
 The probe still uses encoder CLS (not decoder CLS), which is consistent with how Pixio evaluates - they use mean of encoder CLS tokens for kNN. Since we have 1 CLS token, this is just the encoder CLS.
+
+---
+
+## HuggingFace Datasets Cache Corruption on NFS
+
+Problem: Running parallel benchmark jobs on Slurm with HuggingFace datasets causes cache corruption on NFS.
+
+When multiple jobs start simultaneously, they race to download and prepare the same dataset files:
+
+1. `.incomplete` file errors: Job A creates a temp file, Job B looks for it, Job A renames it, Job B crashes with `FileNotFoundError`
+2. Corrupted parquet files: Partial writes result in "Parquet magic bytes not found" or "Corrupt snappy compressed data" errors that persist in cache
+3. Arrow preparation races: Even after download, "Generating train/test split" writes to shared cache, causing similar corruption
+
+What doesn't work:
+- `HF_HUB_OFFLINE=1`: Only helps if cache is already clean; doesn't prevent reading corrupted files
+- `download_mode` parameter: No "fail if not cached" option; `REUSE_DATASET_IF_EXISTS` still attempts downloads
+- Sequential cache population then parallel reads: Works but defeats the purpose of parallel jobs; cache can still get corrupted if any job tries to re-download
+
+Proposed solution: Use `streaming=True` with node-local TMPDIR.
+
+```python
+os.environ["HF_HUB_CACHE"] = os.environ.get("TMPDIR", "/tmp")
+ds = datasets.load_dataset("samuelstevens/BirdSet", task, streaming=True)
+```
+
+Benefits:
+- Data streams directly from HuggingFace, minimal local caching
+- TMPDIR is node-local fast SSD, no NFS contention
+- Each job is completely isolated - no race conditions possible
+- Very little code change required
+
+Code changes needed:
+1. Set `HF_HUB_CACHE` to `TMPDIR` at start of worker
+2. Add `streaming=True` to `load_dataset()`
+3. Replace `len(dataset)` and slicing with `.iter(batch_size=...)` in `extract_features()`
+4. Get `n_classes` from `datasets.load_dataset_builder(...).info` instead of `dataset.features`
+
+Tradeoff: Streaming may be slightly slower than cached reads for repeated iterations, but for benchmarking where we iterate once, this is acceptable.

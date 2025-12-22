@@ -32,8 +32,8 @@ class MultiViewDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         items = [self.ds[idx] for _ in range(self.n_views)]
         views = torch.stack([item["data"] for item in items])
-        target = items[0]["target"]
-        return {"views": views, "target": target}
+        first = items[0]
+        return {"views": views, "target": first["target"], "index": first["index"]}
 
 
 # -----------------------------------------------------------------------------
@@ -69,6 +69,43 @@ class SIGReg(nn.Module):
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         statistic = (err @ self.weights) * proj_vbd.size(-2)
         return statistic.mean()
+
+
+# -----------------------------------------------------------------------------
+# Source Prediction (DIET-style)
+# -----------------------------------------------------------------------------
+
+
+class SourceHead(nn.Module):
+    """Low-rank source prediction head for DIET-style self-supervision.
+
+    Predicts which source recording a sample came from using concatenated CLS tokens.
+    Uses low-rank projection to handle large number of sources efficiently.
+
+    Reference: Perch 2.0 (https://arxiv.org/abs/2508.04665)
+    """
+
+    def __init__(self, input_dim: int, n_sources: int, rank: int):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(input_dim, rank),
+            nn.ReLU(),
+            nn.Linear(rank, n_sources),
+        )
+
+    def forward(self, cls_bcd: Float[Tensor, "b c d"]) -> Float[Tensor, "b s"]:
+        """Predict source from concatenated CLS tokens.
+
+        Args:
+            cls_bcd: CLS tokens (B, n_cls, embed_dim).
+
+        Returns:
+            logits_bs: Source prediction logits (B, n_sources).
+        """
+        # Flatten CLS tokens: (B, n_cls, D) -> (B, n_cls * D)
+        b = cls_bcd.shape[0]
+        cls_flat = cls_bcd.view(b, -1)
+        return self.head(cls_flat)
 
 
 # -----------------------------------------------------------------------------
@@ -116,12 +153,27 @@ class SupervisedConfig:
 
 
 class Supervised(Objective):
-    """Supervised classification objective."""
+    """Supervised classification objective with optional source prediction."""
 
-    def __init__(self, encoder_cfg: birdjepa.nn.transformer.Config, n_classes: int):
+    def __init__(
+        self,
+        encoder_cfg: birdjepa.nn.transformer.Config,
+        n_classes: int,
+        n_sources: int = 0,
+        source_rank: int = 0,
+        source_weight: float = 1.0,
+    ):
         super().__init__()
         self.encoder_cfg = encoder_cfg
+        self.source_weight = source_weight
         self.head = nn.Linear(encoder_cfg.embed_dim, n_classes)
+
+        # Optional source prediction head
+        if source_rank > 0 and n_sources > 0:
+            input_dim = encoder_cfg.n_cls_tokens * encoder_cfg.embed_dim
+            self.source_head = SourceHead(input_dim, n_sources, source_rank)
+        else:
+            self.source_head = None
 
     def wrap_dataset(self, base_ds: Dataset) -> Dataset:
         return base_ds
@@ -136,11 +188,19 @@ class Supervised(Objective):
         x_bnk, grid_bn2 = birdjepa.nn.transformer.patchify(data_bhw, self.encoder_cfg)
         out = encoder(x_bnk, grid=grid_bn2)
 
-        # Use mean of CLS tokens for supervised
+        # Use mean of CLS tokens for classification
         emb_bd = out["cls"].mean(dim=1)  # (B, D)
 
-        logits_bc = self.head(emb_bd)
-        return {"ce": F.cross_entropy(logits_bc, target_b)}, emb_bd.detach(), target_b
+        losses = {"ce": F.cross_entropy(self.head(emb_bd), target_b)}
+
+        # Optional source prediction loss (uses index as source ID)
+        if self.source_head is not None:
+            source_logits = self.source_head(out["cls"])
+            losses["source"] = self.source_weight * F.cross_entropy(
+                source_logits, batch["index"]
+            )
+
+        return losses, emb_bd.detach(), target_b
 
 
 # -----------------------------------------------------------------------------
@@ -411,11 +471,15 @@ class Pixio(Objective):
         encoder_cfg: birdjepa.nn.transformer.Config,
         cfg: PixioConfig,
         probe_pooling: str = "cls",
+        n_sources: int = 0,
+        source_rank: int = 0,
+        source_weight: float = 1.0,
     ):
         super().__init__()
         self.encoder_cfg = encoder_cfg
         self.cfg = cfg
         self.probe_pooling = probe_pooling
+        self.source_weight = source_weight
 
         # Decoder
         self.decoder = PixioDecoder(encoder_cfg, cfg)
@@ -423,6 +487,13 @@ class Pixio(Objective):
         # Mask token (in encoder dim, will be projected by decoder)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, encoder_cfg.embed_dim))
         nn.init.normal_(self.mask_token, std=0.02)
+
+        # Optional source prediction head
+        if source_rank > 0 and n_sources > 0:
+            input_dim = encoder_cfg.n_cls_tokens * encoder_cfg.embed_dim
+            self.source_head = SourceHead(input_dim, n_sources, source_rank)
+        else:
+            self.source_head = None
 
         # RNG for masking (will be moved to correct device on first forward)
         self._rng: torch.Generator | None = None
@@ -516,7 +587,16 @@ class Pixio(Objective):
         else:
             raise ValueError(f"Unknown probe_pooling: {self.probe_pooling}")
 
-        return {"mse": loss}, emb_bd.detach(), target_b
+        losses = {"mse": loss}
+
+        # 9. Optional source prediction loss (uses index as source ID)
+        if self.source_head is not None:
+            source_logits = self.source_head(out["cls"])
+            losses["source"] = self.source_weight * F.cross_entropy(
+                source_logits, batch["index"]
+            )
+
+        return losses, emb_bd.detach(), target_b
 
 
 ###########
@@ -532,13 +612,29 @@ def make_objective(
     model_cfg: birdjepa.nn.transformer.Config,
     n_classes: int,
     probe_pooling: str = "cls",
+    n_sources: int = 0,
+    source_rank: int = 0,
+    source_weight: float = 1.0,
 ) -> Objective:
     """Create an objective from config."""
     if isinstance(cfg, SupervisedConfig):
-        return Supervised(model_cfg, n_classes)
+        return Supervised(
+            model_cfg,
+            n_classes,
+            n_sources=n_sources,
+            source_rank=source_rank,
+            source_weight=source_weight,
+        )
     elif isinstance(cfg, LeJEPAConfig):
         return LeJEPA(model_cfg, cfg)
     elif isinstance(cfg, PixioConfig):
-        return Pixio(model_cfg, cfg, probe_pooling=probe_pooling)
+        return Pixio(
+            model_cfg,
+            cfg,
+            probe_pooling=probe_pooling,
+            n_sources=n_sources,
+            source_rank=source_rank,
+            source_weight=source_weight,
+        )
     else:
         raise ValueError(f"Unknown objective config: {type(cfg)}")

@@ -129,6 +129,41 @@ def sample_per_class(
 
 
 @beartype.beartype
+def sample_per_class_list(
+    examples: list[dict], n_per_class: int, n_classes: int, seed: int = 42
+) -> list[dict]:
+    """Sample up to n_per_class examples for each class from a list of dicts.
+
+    For streaming datasets that have been collected to a list.
+    """
+    rng = np.random.default_rng(seed)
+    selected: set[int] = set()
+
+    # Build index: for each class, which examples contain it?
+    class_to_examples: dict[int, list[int]] = {c: [] for c in range(n_classes)}
+    for i, ex in enumerate(examples):
+        for c in ex[BIRDSET_LABEL_COL]:
+            class_to_examples[c].append(i)
+
+    # Sample from each class
+    for c in range(n_classes):
+        samples = class_to_examples[c]
+        if len(samples) <= n_per_class:
+            selected.update(samples)
+        else:
+            selected.update(rng.choice(samples, size=n_per_class, replace=False))
+
+    indices = sorted(selected)
+    logger.info(
+        "Sampled %d examples (%d per class, %d classes)",
+        len(indices),
+        n_per_class,
+        n_classes,
+    )
+    return [examples[i] for i in indices]
+
+
+@beartype.beartype
 @dataclasses.dataclass(frozen=True)
 class Config:
     """Benchmark configuration."""
@@ -158,8 +193,6 @@ class Config:
     """Log training progress every N epochs."""
     device: str = "cuda"
     """Device."""
-    download: bool = False
-    """If True, download/prepare dataset. WARNING: don't run concurrently!"""
     # Paths
     report_to: pathlib.Path = pathlib.Path("./results")
     """Directory for results database."""
@@ -197,6 +230,14 @@ def worker_fn(cfg: Config) -> None:
         level=logging.INFO,
         format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    # Use node-local TMPDIR for HuggingFace cache to avoid NFS corruption
+    tmpdir = os.environ.get("TMPDIR")
+    assert tmpdir, "TMPDIR must be set for node-local caching"
+    os.environ["HF_HUB_CACHE"] = tmpdir
+    os.environ["HF_HOME"] = tmpdir
+    logger.info("Using HF cache: %s", tmpdir)
 
     key = make_exp_key(cfg)
     logger.info("Benchmarking %s", key)
@@ -207,43 +248,41 @@ def worker_fn(cfg: Config) -> None:
     backbone.eval()
     transform = backbone.make_audio_transform()
 
-    # 2. Load dataset
-    if cfg.download:
-        logger.warning("*" * 60)
-        logger.warning("DOWNLOADING DATASET -- DO NOT RUN CONCURRENTLY")
-        logger.warning("*" * 60)
-    else:
-        os.environ["HF_HUB_OFFLINE"] = "1"
-    ds = datasets.load_dataset("samuelstevens/BirdSet", cfg.task.upper())
-    ds = ds.cast_column("audio", datasets.Audio(sampling_rate=32_000))
+    # 2. Get n_classes from dataset builder (before streaming)
+    builder = datasets.load_dataset_builder("samuelstevens/BirdSet", cfg.task.upper())
+    n_classes = len(builder.info.features[BIRDSET_LABEL_COL].feature.names)
 
-    train_ds = ds["train"]
-    test_ds = ds["test_5s"]
+    # 3. Load datasets with streaming to avoid NFS cache corruption
+    logger.info("Loading dataset with streaming...")
+    ds = datasets.load_dataset(
+        "samuelstevens/BirdSet", cfg.task.upper(), streaming=True
+    )
 
+    # Collect train examples (small enough to fit in memory)
+    logger.info("Collecting train examples...")
+    train_examples = list(ds["train"])
     if cfg.n_train > 0:
-        train_ds = sample_per_class(train_ds, cfg.n_train)
+        train_examples = sample_per_class_list(train_examples, cfg.n_train, n_classes)
 
-    n_classes = len(train_ds.features[BIRDSET_LABEL_COL].feature.names)
     logger.info(
-        "Task %s: %d train, %d test, %d classes",
+        "Task %s: %d train, %d classes (test streaming)",
         cfg.task,
-        len(train_ds),
-        len(test_ds),
+        len(train_examples),
         n_classes,
     )
 
-    # 3. Extract features
+    # 4. Extract features
     logger.info("Extracting train features...")
-    train = extract_features(
-        backbone, transform, train_ds, cfg.device, cfg.batch_size, n_classes
+    train = extract_features_from_list(
+        backbone, transform, train_examples, cfg.device, cfg.batch_size, n_classes
     )
 
-    logger.info("Extracting test features...")
-    test = extract_features(
-        backbone, transform, test_ds, cfg.device, cfg.batch_size, n_classes
+    logger.info("Extracting test features (streaming)...")
+    test = extract_features_streaming(
+        backbone, transform, ds["test_5s"], cfg.device, cfg.batch_size, n_classes
     )
 
-    # 4. Train classifier
+    # 5. Train classifier
     logger.info("Training %s probe...", cfg.classifier)
     if cfg.classifier == "linear":
         probe = train_linear_probe(train.features, train.labels, n_classes, cfg)
@@ -254,12 +293,12 @@ def worker_fn(cfg: Config) -> None:
     else:
         raise NotImplementedError(f"Classifier '{cfg.classifier}' not implemented")
 
-    # 5. Evaluate
+    # 6. Evaluate
     logger.info("Evaluating...")
     cmap, n_classes_eval, predictions = evaluate(probe, test, cfg.device)
     logger.info("Results: cmAP=%.4f", cmap)
 
-    # 6. Build and write report
+    # 7. Build and write report
     exp_cfg = dataclasses.asdict(cfg)
     for k, v in exp_cfg.items():
         if isinstance(v, pathlib.Path):
@@ -464,6 +503,123 @@ def extract_features(
         labels=torch.cat(all_labels, dim=0),
         ids=all_ids,
     )
+
+
+@jaxtyping.jaxtyped(typechecker=beartype.beartype)
+@torch.inference_mode()
+def extract_features_from_list(
+    backbone,
+    transform,
+    examples: list[dict],
+    device: str,
+    batch_size: int,
+    n_classes: int,
+) -> ExtractedFeatures:
+    """Extract features from a list of example dicts (for collected train data)."""
+    all_features = []
+    all_labels = []
+    all_ids = []
+
+    batches = range(0, len(examples), batch_size)
+    for i in helpers.progress(batches, every=10, desc="extract"):
+        batch = examples[i : i + batch_size]
+
+        specs = []
+        for ex in batch:
+            audio = ex["audio"]
+            spec = transform(audio["array"])
+            specs.append(spec)
+
+        specs = torch.stack(specs).to(device)
+        encoded = backbone.audio_encode(specs)
+        all_features.append(encoded.features.cpu())
+
+        labels = torch.zeros(len(batch), n_classes, dtype=torch.float32)
+        for j, ex in enumerate(batch):
+            for c in ex[BIRDSET_LABEL_COL]:
+                labels[j, c] = 1.0
+        all_labels.append(labels)
+
+        all_ids.extend(ex["filepath"] for ex in batch)
+
+    return ExtractedFeatures(
+        features=torch.cat(all_features, dim=0),
+        labels=torch.cat(all_labels, dim=0),
+        ids=all_ids,
+    )
+
+
+@jaxtyping.jaxtyped(typechecker=beartype.beartype)
+@torch.inference_mode()
+def extract_features_streaming(
+    backbone, transform, dataset, device: str, batch_size: int, n_classes: int
+) -> ExtractedFeatures:
+    """Extract features from a streaming dataset (for large test sets)."""
+    all_features = []
+    all_labels = []
+    all_ids = []
+    n_batches = 0
+
+    batch = []
+    for ex in dataset:
+        batch.append(ex)
+        if len(batch) >= batch_size:
+            _process_batch(
+                backbone,
+                transform,
+                batch,
+                n_classes,
+                device,
+                all_features,
+                all_labels,
+                all_ids,
+            )
+            batch = []
+            n_batches += 1
+            if n_batches % 10 == 0:
+                logger.info("Processed %d batches", n_batches)
+
+    # Process remaining examples
+    if batch:
+        _process_batch(
+            backbone,
+            transform,
+            batch,
+            n_classes,
+            device,
+            all_features,
+            all_labels,
+            all_ids,
+        )
+
+    return ExtractedFeatures(
+        features=torch.cat(all_features, dim=0),
+        labels=torch.cat(all_labels, dim=0),
+        ids=all_ids,
+    )
+
+
+def _process_batch(
+    backbone, transform, batch, n_classes, device, all_features, all_labels, all_ids
+):
+    """Helper to process a batch of examples."""
+    specs = []
+    for ex in batch:
+        audio = ex["audio"]
+        spec = transform(audio["array"])
+        specs.append(spec)
+
+    specs = torch.stack(specs).to(device)
+    encoded = backbone.audio_encode(specs)
+    all_features.append(encoded.features.cpu())
+
+    labels = torch.zeros(len(batch), n_classes, dtype=torch.float32)
+    for j, ex in enumerate(batch):
+        for c in ex[BIRDSET_LABEL_COL]:
+            labels[j, c] = 1.0
+    all_labels.append(labels)
+
+    all_ids.extend(ex["filepath"] for ex in batch)
 
 
 @jaxtyping.jaxtyped(typechecker=beartype.beartype)

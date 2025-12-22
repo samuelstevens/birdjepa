@@ -32,22 +32,31 @@
 
 - Consider the [style guidelines for TigerBeetle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md) and adapt it to Python.
 - Fail fast when required information is missing. Never silently skip functionality or infer defaults. Explicit is better than implicit.
-```py
-# Bad: silently skips evaluation if test_data not provided
-test_loader = None
-if cfg.test_data is not None:
+    ```py
+    # Bad: silently skips evaluation if test_data not provided
+    test_loader = None
+    if cfg.test_data is not None:
+        test_ds = make_dataset(cfg.test_data)
+        test_loader = DataLoader(test_ds, ...)
+
+    # Later in training loop...
+    if test_loader is not None:  # Silently skips if not configured
+        evaluate(test_loader)
+
+    # Good: fail immediately if required config missing
+    assert cfg.test_data is not None, "test_data is required"
     test_ds = make_dataset(cfg.test_data)
     test_loader = DataLoader(test_ds, ...)
+    ```
+    Another example:
+    ```py
+    # Bad: silently falls back to /tmp which may not be node-local
+    tmpdir = os.environ.get("TMPDIR", "/tmp")
 
-# Later in training loop...
-if test_loader is not None:  # Silently skips if not configured
-    evaluate(test_loader)
-
-# Good: fail immediately if required config missing
-assert cfg.test_data is not None, "test_data is required"
-test_ds = make_dataset(cfg.test_data)
-test_loader = DataLoader(test_ds, ...)
-```
+    # Good: fail immediately if TMPDIR not set
+    tmpdir = os.environ.get("TMPDIR")
+    assert tmpdir, "TMPDIR must be set for node-local caching"
+    ```
 - Use asserts to validate assumptions frequently. For example, I didn't have an assert here at first because I assumed the shape couldn't change. It turns out it can! So now we have an assert to make it clear that we expect the input and output shapes are identical.
 ```py
 def sp_csr_to_pt(csr: scipy.sparse.csr_matrix, *, device: str) -> Tensor:
@@ -86,6 +95,10 @@ In some cases, you will be asked to perform a seemingly impossible task, either 
 In these cases, do not attempt to implement a half-baked solution just to satisfy the developer's request.
 If the task seems too hard, be honest that you couldn't solve it in the proper way, leave the code unchanged, explain the situation to the developer and ask for further feedback and clarifications.
 The developer is a domain expert that will be able to assist you in these cases.
+
+# Assumptions
+
+- All datasets return a dict from `__getitem__` with at least `data`, `target`, and `index` keys. `index` is the sample index passed to `__getitem__`. This allows wrapper datasets (like MultiViewDataset) to pass through the index consistently.
 
 # Tensor Variables
 

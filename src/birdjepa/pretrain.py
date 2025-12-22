@@ -58,6 +58,10 @@ class Config:
     """Device to train on."""
     probe_pooling: str = "cls"
     """Pooling for probe: 'cls' (mean of CLS tokens) or 'patches' (mean of patches)."""
+    source_rank: int = 0
+    """Low-rank bottleneck for source prediction head. 0 = disabled."""
+    source_weight: float = 1.0
+    """Loss weight for source prediction."""
     # Checkpointing
     ckpt_to: pathlib.Path = pathlib.Path("./checkpoints")
     """Directory for checkpoints."""
@@ -131,9 +135,16 @@ def worker_fn(cfg: Config):
 
     # Model and objective
     n_classes = base_ds.n_classes
+    n_sources = getattr(base_ds, "n_sources", 0)
     encoder = birdjepa.nn.transformer.Transformer(cfg.model).to(cfg.device)
     objective = birdjepa.nn.objectives.make_objective(
-        cfg.objective, cfg.model, n_classes, probe_pooling=cfg.probe_pooling
+        cfg.objective,
+        cfg.model,
+        n_classes,
+        probe_pooling=cfg.probe_pooling,
+        n_sources=n_sources,
+        source_rank=cfg.source_rank,
+        source_weight=cfg.source_weight,
     ).to(cfg.device)
 
     # Wrap dataset for objective (e.g., multi-view for LeJEPA)

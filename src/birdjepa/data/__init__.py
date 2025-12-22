@@ -128,6 +128,8 @@ class XenoCantoDataset(torch.utils.data.Dataset):
         # Get class labels
         self._class_labels = self.ds.features["ebird_code"]
         self.n_classes = self._class_labels.num_classes
+        # Each row is a unique recording - use index as source ID
+        self.n_sources = len(self.ds)
 
         # Fixed random subset if n_samples specified
         if cfg.n_samples is not None:
@@ -175,7 +177,7 @@ class XenoCantoDataset(torch.utils.data.Dataset):
         spec = birdjepa.augment.apply(spec, self.cfg.augmentations)
         target = item["ebird_code"]
         label = self._class_labels.int2str(target)
-        return {"data": spec, "label": label, "target": target}
+        return {"data": spec, "label": label, "target": target, "index": idx}
 
 
 # CIFAR-100 normalization (grayscale approximation)
@@ -319,4 +321,4 @@ class Cifar100Dataset(torch.utils.data.Dataset):
         img = (img - CIFAR_MEAN) / CIFAR_STD
         img = birdjepa.augment.apply(img, self.cfg.augmentations)
         label = CIFAR100_CLASSES[target]
-        return {"data": img, "label": label, "target": target}
+        return {"data": img, "label": label, "target": target, "index": idx}
