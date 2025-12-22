@@ -141,12 +141,15 @@ class Report:
             "posix": self.posix,
             "gpu_name": self.gpu_name,
             "hostname": self.hostname,
-            # Predictions as lists
-            "pred_example_ids": [[p.example_id for p in self.predictions]],
-            "pred_y_true": [[p.y_true for p in self.predictions]],
-            "pred_y_pred": [[p.y_pred for p in self.predictions]],
-            "pred_y_score": [[p.y_score for p in self.predictions]],
         }
+        # Skip predictions for large test sets to avoid OOM
+        if len(self.predictions) < 50_000:
+            data["pred_example_ids"] = [[p.example_id for p in self.predictions]]
+            data["pred_y_true"] = [[p.y_true for p in self.predictions]]
+            data["pred_y_pred"] = [[p.y_pred for p in self.predictions]]
+            data["pred_y_score"] = [[p.y_score for p in self.predictions]]
+        else:
+            logger.warning("Skipping predictions (n=%d > 50k)", len(self.predictions))
         df = pl.DataFrame(data)
 
         # Atomic write: temp file then rename

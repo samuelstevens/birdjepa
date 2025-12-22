@@ -269,3 +269,181 @@ Note on multiple CLS tokens vs register tokens:
 - Register tokens (DINOv2): Extra tokens that absorb artifacts, discarded at inference
 - Multiple CLS tokens (Pixio): All 8 tokens used for representation, concatenated or pooled for downstream
 - For our purposes, likely similar effect - both add learnable tokens to the sequence
+
+
+# 12/22/2025
+
+## Pixio/MAE Implementation Design
+
+Reference: "In Pursuit of Pixel Supervision for Visual Pre-training" (https://arxiv.org/abs/2512.15715)
+
+Pixio = MAE + 3 key changes:
+
+1. Deeper decoder: 32 blocks (vs MAE's 8), 512 dim, 2048 hidden, 16 heads. The shallow MAE decoder forces the encoder to sacrifice representation quality for reconstruction details.
+2. Block masking: 4x4 patch blocks at 75% ratio (vs single-patch masking). Prevents reconstruction shortcuts from nearby visible patches.
+3. Multiple CLS tokens: 8 tokens averaged for global embedding (vs 1). Captures diverse global properties.
+
+The current Transformer takes `(B, H, W)` images and handles patchification internally. For MAE/Pixio, we need the encoder to accept variable-length sequences (only visible patches).
+
+New API (following DINOv3 pattern from saev/biobench):
+
+```python
+def forward(
+    self, x_btk: Float[Tensor, "b t kernel"], *, grid: Int[Tensor, "b t 2"]
+) -> tuple[Float[Tensor, "b d"], Float[Tensor, "b t d"]]:
+```
+
+Where:
+
+- `x_btk`: Pre-patchified input, `(B, T, patch_h * patch_w)`. T can vary (visible patches only for encoder, all patches for decoder).
+- `grid`: `(B, T, 2)` containing (row, col) coordinates for each token. Used for positional embeddings.
+- Returns: `(cls_embedding, patch_embeddings)`
+
+Why this design:
+
+- Caller handles patchification, masking, and token selection
+- Transformer just processes whatever tokens it receives
+- Positional embeddings indexed by grid coordinates (works for any subset of patches)
+- Same Transformer class works for both encoder (visible only) and decoder (all patches)
+
+Masking Strategy: block masking + adjustment for fixed sequence length.
+
+1. Divide patch grid into non-overlapping 2x2 blocks
+2. Randomly mask blocks (creates contiguous masked regions = harder pretext task)
+3. Adjust to hit exact target count:
+   - If too few masked -> randomly mask additional individual patches
+   - If too many masked -> randomly unmask some patches
+
+This gives both:
+- Harder reconstruction from contiguous masked regions
+- Fixed T for efficient batching (no padding needed)
+
+Example for 8x8 patch grid (64 patches) with 75% masking:
+- 16 visible patches always (fixed T)
+- Block masking ensures visible patches aren't all scattered
+
+PixioConfig
+
+```python
+@dataclasses.dataclass(frozen=True)
+class PixioConfig:
+    decoder_depth: int = 8      # Number of decoder transformer blocks
+    decoder_dim: int = 512      # Decoder embedding dimension
+    decoder_heads: int = 8      # Decoder attention heads
+    mask_ratio: float = 0.75    # Fraction of patches to mask
+    block_size: int = 2         # Block masking granularity (1 = random patch)
+    n_cls_tokens: int = 4       # Multiple CLS tokens (averaged for global repr)
+```
+
+Pixio Forward Pass
+
+```
+1. Patchify input
+   x_bhw -> x_bnk where n = n_patches, k = patch_h * patch_w
+
+2. Generate block mask + adjust to exact count
+   mask_bn: bool tensor, True = masked
+   n_visible = n * (1 - mask_ratio)
+
+3. Select visible patches
+   ```
+   x_visible = x_bnk[~mask]  -> (B, n_visible, k)
+   grid_visible = full_grid[~mask]  -> (B, n_visible, 2)
+   ```
+4. Encode visible patches only (efficiency win)
+   cls_bd, enc_bvd = encoder(x_visible, grid=grid_visible)
+5. Prepare decoder input: insert mask tokens at masked positions
+   dec_input_bnd = empty(B, n, D)
+   dec_input[~mask] = enc_bvd  # visible patch embeddings
+   dec_input[mask] = mask_token  # learnable mask token
+6. Add CLS tokens and run decoder
+   dec_out_bnd = decoder(dec_input_bnd, grid=full_grid)
+7. Project to pixels and compute loss on masked only
+   pred_bnk = pixel_head(dec_out_bnd)  # (B, n, patch_h * patch_w)
+   target_bnk = original patches
+   loss = MSE(pred_bnk[mask], target_bnk[mask])
+```
+
+Implementation steps:
+
+1. Modify `nn/transformer.py`:
+   - Add `PatchEmbed` that takes `(B, T, kernel)` not `(B, H, W)`
+   - Change `Transformer.forward` signature to accept `(x_btk, grid)`
+   - Index positional embeddings by grid coordinates
+   - Keep backward compatibility: add helper `patchify(x_bhw) -> x_bnk, grid`
+
+2. Update `nn/objectives.py`:
+   - Implement `Pixio.forward` with masking logic
+   - Add decoder (can reuse Transformer blocks with different config)
+   - Add mask token, pixel prediction head
+
+3. Update other objectives:
+   - `Supervised` and `LeJEPA` need to patchify before calling encoder
+   - Or add a wrapper that handles the old API
+
+Loss function
+
+MSE on masked patches only (same as MAE):
+```python
+loss = F.mse_loss(pred_bnk[mask], target_bnk[mask])
+```
+
+Target is raw pixel values (already normalized by dataset preprocessing).
+
+- MAE: "Masked Autoencoders Are Scalable Vision Learners" (He et al., 2021) https://arxiv.org/abs/2111.06377
+- Pixio: "In Pursuit of Pixel Supervision for Visual Pre-training" https://arxiv.org/abs/2512.15715
+- GitHub: https://github.com/facebookresearch/pixio
+
+---
+
+First Pixio run on CIFAR-100, job 3108556. Observations after ~13 epochs:
+
+- MSE loss decreasing: 0.94 -> 0.77 (good sign)
+- Probe accuracy: 2.9% (epoch 0) -> 5.8% (epoch 4) -> 5.7% (epoch 13)
+- Per-patch normalization implemented (target has ~unit variance, so MSE ~0.77 means model explains ~23% of variance)
+
+CIFAR-100 has 100 classes, so random chance is 1%. Our 5-7% is better than random but:
+
+1. Accuracy plateauing: Improved from 2.9% to 5.8% in first 5 epochs, then stalled around 5-7%. Could indicate:
+   - CLS token not learning useful representations (MAE doesn't train CLS explicitly)
+   - Learning rate too low for probe
+   - Need more epochs (MAE typically trains 800-1600 epochs)
+2. CLS token vs mean pooling: We probe the CLS token, but MAE reconstruction doesn't use CLS. The original MAE paper uses mean pooling of all patch tokens for linear probing. This is likely a significant issue.3. Expected behavior: MAE representations are known to be weak early in training. The Bird-MAE paper notes that linear probing on MAE features underperforms until late in training. 5-7% at epoch 13/800 might be normal.4. Comparison needed: Should compare with supervised baseline at same epoch count to calibrate expectations.
+
+### Potential Bugs / Issues to Investigate
+
+1. Decoder input mismatch: Visible patches go through encoder but skip decoder's embedding projection. They only get decoder positional embeddings added. This matches MAE but worth verifying the dimensions align.
+2. Block masking dilution: We compute `n_blocks_masked = n_masked_target // max_patches_per_block` which is conservative. For 8x8 grid with 2x2 blocks and 75% masking: target=48 masked, but 48//4=12 blocks = 48 patches exactly. But for non-divisible cases, we add individual patches which dilutes the block structure.
+3. Weight decay on all params: MAE excludes bias and LayerNorm from weight decay. We apply it uniformly. Could affect optimization.
+4. No gradient clipping: MAE implementations often use gradient clipping (max_norm=1.0 or similar). We don't.
+5. Mask token squeeze: We use `self.mask_token.squeeze(0).squeeze(0)` which is fragile. Should use indexing `self.mask_token[0, 0]`.
+6. Decoder positional embeddings: We use absolute 1D positional embeddings for decoder (flattened grid). Pixio might use 2D or learned differently.
+7. Online probe during MAE training: The probe sees CLS token which MAE doesn't explicitly train for reconstruction. MAE papers often use mean pooling of patch tokens instead.
+8. Learning rate: Using 1.5e-4 which is standard, but MAE often uses layer-wise LR decay which we don't implement.
+
+### Things That Look Correct
+
+- Per-patch normalization matches Pixio implementation
+- MSE only on masked patches (not visible)
+- Encoder only sees visible patches (efficiency win)
+- Mask token inserted at masked positions for decoder
+- Block masking with adjustment to exact count
+- Reproducible masking via seeded generator
+
+---
+
+## Fix: CLS token in decoder (job 3108582)
+
+The Pixio paper states: "We observe that feeding class tokens to the decoder yields slightly better performance, suggesting that allowing them to participate in reconstruction helps learn more informative global representations."
+
+Our original implementation did NOT feed CLS to the decoder - the encoder CLS was returned directly for probing without participating in reconstruction. This meant CLS only got gradients from the (detached) probe loss, not from reconstruction.
+
+Fix applied:
+1. PixioDecoder now takes `(cls_be, x_bne)` as input
+2. CLS is projected to decoder dim and concatenated with patches
+3. CLS participates in all decoder attention layers
+4. Reconstruction loss flows back to encoder CLS via decoder attention
+
+Note: CLS has no positional embedding in the decoder (it's a global token, not a spatial one). Patches get positional embeddings.
+
+The probe still uses encoder CLS (not decoder CLS), which is consistent with how Pixio evaluates - they use mean of encoder CLS tokens for kNN. Since we have 1 CLS token, this is just the encoder CLS.

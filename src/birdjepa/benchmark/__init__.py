@@ -8,6 +8,7 @@ Classifiers: linear, mlp, centroid
 import dataclasses
 import importlib.util
 import logging
+import os
 import pathlib
 
 import beartype
@@ -142,17 +143,23 @@ class Config:
     """Classifier: linear, mlp, centroid."""
     n_train: int = -1
     """Number of training samples per class. -1 for all."""
-    # Training
-    lr: float = 1e-3
-    """Learning rate for linear probe."""
-    epochs: int = 20
-    """Training epochs for linear probe."""
-    log_every: int = 5
-    """Log training progress every N epochs."""
+    # Training (Bird-MAE defaults)
+    lr: float = 4e-4
+    """Learning rate."""
+    weight_decay: float = 3e-4
+    """AdamW weight decay."""
+    epochs: int = 30
+    """Training epochs."""
     batch_size: int = 64
     """Batch size."""
+    grad_clip: float = 2.0
+    """Gradient clipping max norm."""
+    log_every: int = 5
+    """Log training progress every N epochs."""
     device: str = "cuda"
     """Device."""
+    download: bool = False
+    """If True, download/prepare dataset. WARNING: don't run concurrently!"""
     # Paths
     report_to: pathlib.Path = pathlib.Path("./results")
     """Directory for results database."""
@@ -201,6 +208,12 @@ def worker_fn(cfg: Config) -> None:
     transform = backbone.make_audio_transform()
 
     # 2. Load dataset
+    if cfg.download:
+        logger.warning("*" * 60)
+        logger.warning("DOWNLOADING DATASET -- DO NOT RUN CONCURRENTLY")
+        logger.warning("*" * 60)
+    else:
+        os.environ["HF_HUB_OFFLINE"] = "1"
     ds = datasets.load_dataset("samuelstevens/BirdSet", cfg.task.upper())
     ds = ds.cast_column("audio", datasets.Audio(sampling_rate=32_000))
 
@@ -477,19 +490,13 @@ def train_linear_probe(
         dataset, batch_size=batch_size, shuffle=True, drop_last=False
     )
 
-    # AdamW with Bird-MAE's hyperparameters
     optimizer = torch.optim.AdamW(
-        probe.parameters(), lr=4e-4, weight_decay=3e-4, betas=(0.9, 0.95)
+        probe.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
-
-    # Cosine annealing scheduler
-    n_epochs = 30
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-
-    # Asymmetric loss for imbalanced multi-label
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
     criterion = AsymmetricLoss()
 
-    for epoch in helpers.progress(range(n_epochs), every=cfg.log_every, desc="train"):
+    for epoch in helpers.progress(range(cfg.epochs), every=cfg.log_every, desc="train"):
         probe.train()
         total_loss = 0.0
         for x, y in loader:
@@ -498,8 +505,7 @@ def train_linear_probe(
             loss = criterion(logits, y)
             optimizer.zero_grad()
             loss.backward()
-            # Gradient clipping (Bird-MAE uses 2.0)
-            torch.nn.utils.clip_grad_norm_(probe.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(probe.parameters(), max_norm=cfg.grad_clip)
             optimizer.step()
             total_loss += loss.item()
         scheduler.step()
@@ -539,13 +545,12 @@ def train_mlp_probe(
     )
 
     optimizer = torch.optim.AdamW(
-        probe.parameters(), lr=4e-4, weight_decay=3e-4, betas=(0.9, 0.95)
+        probe.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
-    n_epochs = 30
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
     criterion = AsymmetricLoss()
 
-    for epoch in helpers.progress(range(n_epochs), every=cfg.log_every, desc="train"):
+    for epoch in helpers.progress(range(cfg.epochs), every=cfg.log_every, desc="train"):
         probe.train()
         total_loss = 0.0
         for x, y in loader:
@@ -554,7 +559,7 @@ def train_mlp_probe(
             loss = criterion(logits, y)
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(probe.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(probe.parameters(), max_norm=cfg.grad_clip)
             optimizer.step()
             total_loss += loss.item()
         scheduler.step()
