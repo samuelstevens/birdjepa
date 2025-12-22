@@ -12,3 +12,8 @@ outputs/
 wandb/
 logs/
 vendored/
+.claude/
+.coverage/
+.hypothesis/
+results/
+checkpoints/
