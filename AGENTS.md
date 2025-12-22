@@ -31,6 +31,23 @@
 # Defensive Programming
 
 - Consider the [style guidelines for TigerBeetle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md) and adapt it to Python.
+- Fail fast when required information is missing. Never silently skip functionality or infer defaults. Explicit is better than implicit.
+```py
+# Bad: silently skips evaluation if test_data not provided
+test_loader = None
+if cfg.test_data is not None:
+    test_ds = make_dataset(cfg.test_data)
+    test_loader = DataLoader(test_ds, ...)
+
+# Later in training loop...
+if test_loader is not None:  # Silently skips if not configured
+    evaluate(test_loader)
+
+# Good: fail immediately if required config missing
+assert cfg.test_data is not None, "test_data is required"
+test_ds = make_dataset(cfg.test_data)
+test_loader = DataLoader(test_ds, ...)
+```
 - Use asserts to validate assumptions frequently. For example, I didn't have an assert here at first because I assumed the shape couldn't change. It turns out it can! So now we have an assert to make it clear that we expect the input and output shapes are identical.
 ```py
 def sp_csr_to_pt(csr: scipy.sparse.csr_matrix, *, device: str) -> Tensor:
@@ -95,3 +112,14 @@ BirdSet (https://arxiv.org/abs/2403.10380): 8 bird soundscape datasets for multi
 BEANS (https://arxiv.org/abs/2210.12300): 12 diverse bioacoustics tasks from Earth Species Project. 7 classification tasks (birds, marine mammals, bats, dogs, mosquitoes) and 5 detection tasks. Primary metrics: accuracy (classification), mAP (detection).
 
 See docs/logbook.md for experiment logs and findings.
+
+# Slurm (Ascend cluster)
+
+Two main GPU partitions on Ascend:
+- `nextgen`: Standard partition, 7-day time limit
+- `preemptible-nextgen`: Preemptible jobs, 1-day time limit
+
+Account is `PAS2136`. Example job submission:
+```bash
+uv run python launch.py train --sweep sweeps/pretrain.py --n-hours 2 --slurm-acct PAS2136 --slurm-partition nextgen
+```

@@ -1,9 +1,8 @@
 import librosa
 import pytest
 import torch
-import transformers
 
-from saev.data import bird_mae
+from birdjepa.nn import bird_mae
 
 CKPTS = [
     "Bird-MAE-Base",
@@ -16,6 +15,7 @@ ATOL, RTOL = 1e-5, 1e-4
 
 @pytest.fixture(scope="session", params=CKPTS)
 def models(request):
+    transformers = pytest.importorskip("transformers")
     ckpt = request.param
     hf = transformers.AutoModel.from_pretrained(
         f"DBD-research-group/{ckpt}", trust_remote_code=True
@@ -62,6 +62,8 @@ def test_values_close_batch(models):
 
 @pytest.mark.parametrize("ckpt", CKPTS)
 def test_transform_matches_hf_feature_extractor(ckpt):
+    transformers = pytest.importorskip("transformers")
+
     waveform, _ = librosa.load(librosa.ex("robin"), sr=32_000)
 
     hf_extractor = transformers.AutoFeatureExtractor.from_pretrained(
