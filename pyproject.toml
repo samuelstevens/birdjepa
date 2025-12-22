@@ -14,12 +14,13 @@ dependencies = [
     "huggingface-hub>=1.2.3",
     "jaxtyping>=0.2.38",
     "librosa>=0.11.0",
+    "marimo>=0.18.4",
+    "matplotlib>=3.10.8",
     "polars>=1.36.1",
     "requests>=2.32.0",
     "safetensors>=0.5.0",
     "scikit-learn>=1.6.0",
     "submitit>=1.5.4",
-    "timm>=1.0.22",
     "torch>=2.9.1",
     "torchaudio>=2.9.1",
     "torchcodec>=0.9.1",
@@ -41,6 +42,7 @@ ignore = ["F722"]  # jaxtyping string annotations
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.148.7",
     "pytest>=9.0.2",
     "pytest-cov>=6.0.0",
 ]

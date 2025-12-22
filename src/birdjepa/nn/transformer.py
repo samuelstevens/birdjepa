@@ -6,8 +6,77 @@ import beartype
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from jaxtyping import Float, jaxtyped
+from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor
+
+
+# -----------------------------------------------------------------------------
+# Patchify/Unpatchify Helpers
+# -----------------------------------------------------------------------------
+
+
+@jaxtyped(typechecker=beartype.beartype)
+def patchify(
+    x_bhw: Float[Tensor, "b h w"], cfg: "Config"
+) -> tuple[Float[Tensor, "b n k"], Int[Tensor, "b n 2"]]:
+    """Convert 2D input to flattened patches with grid coordinates.
+
+    Args:
+        x_bhw: Input tensor of shape (B, H, W).
+        cfg: Transformer config with patch sizes.
+
+    Returns:
+        x_bnk: Patches of shape (B, n_patches, patch_h * patch_w).
+        grid_bn2: Grid coordinates (row, col) for each patch.
+    """
+    b, h, w = x_bhw.shape
+    ph, pw = cfg.patch_h, cfg.patch_w
+    n_h, n_w = h // ph, w // pw
+
+    # Reshape to patches: (B, n_h, patch_h, n_w, patch_w) -> (B, n_h*n_w, patch_h*patch_w)
+    x = x_bhw.view(b, n_h, ph, n_w, pw)
+    x = x.permute(0, 1, 3, 2, 4)  # (B, n_h, n_w, patch_h, patch_w)
+    x_bnk = x.reshape(b, n_h * n_w, ph * pw)
+
+    # Generate grid coordinates
+    rows = torch.arange(n_h, device=x_bhw.device)
+    cols = torch.arange(n_w, device=x_bhw.device)
+    grid_row, grid_col = torch.meshgrid(rows, cols, indexing="ij")
+    grid = torch.stack([grid_row.flatten(), grid_col.flatten()], dim=-1)  # (n, 2)
+    grid_bn2 = grid.unsqueeze(0).expand(b, -1, -1)  # (B, n, 2)
+
+    return x_bnk, grid_bn2
+
+
+@jaxtyped(typechecker=beartype.beartype)
+def unpatchify(
+    x_bnk: Float[Tensor, "b n k"], grid_bn2: Int[Tensor, "b n 2"], cfg: "Config"
+) -> Float[Tensor, "b h w"]:
+    """Reconstruct 2D input from patches using grid coordinates.
+
+    Args:
+        x_bnk: Patches of shape (B, n_patches, patch_h * patch_w).
+        grid_bn2: Grid coordinates (row, col) for each patch.
+        cfg: Transformer config with patch sizes.
+
+    Returns:
+        x_bhw: Reconstructed tensor of shape (B, H, W).
+    """
+    b, n, k = x_bnk.shape
+    ph, pw = cfg.patch_h, cfg.patch_w
+    n_h, n_w = cfg.n_patches_h, cfg.n_patches_w
+
+    # Create output tensor
+    x_bhw = torch.zeros(b, n_h * ph, n_w * pw, device=x_bnk.device, dtype=x_bnk.dtype)
+
+    # Place each patch at its grid position
+    for i in range(n):
+        row = grid_bn2[0, i, 0].item()  # Same grid for all batch elements
+        col = grid_bn2[0, i, 1].item()
+        patch = x_bnk[:, i].view(b, ph, pw)
+        x_bhw[:, row * ph : (row + 1) * ph, col * pw : (col + 1) * pw] = patch
+
+    return x_bhw
 
 
 @beartype.beartype
@@ -44,8 +113,10 @@ class Config:
     """Use learnable per-layer residual scaling (from CaiT)."""
     layerscale_init: float = 1e-4
     """Initial value for LayerScale parameters."""
-    n_registers: int = 0
-    """Number of register tokens (0 = none)."""
+    n_cls_tokens: int = 1
+    """Number of CLS tokens (Pixio uses 4-8)."""
+    n_reg_tokens: int = 0
+    """Number of register tokens (discarded at inference)."""
 
     @property
     def n_patches_h(self) -> int:
@@ -61,23 +132,25 @@ class Config:
 
 
 class PatchEmbed(nn.Module):
-    """2D input to patch embeddings via convolution."""
+    """Linear projection of flattened patches to embeddings."""
 
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        self.proj = nn.Conv2d(
-            1,
-            cfg.embed_dim,
-            kernel_size=(cfg.patch_h, cfg.patch_w),
-            stride=(cfg.patch_h, cfg.patch_w),
-        )
+        kernel_size = cfg.patch_h * cfg.patch_w
+        self.proj = nn.Linear(kernel_size, cfg.embed_dim)
 
     @jaxtyped(typechecker=beartype.beartype)
-    def forward(self, x_bhw: Float[Tensor, "b h w"]) -> Float[Tensor, "b n d"]:
-        x = x_bhw.unsqueeze(1)  # (B, 1, H, W)
-        x_bnd = self.proj(x).flatten(2).transpose(1, 2)  # (B, N, D)
-        return x_bnd
+    def forward(self, x_btk: Float[Tensor, "b t k"]) -> Float[Tensor, "b t d"]:
+        """Project flattened patches to embeddings.
+
+        Args:
+            x_btk: Flattened patches (B, T, patch_h * patch_w).
+
+        Returns:
+            x_btd: Patch embeddings (B, T, embed_dim).
+        """
+        return self.proj(x_btk)
 
 
 class Attention(nn.Module):
@@ -196,27 +269,40 @@ class Block(nn.Module):
 class Transformer(nn.Module):
     """Simple bidirectional transformer encoder.
 
-    Takes 2D inputs of shape (B, H, W) and returns:
-    - cls: (B, D) CLS token representation
-    - patches: (B, N, D) patch representations
+    New API: Takes pre-patchified input (B, T, kernel) + grid coordinates.
+    This allows encoder to process any subset of patches (for MAE efficiency).
+
+    Returns a dict with "cls", "patches", and "reg" keys for flexible pooling.
     """
 
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
 
-        if cfg.n_registers > 0:
-            raise NotImplementedError("Register tokens not yet implemented")
-
         self.patch_embed = PatchEmbed(cfg)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.embed_dim))
 
-        # Positional embeddings (only used if not using RoPE)
+        # CLS tokens (can be multiple for Pixio-style training)
+        self.cls_tokens = nn.Parameter(torch.zeros(1, cfg.n_cls_tokens, cfg.embed_dim))
+
+        # Register tokens (optional, discarded at inference)
+        if cfg.n_reg_tokens > 0:
+            self.reg_tokens = nn.Parameter(
+                torch.zeros(1, cfg.n_reg_tokens, cfg.embed_dim)
+            )
+        else:
+            self.reg_tokens = None
+
+        # Positional embeddings: 2D grid that we index into based on grid coords
+        # Shape: (1, n_patches_h, n_patches_w, embed_dim) for easy indexing
         if cfg.use_rope:
             raise NotImplementedError("RoPE not yet implemented")
         else:
-            self.pos_embed = nn.Parameter(
-                torch.zeros(1, 1 + cfg.n_patches, cfg.embed_dim)
+            self.pos_embed_hw = nn.Parameter(
+                torch.zeros(1, cfg.n_patches_h, cfg.n_patches_w, cfg.embed_dim)
+            )
+            # Separate pos embed for each CLS token
+            self.cls_pos_embed = nn.Parameter(
+                torch.zeros(1, cfg.n_cls_tokens, cfg.embed_dim)
             )
 
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.depth)])
@@ -225,28 +311,61 @@ class Transformer(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        if self.pos_embed is not None:
-            nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        if self.pos_embed_hw is not None:
+            nn.init.trunc_normal_(self.pos_embed_hw, std=0.02)
+            nn.init.trunc_normal_(self.cls_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_tokens, std=0.02)
+        if self.reg_tokens is not None:
+            nn.init.trunc_normal_(self.reg_tokens, std=0.02)
 
-    @jaxtyped(typechecker=beartype.beartype)
+    @beartype.beartype
     def forward(
-        self, x_bhw: Float[Tensor, "b h w"]
-    ) -> tuple[Float[Tensor, "b d"], Float[Tensor, "b n d"]]:
-        """Forward pass."""
-        b = x_bhw.shape[0]
-        x = self.patch_embed(x_bhw)  # (B, N, D)
+        self, x_btk: Float[Tensor, "b t k"], *, grid: Int[Tensor, "b t 2"]
+    ) -> dict[str, Tensor]:
+        """Forward pass with pre-patchified input.
 
-        cls_tokens = self.cls_token.expand(b, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)  # (B, 1+N, D)
+        Args:
+            x_btk: Flattened patches (B, T, patch_h * patch_w). T can be any subset.
+            grid: Grid coordinates (row, col) for each patch (B, T, 2).
 
-        if self.pos_embed is not None:
-            x = x + self.pos_embed
+        Returns:
+            Dict with keys:
+                "cls": (B, n_cls_tokens, D) - CLS token embeddings
+                "patches": (B, T, D) - patch embeddings
+                "reg": (B, n_reg_tokens, D) - register tokens (empty if n_reg_tokens=0)
+        """
+        b, t, _ = x_btk.shape
+        n_cls = self.cfg.n_cls_tokens
+        n_reg = self.cfg.n_reg_tokens
+        x = self.patch_embed(x_btk)  # (B, T, D)
+
+        # Get positional embeddings for each patch based on grid coordinates
+        if self.pos_embed_hw is not None:
+            pos_embed = self.pos_embed_hw[0, grid[..., 0], grid[..., 1]]  # (B, T, D)
+            x = x + pos_embed
+
+        # Prepend CLS tokens
+        cls = self.cls_tokens.expand(b, -1, -1)
+        if self.cls_pos_embed is not None:
+            cls = cls + self.cls_pos_embed
+        x = torch.cat([cls, x], dim=1)  # (B, n_cls+T, D)
+
+        # Append register tokens (no positional embedding)
+        if self.reg_tokens is not None:
+            reg = self.reg_tokens.expand(b, -1, -1)
+            x = torch.cat([x, reg], dim=1)  # (B, n_cls+T+n_reg, D)
 
         for block in self.blocks:
             x = block(x)
 
         x = self.norm(x)
-        cls_bd: Float[Tensor, "b d"] = x[:, 0]
-        patches_bnd: Float[Tensor, "b n d"] = x[:, 1:]
-        return cls_bd, patches_bnd
+
+        # Split output: [CLS tokens | patches | register tokens]
+        cls_out = x[:, :n_cls]  # (B, n_cls, D)
+        patches_out = x[:, n_cls : n_cls + t]  # (B, T, D)
+        if n_reg > 0:
+            reg_out = x[:, n_cls + t :]  # (B, n_reg, D)
+        else:
+            reg_out = x.new_empty(b, 0, self.cfg.embed_dim)
+
+        return {"cls": cls_out, "patches": patches_out, "reg": reg_out}

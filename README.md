@@ -35,6 +35,12 @@ On OSC, we need ffmpeg, which can be loaded with `module load ffmpeg/6.1.1`.
   - [ ] NEPA ([sihanxu.me/nepa](https://sihanxu.me/nepa)): modern ViT training tricks
   - [ ] Perception Encoder ([arxiv.org/abs/2504.13181](https://arxiv.org/abs/2504.13181)): modern ViT training tricks
 - [ ] Implement asymmetric patch sizes (16x16, 8x32, 4x64)
+- [ ] BIRB benchmark (https://arxiv.org/pdf/2312.07439)
+
+### Data
+- [ ] Add iNat Sounds 2024 ([github.com/visipedia/inat_sounds/tree/main/2024](https://github.com/visipedia/inat_sounds/tree/main/2024))
+- [ ] Add FSD50K for non-bird sounds ([zenodo.org/record/4060432](https://zenodo.org/record/4060432))
+- [ ] Full Xeno-Canto (beyond XCL/XCM subsets)
 
 ### Benchmark
 - [ ] Add Perch2 to benchmark registry (requires TensorFlow, see [arxiv.org/abs/2508.04665](https://arxiv.org/abs/2508.04665))

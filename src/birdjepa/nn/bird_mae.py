@@ -123,9 +123,6 @@ def get_2d_sincos_pos_embed_flexible(
     return pos_embed
 
 
-# --- timm-ish helpers ---------------------------------------------------------
-
-
 def _ntuple(n: int):
     def parse(x):
         if isinstance(x, Iterable) and not isinstance(x, str):

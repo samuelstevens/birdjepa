@@ -56,6 +56,8 @@ class Config:
     """Log training metrics every N steps."""
     device: str = "cuda"
     """Device to train on."""
+    probe_pooling: str = "cls"
+    """Pooling for probe: 'cls' (mean of CLS tokens) or 'patches' (mean of patches)."""
     # Checkpointing
     ckpt_to: pathlib.Path = pathlib.Path("./checkpoints")
     """Directory for checkpoints."""
@@ -131,7 +133,7 @@ def worker_fn(cfg: Config):
     n_classes = base_ds.n_classes
     encoder = birdjepa.nn.transformer.Transformer(cfg.model).to(cfg.device)
     objective = birdjepa.nn.objectives.make_objective(
-        cfg.objective, cfg.model, n_classes
+        cfg.objective, cfg.model, n_classes, probe_pooling=cfg.probe_pooling
     ).to(cfg.device)
 
     # Wrap dataset for objective (e.g., multi-view for LeJEPA)
@@ -258,12 +260,18 @@ def worker_fn(cfg: Config):
         probe.eval()
         correct = 0
         total = 0
+
         with torch.inference_mode():
             for batch in test_loader:
                 data = batch["data"].to(cfg.device, non_blocking=True)
                 targets = batch["target"].to(cfg.device, non_blocking=True)
                 with autocast(cfg.device, dtype=torch.bfloat16):
-                    emb, _ = encoder(data)
+                    x_bnk, grid = birdjepa.nn.transformer.patchify(data, cfg.model)
+                    out = encoder(x_bnk, grid=grid)
+                    if cfg.probe_pooling == "cls":
+                        emb = out["cls"].mean(dim=1)
+                    else:
+                        emb = out["patches"].mean(dim=1)
                     logits = probe(emb)
                     preds = logits.argmax(dim=1)
                 correct += (preds == targets).sum().item()
