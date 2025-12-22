@@ -1,4 +1,7 @@
-"""Augmentation configs and transforms."""
+"""Augmentation configs and transforms.
+
+Implementation note: Augmentations should match standard libraries (torchvision.transforms.v2, torchaudio) or cite papers. This ensures reproducibility and makes it easier to compare with published results. Always cite the source when implementing an augmentation.
+"""
 
 import dataclasses
 
@@ -108,9 +111,12 @@ Config = (
 def apply_random_crop(
     x_hw: Float[Tensor, "h w"], cfg: RandomCrop
 ) -> Float[Tensor, "h w"]:
-    """Pad then random crop back to original size."""
+    """Pad with zeros then random crop back to original size.
+
+    Matches torchvision.transforms.v2.RandomCrop with padding_mode='constant', fill=0.
+    """
     h, w = x_hw.shape
-    padded = F.pad(x_hw, [cfg.padding] * 4, mode="reflect")
+    padded = F.pad(x_hw, [cfg.padding] * 4)
     top = torch.randint(0, 2 * cfg.padding + 1, ()).item()
     left = torch.randint(0, 2 * cfg.padding + 1, ()).item()
     return padded[top : top + h, left : left + w]
@@ -120,7 +126,10 @@ def apply_random_crop(
 def apply_horizontal_flip(
     x_hw: Float[Tensor, "h w"], cfg: HorizontalFlip
 ) -> Float[Tensor, "h w"]:
-    """Random horizontal flip."""
+    """Random horizontal flip.
+
+    Matches torchvision.transforms.v2.RandomHorizontalFlip.
+    """
     if torch.rand(()).item() < cfg.p:
         return x_hw.flip(-1)
     return x_hw
@@ -130,13 +139,19 @@ def apply_horizontal_flip(
 def apply_gaussian_noise(
     x_hw: Float[Tensor, "h w"], cfg: GaussianNoise
 ) -> Float[Tensor, "h w"]:
-    """Add Gaussian noise."""
+    """Add Gaussian noise.
+
+    Standard augmentation for audio/spectrograms. See torchaudio or audiomentations.
+    """
     return x_hw + torch.randn_like(x_hw) * cfg.std
 
 
 @jaxtyped(typechecker=beartype.beartype)
 def apply_freq_mask(x_hw: Float[Tensor, "h w"], cfg: FreqMask) -> Float[Tensor, "h w"]:
-    """SpecAugment frequency masking (zeros out horizontal bands)."""
+    """SpecAugment frequency masking (zeros out horizontal bands).
+
+    From "SpecAugment" (Park et al., 2019). https://arxiv.org/abs/1904.08779
+    """
     h, w = x_hw.shape
     x = x_hw.clone()
     for _ in range(cfg.n_masks):
@@ -148,7 +163,10 @@ def apply_freq_mask(x_hw: Float[Tensor, "h w"], cfg: FreqMask) -> Float[Tensor, 
 
 @jaxtyped(typechecker=beartype.beartype)
 def apply_time_mask(x_hw: Float[Tensor, "h w"], cfg: TimeMask) -> Float[Tensor, "h w"]:
-    """SpecAugment time masking (zeros out vertical bands)."""
+    """SpecAugment time masking (zeros out vertical bands).
+
+    From "SpecAugment" (Park et al., 2019). https://arxiv.org/abs/1904.08779
+    """
     h, w = x_hw.shape
     x = x_hw.clone()
     for _ in range(cfg.n_masks):
@@ -162,7 +180,10 @@ def apply_time_mask(x_hw: Float[Tensor, "h w"], cfg: TimeMask) -> Float[Tensor, 
 def apply_random_resized_crop(
     x_hw: Float[Tensor, "h w"], cfg: RandomResizedCrop
 ) -> Float[Tensor, "h w"]:
-    """Random crop then resize back to original size."""
+    """Random crop then resize back to original size.
+
+    Matches torchvision.transforms.v2.RandomResizedCrop.
+    """
     h, w = x_hw.shape
     area = h * w
 
@@ -199,7 +220,10 @@ def apply_random_resized_crop(
 def apply_color_jitter(
     x_hw: Float[Tensor, "h w"], cfg: ColorJitter
 ) -> Float[Tensor, "h w"]:
-    """Random brightness/contrast jitter for grayscale images."""
+    """Random brightness/contrast jitter for grayscale images.
+
+    Simplified version of torchvision.transforms.v2.ColorJitter (brightness/contrast only).
+    """
     # Brightness: add random offset
     if cfg.brightness > 0:
         brightness_factor = 1.0 + (torch.rand(()).item() * 2 - 1) * cfg.brightness
@@ -218,7 +242,10 @@ def apply_color_jitter(
 def apply_gaussian_blur(
     x_hw: Float[Tensor, "h w"], cfg: GaussianBlur
 ) -> Float[Tensor, "h w"]:
-    """Apply Gaussian blur with random sigma."""
+    """Apply Gaussian blur with random sigma.
+
+    Matches torchvision.transforms.v2.GaussianBlur.
+    """
     sigma = cfg.sigma_min + torch.rand(()).item() * (cfg.sigma_max - cfg.sigma_min)
 
     # Create 1D Gaussian kernel
@@ -240,7 +267,10 @@ def apply_gaussian_blur(
 
 @jaxtyped(typechecker=beartype.beartype)
 def apply_solarize(x_hw: Float[Tensor, "h w"], cfg: Solarize) -> Float[Tensor, "h w"]:
-    """Invert pixels above threshold with probability p."""
+    """Invert pixels above threshold with probability p.
+
+    Matches torchvision.transforms.v2.RandomSolarize. Threshold is in [0, 1] for normalized inputs.
+    """
     if torch.rand(()).item() < cfg.p:
         # Assuming input is normalized to [0, 1]
         mask = x_hw > cfg.threshold

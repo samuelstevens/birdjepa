@@ -4,8 +4,19 @@
 def make_cfgs() -> list[dict]:
     cfgs = []
 
+    # Shared model config: ViT-S on CIFAR-100 with 4x4 patches (64 patches total)
+    model = {
+        "input_h": 32,
+        "input_w": 32,
+        "patch_h": 4,
+        "patch_w": 4,
+        "embed_dim": 384,
+        "depth": 12,
+        "n_heads": 6,
+    }
+
     # LeJEPA-style augmentations for multi-view pretraining
-    train_augs = [
+    lejepa_augs = [
         {"__class__": "RandomResizedCrop", "scale_min": 0.08, "scale_max": 1.0},
         {"__class__": "ColorJitter", "brightness": 0.8, "contrast": 0.8},
         {
@@ -18,23 +29,40 @@ def make_cfgs() -> list[dict]:
         {"__class__": "HorizontalFlip", "p": 0.5},
     ]
 
-    # ViT-S on CIFAR-100 with 4x4 patches (64 patches total)
-    cfgs.append({
-        "train_data": {"__class__": "Cifar100", "augmentations": train_augs},
-        "test_data": {"__class__": "Cifar100", "split": "test"},
-        "model": {
-            "input_h": 32,
-            "input_w": 32,
-            "patch_h": 4,
-            "patch_w": 4,
-            "embed_dim": 384,
-            "depth": 12,
-            "n_heads": 6,
+    # Strong augmentations for supervised learning (similar to LeJEPA but no Solarize)
+    supervised_augs = [
+        {"__class__": "RandomResizedCrop", "scale_min": 0.08, "scale_max": 1.0},
+        {"__class__": "ColorJitter", "brightness": 0.4, "contrast": 0.4},
+        {
+            "__class__": "GaussianBlur",
+            "kernel_size": 3,
+            "sigma_min": 0.1,
+            "sigma_max": 1.0,
         },
-        "objective": {"__class__": "LeJEPAConfig", "proj_dim": 16},
+        {"__class__": "HorizontalFlip", "p": 0.5},
+    ]
+
+    # LeJEPA self-supervised pretraining
+    # cfgs.append({
+    #     "train_data": {"__class__": "Cifar100", "augmentations": lejepa_augs},
+    #     "test_data": {"__class__": "Cifar100", "split": "test"},
+    #     "model": model,
+    #     "objective": {"__class__": "LeJEPAConfig", "proj_dim": 16},
+    #     "batch_size": 256,
+    #     "lr": 2e-3,
+    #     "epochs": 800,
+    #     "n_workers": 4,
+    # })
+
+    # Supervised baseline
+    cfgs.append({
+        "train_data": {"__class__": "Cifar100", "augmentations": supervised_augs},
+        "test_data": {"__class__": "Cifar100", "split": "test"},
+        "model": model,
+        "objective": {"__class__": "SupervisedConfig"},
         "batch_size": 256,
-        "lr": 2e-3,
-        "epochs": 800,
+        "lr": 1e-3,
+        "epochs": 200,
         "n_workers": 4,
     })
 

@@ -202,7 +202,12 @@ def worker_fn(cfg: Config):
         epoch_probe_loss = 0.0
 
         for batch in train_loader:
-            batch = {k: v.to(cfg.device, non_blocking=True) for k, v in batch.items()}
+            batch = {
+                k: v.to(cfg.device, non_blocking=True)
+                if isinstance(v, torch.Tensor)
+                else v
+                for k, v in batch.items()
+            }
 
             with autocast(cfg.device, dtype=torch.bfloat16):
                 losses, emb, targets = objective(batch, encoder)
