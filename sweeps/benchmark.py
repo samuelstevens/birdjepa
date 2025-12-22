@@ -1,9 +1,9 @@
 """Sweep: evaluate Bird-MAE models on all BirdSet tasks."""
 
 TASKS = ["pow", "per", "nes", "uhh", "hsn", "nbp", "ssw", "sne"]
-MODELS = ["Bird-MAE-Base", "Bird-MAE-Large", "Bird-MAE-Huge"]
-CLFS = ["linear", "mlp", "centroid"]
-N_TRAINS = [1, 5, -1]
+MODELS = ["Bird-MAE-Base"]
+CLFS = ["linear"]
+N_TRAINS = [1]
 
 
 def make_cfgs() -> list[dict]:

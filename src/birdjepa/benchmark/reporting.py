@@ -1,45 +1,25 @@
 """
-SQLite-based experiment tracking for benchmark results.
+Parquet-based experiment tracking for benchmark results.
 
-Provides deduplication (skip already-run experiments) and worker coordination for parallel execution.
+Each experiment is stored as a separate parquet file, queryable via DuckDB.
 """
 
 import dataclasses
+import datetime
 import json
 import logging
 import os
 import pathlib
-import random
 import socket
-import sqlite3
 import subprocess
 import sys
 import time
 
 import beartype
+import duckdb
+import polars as pl
 
 logger = logging.getLogger(__name__)
-
-schema_fpath = pathlib.Path(__file__).parent / "schema.sql"
-
-max_retries = 10
-max_backoff_s = 30.0
-
-
-@beartype.beartype
-def get_db(report_to: str | pathlib.Path) -> sqlite3.Connection:
-    """Get a connection to the reports database."""
-    report_to = pathlib.Path(os.path.expandvars(report_to))
-    report_to.mkdir(parents=True, exist_ok=True)
-
-    db_fpath = report_to / "benchmark.sqlite"
-    db = sqlite3.connect(db_fpath, autocommit=True)
-
-    with open(schema_fpath) as fd:
-        db.executescript(fd.read())
-    db.autocommit = False
-
-    return db
 
 
 @beartype.beartype
@@ -58,76 +38,22 @@ class ExpKey:
 
 
 @beartype.beartype
-def already_ran(db: sqlite3.Connection, key: ExpKey) -> bool:
-    """Check if an experiment has already been run."""
+def already_ran(report_to: str | pathlib.Path, key: ExpKey) -> bool:
+    """Check if experiment exists in any parquet file."""
+    report_to = pathlib.Path(os.path.expandvars(report_to))
+    raw_dir = report_to / "raw"
+    if not raw_dir.exists():
+        return False
+    pattern = str(raw_dir / "*.parquet")
     query = """
-    SELECT COUNT(*) FROM experiments
-    WHERE task_name = ? AND model_org = ? AND model_ckpt = ? AND clf = ? AND n_train = ?
-    """
-    (count,) = db.execute(query, key.as_tuple()).fetchone()
-    return count > 0
-
-
-@beartype.beartype
-def is_claimed(db: sqlite3.Connection, key: ExpKey) -> bool:
-    """Check if a run is already claimed by another process."""
-    query = """
-    SELECT COUNT(*) FROM runs
-    WHERE task_name = ? AND model_org = ? AND model_ckpt = ? AND clf = ? AND n_train = ?
-    """
-    (count,) = db.execute(query, key.as_tuple()).fetchone()
-    return count > 0
-
-
-@beartype.beartype
-def claim_run(db: sqlite3.Connection, key: ExpKey) -> bool:
-    """Try to claim an experiment. Returns True if claimed, False if already taken."""
-    stmt = """
-    INSERT OR IGNORE INTO runs (task_name, model_org, model_ckpt, clf, n_train, pid, posix)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    """
-    values = (*key.as_tuple(), os.getpid(), time.time())
-
-    try:
-        cur = db.execute(stmt, values)
-        db.commit()
-        claimed = cur.rowcount == 1
-        if claimed:
-            logger.info("Claimed %s.", key)
-        return claimed
-    except Exception:
-        db.rollback()
-        raise
-
-
-@beartype.beartype
-def release_run(db: sqlite3.Connection, key: ExpKey) -> None:
-    """Release a claimed run so others may claim it."""
-    stmt = """
-    DELETE FROM runs
+    SELECT COUNT(*) FROM read_parquet(?)
     WHERE task_name = ? AND model_org = ? AND model_ckpt = ? AND clf = ? AND n_train = ?
     """
     try:
-        db.execute(stmt, key.as_tuple())
-        db.commit()
-        logger.info("Released %s.", key)
-    except Exception:
-        db.rollback()
-        raise
-
-
-@beartype.beartype
-def clear_stale_claims(db: sqlite3.Connection, *, max_age_hours: int = 72) -> int:
-    """Delete claims older than max_age_hours. Returns number deleted."""
-    assert max_age_hours > 0
-    cutoff = time.time() - max_age_hours * 3600
-    try:
-        cur = db.execute("DELETE FROM runs WHERE posix < ?", (cutoff,))
-        db.commit()
-        return cur.rowcount
-    except Exception:
-        db.rollback()
-        raise
+        result = duckdb.execute(query, [pattern, *key.as_tuple()]).fetchone()
+        return result[0] > 0
+    except duckdb.IOException:
+        return False  # No parquet files yet
 
 
 def get_git_hash() -> str:
@@ -191,76 +117,43 @@ class Report:
     gpu_name: str = dataclasses.field(default_factory=get_gpu_name)
     hostname: str = dataclasses.field(default_factory=socket.gethostname)
 
-    def write(self, db: sqlite3.Connection) -> None:
-        """Save the report to the database with exponential backoff for lock contention."""
-        exp_stmt = """
-        INSERT INTO experiments
-        (task_name, model_org, model_ckpt, clf, n_train, cmap, n_classes,
-         exp_cfg, argv, git_commit, posix, gpu_name, hostname)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
-        pred_stmt = """
-        INSERT INTO predictions
-        (example_id, y_true, y_pred, y_score, experiment_id)
-        VALUES (?, ?, ?, ?, ?)
-        """
+    def write(self, report_to: str | pathlib.Path) -> None:
+        """Save report as a parquet file."""
+        report_to = pathlib.Path(os.path.expandvars(report_to))
+        raw_dir = report_to / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
 
-        exp_values = (
-            *self.key.as_tuple(),
-            self.cmap,
-            self.n_classes,
-            json.dumps(self.exp_cfg),
-            json.dumps(self.argv),
-            self.git_commit,
-            self.posix,
-            self.gpu_name,
-            self.hostname,
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        fpath = raw_dir / f"{timestamp}.parquet"
+
+        # Build dataframe with experiment metadata + predictions
+        data = {
+            "task_name": self.key.task_name,
+            "model_org": self.key.model_org,
+            "model_ckpt": self.key.model_ckpt,
+            "clf": self.key.clf,
+            "n_train": self.key.n_train,
+            "cmap": self.cmap,
+            "n_classes": self.n_classes,
+            "exp_cfg": json.dumps(self.exp_cfg),
+            "argv": json.dumps(self.argv),
+            "git_commit": self.git_commit,
+            "posix": self.posix,
+            "gpu_name": self.gpu_name,
+            "hostname": self.hostname,
+            # Predictions as lists
+            "pred_example_ids": [[p.example_id for p in self.predictions]],
+            "pred_y_true": [[p.y_true for p in self.predictions]],
+            "pred_y_pred": [[p.y_pred for p in self.predictions]],
+            "pred_y_score": [[p.y_score for p in self.predictions]],
+        }
+        df = pl.DataFrame(data)
+
+        # Atomic write: temp file then rename
+        tmp_fpath = fpath.with_suffix(".parquet.tmp")
+        df.write_parquet(tmp_fpath)
+        tmp_fpath.rename(fpath)
+
+        logger.info(
+            "Saved report for %s (cmAP=%.4f) to %s", self.key, self.cmap, fpath.name
         )
-        pred_values = [
-            (
-                p.example_id,
-                json.dumps(p.y_true),
-                json.dumps(p.y_pred),
-                json.dumps(p.y_score),
-                None,  # experiment_id filled in after insert
-            )
-            for p in self.predictions
-        ]
-
-        for attempt in range(max_retries):
-            try:
-                cursor = db.cursor()
-                cursor.execute(exp_stmt, exp_values)
-                exp_id = cursor.lastrowid
-                # Update pred_values with actual experiment_id
-                pred_values_with_id = [(*pv[:-1], exp_id) for pv in pred_values]
-                cursor.executemany(pred_stmt, pred_values_with_id)
-                db.commit()
-                logger.info("Saved report for %s (cmAP=%.4f).", self.key, self.cmap)
-                return
-            except sqlite3.OperationalError as err:
-                db.rollback()
-                if "database is locked" not in str(err):
-                    raise
-                if attempt == max_retries - 1:
-                    logger.error(
-                        "Failed to write report for %s after %d attempts: %s",
-                        self.key,
-                        max_retries,
-                        err,
-                    )
-                    raise
-                # Exponential backoff with jitter: 2^attempt * random(0.5, 1.5), capped
-                delay = min(max_backoff_s, (2**attempt) * random.uniform(0.5, 1.5))
-                logger.warning(
-                    "Database locked for %s, retrying in %.1fs (attempt %d/%d)",
-                    self.key,
-                    delay,
-                    attempt + 1,
-                    max_retries,
-                )
-                time.sleep(delay)
-            except sqlite3.Error as err:
-                db.rollback()
-                logger.error("Failed to write report for %s: %s", self.key, err)
-                raise

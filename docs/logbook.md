@@ -213,9 +213,9 @@ Note: 4x64 means 4 time frames x 64 mel bins per patch, so each patch is tall (c
 Pixio paper notes (arxiv.org/abs/2512.15715)
 
 Key improvements over vanilla MAE:
-1. **Deeper decoder**: 32 blocks instead of 8. The shallow MAE decoder forced encoder's later blocks to handle reconstruction details instead of learning good representations.
-2. **Block masking**: 4x4 patch blocks instead of single patches (75% mask ratio). Prevents reconstruction shortcuts from nearby visible patches.
-3. **Multiple class tokens**: 8 instead of 1. Captures diverse global properties (scene type, style, camera pose). Unlike register tokens, these are used directly for downstream tasks.
+1. Deeper decoder: 32 blocks instead of 8. The shallow MAE decoder forced encoder's later blocks to handle reconstruction details instead of learning good representations.
+2. Block masking: 4x4 patch blocks instead of single patches (75% mask ratio). Prevents reconstruction shortcuts from nearby visible patches.
+3. Multiple class tokens: 8 instead of 1. Captures diverse global properties (scene type, style, camera pose). Unlike register tokens, these are used directly for downstream tasks.
 
 For BirdJEPA, we could adapt:
 - Deeper decoder for richer reconstruction signal
@@ -225,3 +225,47 @@ For BirdJEPA, we could adapt:
 Other papers to read:
 - NEPA (sihanxu.me/nepa)
 - Perception Encoder (arxiv.org/abs/2504.13181)
+
+
+# 12/21/2025
+
+Experimental plan: systematically comparing architecture and training decisions
+
+Using XCM with ViT-S and ViT-B as testbeds to validate architecture decisions from recent papers (Pixio, Perception Encoder, etc).
+
+Baseline: Supervised pretraining on XCM with AdamW and standard parameterization (SP). Tune learning rate on ViT-S first.
+
+"Free wins" (adopt without extensive ablation):
+- RoPE instead of absolute positional embeddings (better length generalization)
+- QK-Norm (attention stability at scale)
+- SwiGLU activation (consistently better than GELU)
+- Register tokens (absorb artifacts, prevent attention collapse)
+
+Factorial comparison (need to test combinations):
+
+| Factor | Levels |
+|--------|--------|
+| Objective | Supervised, LeJEPA, Pixio |
+| Optimizer | AdamW, Muon |
+| Parameterization | SP, muP |
+
+3 x 2 x 2 = 12 combinations on ViT-S.
+
+Pixio-style changes (for MAE baseline):
+- Deeper decoder (8-32 blocks instead of shallow)
+- Block masking (contiguous time regions, not random patches)
+- Multiple CLS/register tokens (8 tokens capturing different acoustic properties)
+
+Experimental phases:
+
+1. Phase 1: Supervised baseline on ViT-S, tune LR
+2. Phase 2: Add "free wins" (RoPE, QK-Norm, SwiGLU), verify no regression
+3. Phase 3: Factorial on objectives x optimizers x parameterization (12 configs on ViT-S)
+4. Phase 4: Transfer best config to ViT-B (if muP works, LR should transfer directly)
+
+Evaluation: Online linear probe accuracy during pretraining, then downstream BirdSet/BEANS.
+
+Note on multiple CLS tokens vs register tokens:
+- Register tokens (DINOv2): Extra tokens that absorb artifacts, discarded at inference
+- Multiple CLS tokens (Pixio): All 8 tokens used for representation, concatenated or pooled for downstream
+- For our purposes, likely similar effect - both add learnable tokens to the sequence

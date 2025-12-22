@@ -147,6 +147,8 @@ class Config:
     """Learning rate for linear probe."""
     epochs: int = 20
     """Training epochs for linear probe."""
+    log_every: int = 5
+    """Log training progress every N epochs."""
     batch_size: int = 64
     """Batch size."""
     device: str = "cuda"
@@ -182,8 +184,8 @@ def make_exp_key(cfg: Config) -> reporting.ExpKey:
 
 
 @beartype.beartype
-def worker_fn(cfg: Config) -> reporting.Report:
-    """Run a single benchmark experiment. Returns the Report (caller writes to DB)."""
+def worker_fn(cfg: Config) -> None:
+    """Run a single benchmark experiment and write results to parquet."""
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
@@ -244,29 +246,28 @@ def worker_fn(cfg: Config) -> reporting.Report:
     cmap, n_classes_eval, predictions = evaluate(probe, test, cfg.device)
     logger.info("Results: cmAP=%.4f", cmap)
 
-    # 6. Build report
+    # 6. Build and write report
     exp_cfg = dataclasses.asdict(cfg)
     for k, v in exp_cfg.items():
         if isinstance(v, pathlib.Path):
             exp_cfg[k] = str(v)
 
-    return reporting.Report(
+    report = reporting.Report(
         key=key,
         cmap=cmap,
         n_classes=n_classes_eval,
         predictions=predictions,
         exp_cfg=exp_cfg,
     )
+    report.write(cfg.report_to)
 
 
 @beartype.beartype
-def get_skip_reason(db, cfg: Config) -> str | None:
+def get_skip_reason(report_to: pathlib.Path, cfg: Config) -> str | None:
     """Return a reason to skip this experiment, or None if it should run."""
     key = make_exp_key(cfg)
-    if reporting.already_ran(db, key):
+    if reporting.already_ran(report_to, key):
         return "done"
-    if reporting.is_claimed(db, key):
-        return "claimed"
     return None
 
 
@@ -281,20 +282,30 @@ def load_sweep_cfgs(sweep_fpath: str) -> list[dict]:
 
 
 @beartype.beartype
-def print_results_table(db, cfgs: list[Config]):
+def print_results_table(report_to: pathlib.Path, cfgs: list[Config]):
     """Print a table of results for the given configs."""
+    import duckdb
+
     # Get dimensions from configs
     tasks = sorted({c.task for c in cfgs})
     clfs = sorted({c.classifier for c in cfgs})
     n_trains = sorted({c.n_train for c in cfgs})
     models = sorted({c.model_ckpt for c in cfgs})
 
-    # Query results
-    query = "SELECT task_name, model_ckpt, clf, n_train, cmap FROM experiments"
-    rows = db.execute(query).fetchall()
+    # Query results from parquet files
+    raw_dir = report_to / "raw"
     results: dict[tuple[str, str, str, int], float] = {}
-    for task_name, model_ckpt, clf, n_train, cmap in rows:
-        results[(task_name, model_ckpt, clf, n_train)] = cmap
+    if raw_dir.exists():
+        pattern = str(raw_dir / "*.parquet")
+        try:
+            query = (
+                "SELECT task_name, model_ckpt, clf, n_train, cmap FROM read_parquet(?)"
+            )
+            rows = duckdb.execute(query, [pattern]).fetchall()
+            for task_name, model_ckpt, clf, n_train, cmap in rows:
+                results[(task_name, model_ckpt, clf, n_train)] = cmap
+        except duckdb.IOException:
+            pass  # No parquet files yet
 
     # Print table for each model
     for model in models:
@@ -319,16 +330,9 @@ def print_results_table(db, cfgs: list[Config]):
 
 @beartype.beartype
 def cli(cfg: Config):
-    """CLI entrypoint: check DB, then run locally or submit to Slurm."""
+    """CLI entrypoint: run locally or submit to Slurm."""
     log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
     logging.basicConfig(level=logging.INFO, format=log_format)
-
-    db = reporting.get_db(cfg.report_to)
-
-    # Clear stale claims
-    cleared = reporting.clear_stale_claims(db, max_age_hours=24 * 5)
-    if cleared:
-        logger.info("Cleared %d stale claims.", cleared)
 
     # Collect all configs to run
     if cfg.sweep:
@@ -340,12 +344,14 @@ def cli(cfg: Config):
 
     # Dry run: show table and what would run
     if cfg.dry_run:
-        print_results_table(db, cfgs)
+        print_results_table(cfg.report_to, cfgs)
         print("\nWould run:")
         for c in cfgs:
             key = make_exp_key(c)
-            reason = get_skip_reason(db, c)
-            if reason:
+            reason = get_skip_reason(cfg.report_to, c)
+            if reason == "done":
+                continue
+            elif reason:
                 print(f"  [skip: {reason}] {key}")
             else:
                 print(f"  [pending] {key}")
@@ -355,12 +361,11 @@ def cli(cfg: Config):
     to_run: list[Config] = []
     for c in cfgs:
         key = make_exp_key(c)
-        reason = get_skip_reason(db, c)
+        reason = get_skip_reason(cfg.report_to, c)
+        if reason == "done":
+            continue
         if reason:
             logger.info("Skipping %s: %s", key, reason)
-            continue
-        if not reporting.claim_run(db, key):
-            logger.info("Run %s just claimed by another worker, skipping.", key)
             continue
         to_run.append(c)
 
@@ -382,32 +387,16 @@ def cli(cfg: Config):
             setup=["module load ffmpeg/6.1.1"],
         )
 
-        # Batch submit all jobs
+        # Batch submit all jobs (workers write to parquet themselves)
         with executor.batch():
             jobs = [executor.submit(worker_fn, c) for c in to_run]
 
         for job, c in zip(jobs, to_run):
             logger.info("Submitted job %s for %s", job.job_id, make_exp_key(c))
-
-        # Wait for all results and write to DB
-        for job, c in zip(jobs, to_run):
-            key = make_exp_key(c)
-            try:
-                report = job.result()
-                report.write(db)
-                logger.info("Finished %s: cmAP=%.4f", key, report.cmap)
-            finally:
-                reporting.release_run(db, key)
     else:
         # Run locally (sequentially)
         for c in to_run:
-            key = make_exp_key(c)
-            try:
-                report = worker_fn(c)
-                report.write(db)
-                logger.info("Finished %s: cmAP=%.4f", key, report.cmap)
-            finally:
-                reporting.release_run(db, key)
+            worker_fn(c)
 
 
 @jaxtyping.jaxtyped(typechecker=beartype.beartype)
@@ -500,7 +489,7 @@ def train_linear_probe(
     # Asymmetric loss for imbalanced multi-label
     criterion = AsymmetricLoss()
 
-    for epoch in range(n_epochs):
+    for epoch in helpers.progress(range(n_epochs), every=cfg.log_every, desc="train"):
         probe.train()
         total_loss = 0.0
         for x, y in loader:
@@ -514,10 +503,9 @@ def train_linear_probe(
             optimizer.step()
             total_loss += loss.item()
         scheduler.step()
-        avg_loss = total_loss / len(loader)
-        if (epoch + 1) % 5 == 0:
-            lr = scheduler.get_last_lr()[0]
-            logger.info("Epoch %d: loss=%.4f lr=%.2e", epoch + 1, avg_loss, lr)
+        if (epoch + 1) % cfg.log_every == 0:
+            avg_loss = total_loss / len(loader)
+            logger.info("loss=%.4f lr=%.2e", avg_loss, scheduler.get_last_lr()[0])
 
     return probe
 
@@ -557,7 +545,7 @@ def train_mlp_probe(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
     criterion = AsymmetricLoss()
 
-    for epoch in range(n_epochs):
+    for epoch in helpers.progress(range(n_epochs), every=cfg.log_every, desc="train"):
         probe.train()
         total_loss = 0.0
         for x, y in loader:
@@ -570,14 +558,9 @@ def train_mlp_probe(
             optimizer.step()
             total_loss += loss.item()
         scheduler.step()
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % cfg.log_every == 0:
             avg_loss = total_loss / len(loader)
-            logger.info(
-                "Epoch %d: loss=%.4f lr=%.2e",
-                epoch + 1,
-                avg_loss,
-                scheduler.get_last_lr()[0],
-            )
+            logger.info("loss=%.4f lr=%.2e", avg_loss, scheduler.get_last_lr()[0])
 
     return probe
 
