@@ -9,7 +9,6 @@ This document lists design decisions that are hardcoded in the codebase and not 
 
 RGB images are converted to single-channel grayscale using standard luminance weights (0.299R + 0.587G + 0.114B). This matches our audio spectrogram format (single-channel 2D input) and simplifies the model architecture.
 
-Location: `data/__init__.py:317-318`
 </details>
 
 <details>
@@ -17,7 +16,6 @@ Location: `data/__init__.py:317-318`
 
 We use CIFAR_MEAN=0.4914 and CIFAR_STD=0.2470, which are the grayscale equivalents of standard CIFAR-100 normalization. These are applied after converting to [0,1] range.
 
-Location: `data/__init__.py:184-185, 320-321`
 </details>
 
 <details>
@@ -25,7 +23,6 @@ Location: `data/__init__.py:184-185, 320-321`
 
 All audio is resampled to 32kHz to match Bird-MAE's spectrogram configuration. Audio at different sample rates is automatically resampled.
 
-Location: `data/__init__.py:15`
 </details>
 
 <details>
@@ -33,7 +30,6 @@ Location: `data/__init__.py:15`
 
 Log-mel spectrograms are computed with 128 mel frequency bins, matching Bird-MAE.
 
-Location: `data/__init__.py:17`
 </details>
 
 <details>
@@ -41,7 +37,6 @@ Location: `data/__init__.py:17`
 
 Spectrograms use a 10ms frame shift, resulting in 100 frames per second. A 5-second clip produces 512 time frames.
 
-Location: `data/__init__.py:94`
 </details>
 
 <details>
@@ -49,7 +44,6 @@ Location: `data/__init__.py:94`
 
 Spectrograms are normalized with MEAN=-7.2, STD=4.43 (divided by 2), matching Bird-MAE preprocessing. This ensures compatibility with pretrained models.
 
-Location: `data/__init__.py:18-19, 107`
 </details>
 
 <details>
@@ -57,7 +51,6 @@ Location: `data/__init__.py:18-19, 107`
 
 Raw waveforms have their DC offset removed by subtracting the mean before computing the spectrogram.
 
-Location: `data/__init__.py:83`
 </details>
 
 <details>
@@ -65,7 +58,6 @@ Location: `data/__init__.py:83`
 
 If the computed spectrogram is shorter than the target length, it's padded with the minimum value in the spectrogram (treating it as silence).
 
-Location: `data/__init__.py:101-102`
 </details>
 
 <details>
@@ -73,7 +65,6 @@ Location: `data/__init__.py:101-102`
 
 Spectrogram computation uses torchaudio's Kaldi-compatible filterbank with htk_compat=True, Hanning window, no dithering, and no energy feature.
 
-Location: `data/__init__.py:86-95`
 </details>
 
 ## Model
@@ -83,7 +74,6 @@ Location: `data/__init__.py:86-95`
 
 Each transformer block applies LayerNorm before the attention and MLP sublayers, not after. This is the modern standard that improves training stability.
 
-Location: `nn/transformer.py:256, 261`
 </details>
 
 <details>
@@ -91,7 +81,6 @@ Location: `nn/transformer.py:256, 261`
 
 The feedforward network uses GELU activation unless SwiGLU is explicitly enabled via config.
 
-Location: `nn/transformer.py:231`
 </details>
 
 <details>
@@ -99,7 +88,6 @@ Location: `nn/transformer.py:231`
 
 The attention mechanism includes bias terms in both the QKV projection and the output projection.
 
-Location: `nn/transformer.py:165-166`
 </details>
 
 <details>
@@ -107,7 +95,6 @@ Location: `nn/transformer.py:165-166`
 
 Patches are embedded using a simple linear layer rather than a convolutional layer. The input is already patchified before the projection.
 
-Location: `nn/transformer.py:141`
 </details>
 
 <details>
@@ -115,7 +102,6 @@ Location: `nn/transformer.py:141`
 
 All positional embeddings, CLS tokens, and register tokens are initialized with truncated normal distribution (std=0.02), matching standard ViT practice.
 
-Location: `nn/transformer.py:315-319`
 </details>
 
 <details>
@@ -123,7 +109,6 @@ Location: `nn/transformer.py:315-319`
 
 Each CLS token has its own learned positional embedding, separate from the patch position embeddings.
 
-Location: `nn/transformer.py:304-306`
 </details>
 
 <details>
@@ -131,7 +116,6 @@ Location: `nn/transformer.py:304-306`
 
 Register tokens (if used) are appended without positional embeddings, as they serve as auxiliary computation tokens.
 
-Location: `nn/transformer.py:354-356`
 </details>
 
 <details>
@@ -139,7 +123,6 @@ Location: `nn/transformer.py:354-356`
 
 The LeJEPA projection head uses: Linear(D, 2048) -> BatchNorm -> ReLU -> Linear(2048, 2048) -> BatchNorm -> ReLU -> Linear(2048, proj_dim). The hidden dimension is fixed at 2048.
 
-Location: `nn/objectives.py:230-238`
 </details>
 
 <details>
@@ -147,7 +130,6 @@ Location: `nn/objectives.py:230-238`
 
 The SIGReg regularizer projects embeddings onto 256 random unit vectors and evaluates the characteristic function at 17 knots from 0 to 3.
 
-Location: `nn/objectives.py:51-53, 66`
 </details>
 
 <details>
@@ -155,7 +137,6 @@ Location: `nn/objectives.py:51-53, 66`
 
 The low-rank source prediction head uses ReLU between its two linear layers: Linear(input_dim, rank) -> ReLU -> Linear(rank, n_sources).
 
-Location: `nn/objectives.py:90-94`
 </details>
 
 <details>
@@ -163,7 +144,6 @@ Location: `nn/objectives.py:90-94`
 
 In the Pixio decoder, the CLS token participates in attention but doesn't receive a positional embedding (only patch tokens do).
 
-Location: `nn/objectives.py:444-448`
 </details>
 
 <details>
@@ -171,7 +151,6 @@ Location: `nn/objectives.py:444-448`
 
 The learnable mask token used for masked patches is initialized from a normal distribution with std=0.02.
 
-Location: `nn/objectives.py:489`
 </details>
 
 <details>
@@ -179,7 +158,6 @@ Location: `nn/objectives.py:489`
 
 Before computing MSE loss, each patch is normalized to zero mean and unit variance. This prevents the model from exploiting global statistics.
 
-Location: `nn/objectives.py:576-580`
 </details>
 
 ## Training
@@ -189,7 +167,6 @@ Location: `nn/objectives.py:576-580`
 
 The learning rate warmup period is set to len(train_loader) steps, which equals exactly one epoch of training.
 
-Location: `pretrain.py:189`
 </details>
 
 <details>
@@ -197,7 +174,6 @@ Location: `pretrain.py:189`
 
 Linear warmup begins at 0.01x the target learning rate and increases linearly to the full learning rate.
 
-Location: `pretrain.py:191`
 </details>
 
 <details>
@@ -205,7 +181,6 @@ Location: `pretrain.py:191`
 
 After warmup, the learning rate follows a cosine schedule that decays to a minimum of 1e-6.
 
-Location: `pretrain.py:192`
 </details>
 
 <details>
@@ -213,7 +188,6 @@ Location: `pretrain.py:192`
 
 The online linear probe applies LayerNorm to the embeddings before the classification linear layer.
 
-Location: `pretrain.py:169-171`
 </details>
 
 <details>
@@ -221,7 +195,6 @@ Location: `pretrain.py:169-171`
 
 The probe has its own optimizer hyperparameters separate from the main model: lr=1e-3 and weight_decay=1e-7.
 
-Location: `pretrain.py:186`
 </details>
 
 <details>
@@ -229,7 +202,6 @@ Location: `pretrain.py:186`
 
 All forward passes use torch.autocast with bfloat16 dtype for memory efficiency and speed.
 
-Location: `pretrain.py:225, 279`
 </details>
 
 <details>
@@ -237,7 +209,6 @@ Location: `pretrain.py:225, 279`
 
 The optimizer is AdamW with per-parameter-group learning rates and weight decay.
 
-Location: `pretrain.py:188`
 </details>
 
 <details>
@@ -245,7 +216,6 @@ Location: `pretrain.py:188`
 
 torch.manual_seed(42) is called at the start of training for reproducibility.
 
-Location: `pretrain.py:129`
 </details>
 
 <details>
@@ -253,7 +223,6 @@ Location: `pretrain.py:129`
 
 Training uses drop_last=True to ensure all batches have the same size, which is required for consistent masking in MAE.
 
-Location: `pretrain.py:156`
 </details>
 
 <details>
@@ -261,5 +230,179 @@ Location: `pretrain.py:156`
 
 Both train and test dataloaders use pin_memory=True for faster GPU transfer.
 
-Location: `pretrain.py:158, 165`
+</details>
+
+## Objectives
+
+<details>
+<summary>Supervised and LeJEPA pool by mean of CLS tokens</summary>
+
+Both supervised and LeJEPA objectives always use the mean of all CLS tokens (not just the first) for embeddings and classification. This is fixed even when multiple CLS tokens are configured.
+
+</details>
+
+<details>
+<summary>LeJEPA invariance loss uses mean-over-views target</summary>
+
+LeJEPA computes invariance loss against the mean projection over all views, not pairwise losses between views.
+
+</details>
+
+<details>
+<summary>Pixio masking enforces exact mask count by adding patches</summary>
+
+Pixio block masking first masks full blocks up to a floor of the target mask count, then adds individual patches to reach the exact target. It never removes patches after block masking.
+
+</details>
+
+## Data (additional)
+
+<details>
+<summary>XenoCanto is loaded from samuelstevens/BirdSet with ebird_code labels</summary>
+
+The XenoCanto dataset is always loaded from the HuggingFace dataset `samuelstevens/BirdSet`, and labels are read from the `ebird_code` field. The dataset index is treated as the source ID.
+
+</details>
+
+<details>
+<summary>CIFAR-100 is stored under ./data and downloads automatically</summary>
+
+The CIFAR-100 dataset always uses root "./data" with download=True when initialized via torchvision.
+
+</details>
+
+<details>
+<summary>CIFAR-100 class names are hardcoded</summary>
+
+The 100 fine-grained CIFAR-100 class names are a fixed list in the codebase.
+
+</details>
+
+## Training (additional)
+
+<details>
+<summary>Weights & Biases is always enabled with project "birdjepa"</summary>
+
+Training always initializes WandB logging and hardcodes the project name to "birdjepa".
+
+</details>
+
+<details>
+<summary>Online probe loss is always added to objective loss</summary>
+
+The total loss is always the sum of the objective loss terms and the online probe cross-entropy. There is no config to disable or reweight the probe loss.
+
+</details>
+
+<details>
+<summary>Evaluation uses top-1 accuracy</summary>
+
+Per-epoch evaluation computes top-1 accuracy by argmax over probe logits.
+
+</details>
+
+## Benchmarking
+
+<details>
+<summary>BirdSet multi-label column is ebird_code_multilabel</summary>
+
+All BirdSet benchmarking assumes the multi-label class index column is named `ebird_code_multilabel`.
+
+</details>
+
+<details>
+<summary>Benchmarking always uses samuelstevens/BirdSet with streaming and 32kHz audio</summary>
+
+Benchmarking loads `samuelstevens/BirdSet` with streaming, casts the audio column to 32kHz, and evaluates on the `test_5s` split.
+
+</details>
+
+<details>
+<summary>Benchmarking requires TMPDIR for HuggingFace cache</summary>
+
+The benchmark runner requires TMPDIR to be set and uses it for HF cache paths (HF_HUB_CACHE and HF_HOME).
+
+</details>
+
+<details>
+<summary>AsymmetricLoss hyperparameters are fixed</summary>
+
+The asymmetric loss uses gamma_neg=4.0, gamma_pos=1.0, clip=0.05, and eps=1e-8.
+
+</details>
+
+<details>
+<summary>Probe training uses fixed architectures and optimizer settings</summary>
+
+Linear probe uses LayerNorm -> Linear, MLP probe uses hidden_dim=2x and dropout=0.1, and both use AdamW with betas=(0.9, 0.95) and a cosine LR schedule.
+
+</details>
+
+<details>
+<summary>Centroid classifier uses cosine similarity with temperature 0.1</summary>
+
+The centroid classifier computes cosine similarity logits scaled by 10 (temperature=0.1).
+
+</details>
+
+<details>
+<summary>Evaluation uses sigmoid threshold 0.5 and cmAP</summary>
+
+Predictions are formed by thresholding sigmoid probabilities at 0.5, and the metric is cmAP (mean AP over classes with positives).
+
+</details>
+
+<details>
+<summary>Benchmark Slurm params are fixed</summary>
+
+Benchmark Slurm submission always uses gpus_per_node=1, cpus_per_task=4, and loads the ffmpeg/6.1.1 module.
+
+</details>
+
+## Reporting
+
+<details>
+<summary>Predictions are omitted for large test sets</summary>
+
+Benchmark reports skip saving per-example predictions when the test set exceeds 50,000 examples.
+
+</details>
+
+## Bird-MAE
+
+<details>
+<summary>Only three Bird-MAE checkpoints are supported</summary>
+
+Bird-MAE loading is limited to Bird-MAE-Base, Bird-MAE-Large, and Bird-MAE-Huge with a fixed config mapping.
+
+</details>
+
+<details>
+<summary>Bird-MAE weights download URL and cache path are fixed</summary>
+
+Weights are always downloaded from the DBD-research-group HuggingFace URLs and cached under BIRDJEPA_CACHE (default ~/.cache/birdjepa).
+
+</details>
+
+<details>
+<summary>Benchmark registry only registers Bird-MAE and uses pooled features</summary>
+
+The benchmark registry registers only "bird-mae", and BirdMAEBackbone returns the pooled features from the model.
+
+</details>
+
+<details>
+<summary>filter_audio uses fixed STFT params and limited modes</summary>
+
+filter_audio uses fixed STFT parameters (n_fft, hop_length, win_length) and only supports "time" and "time+freq" modes.
+
+</details>
+
+## Launcher
+
+<details>
+<summary>Training Slurm params are fixed in the launcher</summary>
+
+Training Slurm submission always uses gpus_per_node=1, ntasks_per_node=1, and loads the ffmpeg/6.1.1 module.
+
 </details>
