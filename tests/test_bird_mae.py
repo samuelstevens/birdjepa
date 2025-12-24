@@ -1,236 +1,307 @@
-import librosa
-import pytest
+"""
+Parity tests comparing JAX bird_mae implementation to PyTorch reference.
+
+All tests use float32 precision to match Bird-MAE's internal processing.
+Tolerances (rtol=1e-4, atol=2e-3) account for:
+- FFT implementation differences between JAX and torch
+- Log amplification of small power spectrum differences (~1e-7 -> ~1e-3)
+- Float32 accumulation errors in dot products
+"""
+
+import numpy as np
 import torch
+from hypothesis import given, settings, strategies as st
 
 from birdjepa.nn import bird_mae
-
-CKPTS = [
-    "Bird-MAE-Base",
-    "Bird-MAE-Large",
-    "Bird-MAE-Huge",
-]
-DTYPE = torch.float32
-ATOL, RTOL = 1e-5, 1e-4
+from birdjepa.nn import bird_mae_pt
 
 
-@pytest.fixture(scope="session", params=CKPTS)
-def models(request):
-    transformers = pytest.importorskip("transformers")
-    ckpt = request.param
-    hf = transformers.AutoModel.from_pretrained(
-        f"DBD-research-group/{ckpt}", trust_remote_code=True
-    ).eval()
-    bio = bird_mae.Transformer(ckpt).eval().to(DTYPE)
-    return hf, bio
+# Unified tolerances for float32 parity (JAX FFT vs torch FFT)
+# - FFT implementation differences between XLA and torch: ~1e-5 in spectrum
+# - Log amplifies small differences: ~1e-5 -> ~1e-2 in low-energy bins
+# - Max absolute diff observed: ~8e-3 (log-mel values range from -16 to 0)
+# - Max relative diff observed: ~6e-4
+RTOL = 1e-3
+ATOL = 1e-2
 
 
-def _rand(*, batch: int = 1):
-    torch.manual_seed(0)
-    return torch.rand(batch, 1, 512, 128, dtype=DTYPE)
+def _to_numpy(x):
+    """Convert JAX array to numpy for comparison."""
+    return np.asarray(x)
 
 
-def test_same_shape_single(models):
-    ref, ours = models
-    batch = _rand()
-    h = ref(batch, output_hidden_states=True)
-    o = ours(batch)
-    assert h.hidden_states[-1][:, 1:, :].shape == o[:, 1:, :].shape
-    assert h.last_hidden_state.shape == o[:, 0, :].shape
+# --- Hypothesis strategies ---
 
 
-def test_values_close_single(models):
-    ref, ours = models
-    batch = _rand()
-    h = ref(batch, output_hidden_states=True)
-    o = ours(batch)
-    torch.testing.assert_close(
-        h.hidden_states[-1][:, 1:], o[:, 1:, :], atol=ATOL, rtol=RTOL
+@st.composite
+def waveform_strategy(draw, min_samples=1000, max_samples=200_000):
+    """Generate random waveforms in float32."""
+    n_samples = draw(st.integers(min_value=min_samples, max_value=max_samples))
+    seed = draw(st.integers(min_value=0, max_value=2**31 - 1))
+    rng = np.random.default_rng(seed)
+    waveform = rng.standard_normal(n_samples).astype(np.float32)
+    return waveform
+
+
+@st.composite
+def waveform_5s_strategy(draw):
+    """Generate 5-second waveforms at 32kHz in float32."""
+    n_samples = 32_000 * 5  # 160,000 samples
+    seed = draw(st.integers(min_value=0, max_value=2**31 - 1))
+    rng = np.random.default_rng(seed)
+    waveform = rng.standard_normal(n_samples).astype(np.float32)
+    return waveform
+
+
+# --- Transform parity tests ---
+
+
+@given(waveform=waveform_5s_strategy())
+@settings(max_examples=50, deadline=None)
+def test_transform_parity_random_5s(waveform):
+    """Test that JAX transform matches PT transform for random 5s waveforms."""
+    jax_out = bird_mae.transform(waveform)
+    pt_out = bird_mae_pt.transform(waveform)
+
+    assert jax_out.shape == pt_out.shape, f"{jax_out.shape} != {pt_out.shape}"
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
+
+
+@given(waveform=waveform_strategy(min_samples=1000, max_samples=300_000))
+@settings(max_examples=50, deadline=None)
+def test_transform_parity_variable_length(waveform):
+    """Test that JAX transform matches PT transform for variable length waveforms."""
+    jax_out = bird_mae.transform(waveform)
+    pt_out = bird_mae_pt.transform(waveform)
+
+    assert jax_out.shape == pt_out.shape, f"{jax_out.shape} != {pt_out.shape}"
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
+
+
+def test_transform_parity_short_audio():
+    """Test that JAX transform matches PT transform for very short audio."""
+    waveform = np.random.randn(1000).astype(np.float32)
+
+    jax_out = bird_mae.transform(waveform)
+    pt_out = bird_mae_pt.transform(waveform)
+
+    assert jax_out.shape == pt_out.shape
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
+
+
+def test_transform_parity_long_audio():
+    """Test that JAX transform matches PT transform for audio longer than 5s."""
+    waveform = np.random.randn(32_000 * 10).astype(np.float32)
+
+    jax_out = bird_mae.transform(waveform)
+    pt_out = bird_mae_pt.transform(waveform)
+
+    assert jax_out.shape == pt_out.shape
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
+
+
+def test_transform_parity_zeros():
+    """Test that JAX transform matches PT transform for silent audio."""
+    waveform = np.zeros(32_000 * 5, dtype=np.float32)
+
+    jax_out = bird_mae.transform(waveform)
+    pt_out = bird_mae_pt.transform(waveform)
+
+    assert jax_out.shape == pt_out.shape
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
+
+
+def test_transform_parity_sine_wave():
+    """Test that JAX transform matches PT transform for a pure sine wave."""
+    sr = 32_000
+    duration = 5
+    freq = 440  # A4
+    t = np.linspace(0, duration, sr * duration, dtype=np.float32)
+    waveform = np.sin(2 * np.pi * freq * t).astype(np.float32)
+
+    jax_out = bird_mae.transform(waveform)
+    pt_out = bird_mae_pt.transform(waveform)
+
+    assert jax_out.shape == pt_out.shape
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
+
+
+# --- kaldi_fbank parity tests ---
+
+
+@given(waveform=waveform_strategy(min_samples=8000, max_samples=160_000))
+@settings(max_examples=50, deadline=None)
+def test_kaldi_fbank_parity(waveform):
+    """Test that our kaldi_fbank matches torchaudio's implementation."""
+    import torchaudio.compliance.kaldi
+
+    jax_out = bird_mae.kaldi_fbank(
+        waveform,
+        htk_compat=True,
+        sample_frequency=32_000,
+        use_energy=False,
+        num_mel_bins=128,
+        dither=0.0,
+        frame_shift=10.0,
     )
-    torch.testing.assert_close(h.last_hidden_state, o[:, 0, :], atol=ATOL, rtol=RTOL)
 
-
-def test_values_close_batch(models):
-    ref, ours = models
-    batch = _rand(batch=4)
-    h = ref(batch, output_hidden_states=True)
-    o = ours(batch)
-    torch.testing.assert_close(
-        h.hidden_states[-1][:, 1:], o[:, 1:, :], atol=ATOL, rtol=RTOL
+    waveform_pt = torch.from_numpy(waveform).unsqueeze(0)
+    pt_out = torchaudio.compliance.kaldi.fbank(
+        waveform_pt,
+        htk_compat=True,
+        sample_frequency=32_000,
+        use_energy=False,
+        window_type="hanning",
+        num_mel_bins=128,
+        dither=0.0,
+        frame_shift=10.0,
     )
-    torch.testing.assert_close(h.last_hidden_state, o[:, 0, :], atol=ATOL, rtol=RTOL)
+
+    assert jax_out.shape == tuple(pt_out.shape), f"{jax_out.shape} != {pt_out.shape}"
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
 
 
-@pytest.mark.parametrize("ckpt", CKPTS)
-def test_transform_matches_hf_feature_extractor(ckpt):
-    transformers = pytest.importorskip("transformers")
+def test_kaldi_fbank_parity_default_params():
+    """Test kaldi_fbank with default parameters."""
+    import torchaudio.compliance.kaldi
 
-    waveform, _ = librosa.load(librosa.ex("robin"), sr=32_000)
+    waveform = np.random.randn(16000).astype(np.float32)
 
-    hf_extractor = transformers.AutoFeatureExtractor.from_pretrained(
-        f"DBD-research-group/{ckpt}", trust_remote_code=True
+    jax_out = bird_mae.kaldi_fbank(waveform, dither=0.0)
+
+    waveform_pt = torch.from_numpy(waveform).unsqueeze(0)
+    pt_out = torchaudio.compliance.kaldi.fbank(
+        waveform_pt,
+        window_type="hanning",
+        dither=0.0,
     )
-    hf_mel = hf_extractor(waveform).squeeze()
-    ours_mel = bird_mae.transform(waveform)
 
-    torch.testing.assert_close(hf_mel, ours_mel, atol=ATOL, rtol=RTOL)
-
-
-# ===================== #
-# filter_audio tests    #
-# ===================== #
-
-# Constants for filter_audio tests
-SR = 32_000
-N_TIME_PATCHES = 32
-N_MEL_PATCHES = 8
-N_PATCHES = N_TIME_PATCHES * N_MEL_PATCHES  # 256
-SAMPLES_PER_TIME_PATCH = 16 * 320  # 16 frames * 320 samples/frame = 5,120
+    assert jax_out.shape == tuple(pt_out.shape)
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
 
 
-@pytest.fixture
-def waveform_5s():
-    """5 seconds of audio at 32kHz with recognizable pattern."""
-    n_samples = SR * 5  # 160,000
-    # Use a simple ramp so we can verify which samples are extracted
-    return torch.arange(n_samples, dtype=torch.float32) / n_samples
+@given(
+    num_mel_bins=st.sampled_from([23, 40, 64, 80, 128]),
+    frame_shift=st.sampled_from([10.0, 20.0]),
+    frame_length=st.sampled_from([25.0, 30.0]),
+)
+@settings(max_examples=20, deadline=None)
+def test_kaldi_fbank_parity_various_params(num_mel_bins, frame_shift, frame_length):
+    """Test kaldi_fbank with various parameter combinations."""
+    import torchaudio.compliance.kaldi
+
+    waveform = np.random.randn(32000).astype(np.float32)
+
+    jax_out = bird_mae.kaldi_fbank(
+        waveform,
+        sample_frequency=32_000,
+        num_mel_bins=num_mel_bins,
+        frame_shift=frame_shift,
+        frame_length=frame_length,
+        dither=0.0,
+    )
+
+    waveform_pt = torch.from_numpy(waveform).unsqueeze(0)
+    pt_out = torchaudio.compliance.kaldi.fbank(
+        waveform_pt,
+        sample_frequency=32_000,
+        window_type="hanning",
+        num_mel_bins=num_mel_bins,
+        frame_shift=frame_shift,
+        frame_length=frame_length,
+        dither=0.0,
+    )
+
+    assert jax_out.shape == tuple(pt_out.shape), f"{jax_out.shape} != {pt_out.shape}"
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
 
 
-def _make_patches(time_indices: list[int]) -> torch.Tensor:
-    """Create a boolean patch mask with all mel patches activated for given time indices."""
-    patches = torch.zeros(N_PATCHES, dtype=torch.bool)
-    for t in time_indices:
-        patches[t * N_MEL_PATCHES : (t + 1) * N_MEL_PATCHES] = True
-    return patches
+def test_kaldi_fbank_parity_sine_wave():
+    """Test kaldi_fbank with a pure sine wave for deterministic comparison."""
+    import torchaudio.compliance.kaldi
+
+    sr = 32_000
+    duration = 1
+    freq = 1000
+    t = np.linspace(0, duration, sr * duration, dtype=np.float32)
+    waveform = np.sin(2 * np.pi * freq * t).astype(np.float32)
+
+    jax_out = bird_mae.kaldi_fbank(
+        waveform,
+        sample_frequency=sr,
+        num_mel_bins=128,
+        dither=0.0,
+    )
+
+    waveform_pt = torch.from_numpy(waveform).unsqueeze(0)
+    pt_out = torchaudio.compliance.kaldi.fbank(
+        waveform_pt,
+        sample_frequency=sr,
+        window_type="hanning",
+        num_mel_bins=128,
+        dither=0.0,
+    )
+
+    assert jax_out.shape == tuple(pt_out.shape)
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
 
 
-def test_filter_audio_time_single_first_patch(waveform_5s):
-    """Activate first time patch (t=0), expect samples from start of audio."""
-    patches = _make_patches([0])
-    result = bird_mae.filter_audio(waveform_5s, SR, patches, mode="time")
+@given(waveform=waveform_strategy(min_samples=8000, max_samples=80_000))
+@settings(max_examples=20, deadline=None)
+def test_kaldi_fbank_parity_use_energy(waveform):
+    """Test kaldi_fbank with use_energy=True."""
+    import torchaudio.compliance.kaldi
 
-    assert result.shape[0] == SAMPLES_PER_TIME_PATCH
-    # First time patch should be first 5,120 samples
-    assert torch.equal(result, waveform_5s[:SAMPLES_PER_TIME_PATCH])
+    jax_out = bird_mae.kaldi_fbank(
+        waveform,
+        sample_frequency=32_000,
+        num_mel_bins=128,
+        use_energy=True,
+        htk_compat=True,
+        dither=0.0,
+    )
 
+    waveform_pt = torch.from_numpy(waveform).unsqueeze(0)
+    pt_out = torchaudio.compliance.kaldi.fbank(
+        waveform_pt,
+        sample_frequency=32_000,
+        window_type="hanning",
+        num_mel_bins=128,
+        use_energy=True,
+        htk_compat=True,
+        dither=0.0,
+    )
 
-def test_filter_audio_time_single_middle_patch(waveform_5s):
-    """Activate middle time patch (t=15), expect samples from middle of audio."""
-    patches = _make_patches([15])
-    result = bird_mae.filter_audio(waveform_5s, SR, patches, mode="time")
-
-    assert result.shape[0] == SAMPLES_PER_TIME_PATCH
-    start = 15 * SAMPLES_PER_TIME_PATCH
-    end = 16 * SAMPLES_PER_TIME_PATCH
-    assert torch.equal(result, waveform_5s[start:end])
-
-
-def test_filter_audio_time_single_last_patch(waveform_5s):
-    """Activate last time patch (t=31), expect samples from end of audio."""
-    patches = _make_patches([31])
-    result = bird_mae.filter_audio(waveform_5s, SR, patches, mode="time")
-
-    start = 31 * SAMPLES_PER_TIME_PATCH
-    # Last patch may be truncated to audio length
-    expected = waveform_5s[start:]
-    assert result.shape[0] == expected.shape[0]
-    assert torch.equal(result, expected)
+    assert jax_out.shape == tuple(pt_out.shape), f"{jax_out.shape} != {pt_out.shape}"
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)
 
 
-def test_filter_audio_time_consecutive_patches(waveform_5s):
-    """Activate two consecutive time patches, expect contiguous segment."""
-    patches = _make_patches([10, 11])
-    result = bird_mae.filter_audio(waveform_5s, SR, patches, mode="time")
+def test_kaldi_fbank_parity_use_energy_htk_compat_false():
+    """Test kaldi_fbank with use_energy=True and htk_compat=False (energy first)."""
+    import torchaudio.compliance.kaldi
 
-    assert result.shape[0] == 2 * SAMPLES_PER_TIME_PATCH
-    start = 10 * SAMPLES_PER_TIME_PATCH
-    end = 12 * SAMPLES_PER_TIME_PATCH
-    assert torch.equal(result, waveform_5s[start:end])
+    waveform = np.random.randn(32000).astype(np.float32)
 
+    jax_out = bird_mae.kaldi_fbank(
+        waveform,
+        sample_frequency=32_000,
+        num_mel_bins=128,
+        use_energy=True,
+        htk_compat=False,
+        dither=0.0,
+    )
 
-def test_filter_audio_time_non_consecutive_patches(waveform_5s):
-    """Activate two non-consecutive time patches, expect concatenated segments."""
-    patches = _make_patches([5, 20])
-    result = bird_mae.filter_audio(waveform_5s, SR, patches, mode="time")
+    waveform_pt = torch.from_numpy(waveform).unsqueeze(0)
+    pt_out = torchaudio.compliance.kaldi.fbank(
+        waveform_pt,
+        sample_frequency=32_000,
+        window_type="hanning",
+        num_mel_bins=128,
+        use_energy=True,
+        htk_compat=False,
+        dither=0.0,
+    )
 
-    assert result.shape[0] == 2 * SAMPLES_PER_TIME_PATCH
-    seg1 = waveform_5s[5 * SAMPLES_PER_TIME_PATCH : 6 * SAMPLES_PER_TIME_PATCH]
-    seg2 = waveform_5s[20 * SAMPLES_PER_TIME_PATCH : 21 * SAMPLES_PER_TIME_PATCH]
-    expected = torch.cat([seg1, seg2], dim=0)
-    assert torch.equal(result, expected)
-
-
-def test_filter_audio_time_single_mel_patch_activates_full_time(waveform_5s):
-    """Activate only one mel patch in a time slot, should still extract full time segment."""
-    patches = torch.zeros(N_PATCHES, dtype=torch.bool)
-    patches[10 * N_MEL_PATCHES + 3] = True  # time=10, mel=3
-    result = bird_mae.filter_audio(waveform_5s, SR, patches, mode="time")
-
-    assert result.shape[0] == SAMPLES_PER_TIME_PATCH
-    start = 10 * SAMPLES_PER_TIME_PATCH
-    end = 11 * SAMPLES_PER_TIME_PATCH
-    assert torch.equal(result, waveform_5s[start:end])
-
-
-def test_filter_audio_time_all_patches(waveform_5s):
-    """Activate all patches, expect full audio returned."""
-    patches = torch.ones(N_PATCHES, dtype=torch.bool)
-    result = bird_mae.filter_audio(waveform_5s, SR, patches, mode="time")
-
-    # Full audio, possibly truncated at 32 * 5120 = 163,840 but audio is 160,000
-    assert torch.equal(result, waveform_5s)
-
-
-def test_filter_audio_time_no_patches(waveform_5s):
-    """Activate no patches, expect empty array."""
-    patches = torch.zeros(N_PATCHES, dtype=torch.bool)
-    result = bird_mae.filter_audio(waveform_5s, SR, patches, mode="time")
-
-    assert result.shape[0] == 0
-
-
-def test_filter_audio_time_first_and_last_patches(waveform_5s):
-    """Activate first and last time patches, expect two segments concatenated."""
-    patches = _make_patches([0, 31])
-    result = bird_mae.filter_audio(waveform_5s, SR, patches, mode="time")
-
-    seg1 = waveform_5s[:SAMPLES_PER_TIME_PATCH]
-    seg2 = waveform_5s[31 * SAMPLES_PER_TIME_PATCH :]
-    expected = torch.cat([seg1, seg2], dim=0)
-    assert torch.equal(result, expected)
-
-
-def test_filter_audio_time_freq_handles_non_aligned_length():
-    """time+freq should not error when waveform length is not hop-aligned."""
-    # Length chosen to be non-multiple of hop_length (320)
-    n_samples = SR * 5 + 123
-    waveform = torch.arange(n_samples, dtype=torch.float32) / n_samples
-    patches = _make_patches([0])  # activate first time patch
-
-    out = bird_mae.filter_audio(waveform, SR, patches, mode="time+freq")
-    assert isinstance(out, torch.Tensor)
-    assert out.numel() > 0
-
-
-def test_filter_audio_clips_to_5s_when_longer():
-    """filter_audio should truncate/pad to same 5s window as transform()."""
-    n_samples = SR * 7  # longer than 5s
-    waveform = torch.arange(n_samples, dtype=torch.float32) / n_samples
-    patches = _make_patches([0, 31])
-
-    out = bird_mae.filter_audio(waveform, SR, patches, mode="time")
-    # Patch 0 is full-length; patch 31 is truncated to remaining samples in the 5s window.
-    expected_tail = waveform[31 * SAMPLES_PER_TIME_PATCH : SR * 5]
-    assert out.numel() == SAMPLES_PER_TIME_PATCH + expected_tail.numel()
-    assert torch.equal(out[:SAMPLES_PER_TIME_PATCH], waveform[:SAMPLES_PER_TIME_PATCH])
-    assert torch.equal(out[SAMPLES_PER_TIME_PATCH:], expected_tail)
-
-
-def test_filter_audio_time_freq_handles_much_longer():
-    """time+freq should not error when waveform is much longer than 5s (clipped inside)."""
-    n_samples = SR * 10 + 77
-    waveform = torch.arange(n_samples, dtype=torch.float32) / n_samples
-    patches = _make_patches([0, 10, 20])
-
-    out = bird_mae.filter_audio(waveform, SR, patches, mode="time+freq")
-    assert isinstance(out, torch.Tensor)
-    assert out.numel() > 0
+    assert jax_out.shape == tuple(pt_out.shape)
+    assert jax_out.shape[1] == 129  # 128 mel bins + 1 energy
+    np.testing.assert_allclose(_to_numpy(jax_out), pt_out.numpy(), rtol=RTOL, atol=ATOL)

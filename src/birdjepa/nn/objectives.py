@@ -1,211 +1,30 @@
-"""Training objectives: Supervised, LeJEPA, Pixio."""
+"""Training objectives (JAX)."""
 
 import abc
 import dataclasses
+import typing as tp
 
 import beartype
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from jaxtyping import Bool, Float, Int, jaxtyped
-from torch import Tensor
-from torch.utils.data import Dataset
+import chex
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 
+# (sam) TODO: I want to use chex instead of PRNGKeyArray
+from jaxtyping import Array, Float, Int, PRNGKeyArray
+
+import birdjepa.data
 import birdjepa.nn.transformer
-
-
-@beartype.beartype
-class MultiViewDataset(Dataset):
-    """Wraps a base dataset to return multiple views per sample.
-
-    Each call to base_ds[idx] should return a different random crop/augmentation.
-    """
-
-    def __init__(self, base_ds: Dataset, n_views: int):
-        self.ds = base_ds
-        self.n_views = n_views
-        self.n_classes = base_ds.n_classes
-
-    def __len__(self):
-        return len(self.ds)
-
-    def __getitem__(self, idx: int) -> dict:
-        items = [self.ds[idx] for _ in range(self.n_views)]
-        views = torch.stack([item["data"] for item in items])
-        first = items[0]
-        return {"views": views, "target": first["target"], "index": first["index"]}
-
-
-# -----------------------------------------------------------------------------
-# SIGReg (for LeJEPA)
-# -----------------------------------------------------------------------------
-
-
-class SIGReg(nn.Module):
-    """Sketched Isotropic Gaussian Regularization.
-
-    Encourages embeddings to follow a standard Gaussian distribution
-    using characteristic function matching.
-    """
-
-    def __init__(self, n_knots: int = 17):
-        super().__init__()
-        t = torch.linspace(0, 3, n_knots, dtype=torch.float32)
-        dt = 3 / (n_knots - 1)
-        weights = torch.full((n_knots,), 2 * dt, dtype=torch.float32)
-        weights[[0, -1]] = dt
-        window = torch.exp(-t.square() / 2.0)
-        self.register_buffer("t", t)
-        self.register_buffer("phi", window)
-        self.register_buffer("weights", weights * window)
-
-    @jaxtyped(typechecker=beartype.beartype)
-    def forward(self, proj_vbd: Float[Tensor, "v b d"]) -> Float[Tensor, ""]:
-        """Compute SIGReg loss."""
-        device = proj_vbd.device
-        A_dk = torch.randn(proj_vbd.size(-1), 256, device=device)
-        A_dk = A_dk.div_(A_dk.norm(p=2, dim=0))
-        x_t = (proj_vbd @ A_dk).unsqueeze(-1) * self.t
-        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ self.weights) * proj_vbd.size(-2)
-        return statistic.mean()
-
-
-# -----------------------------------------------------------------------------
-# Source Prediction (DIET-style)
-# -----------------------------------------------------------------------------
-
-
-class SourceHead(nn.Module):
-    """Low-rank source prediction head for DIET-style self-supervision.
-
-    Predicts which source recording a sample came from using concatenated CLS tokens.
-    Uses low-rank projection to handle large number of sources efficiently.
-
-    Reference: Perch 2.0 (https://arxiv.org/abs/2508.04665)
-    """
-
-    def __init__(self, input_dim: int, n_sources: int, rank: int):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(input_dim, rank),
-            nn.ReLU(),
-            nn.Linear(rank, n_sources),
-        )
-
-    def forward(self, cls_bcd: Float[Tensor, "b c d"]) -> Float[Tensor, "b s"]:
-        """Predict source from concatenated CLS tokens.
-
-        Args:
-            cls_bcd: CLS tokens (B, n_cls, embed_dim).
-
-        Returns:
-            logits_bs: Source prediction logits (B, n_sources).
-        """
-        # Flatten CLS tokens: (B, n_cls, D) -> (B, n_cls * D)
-        b = cls_bcd.shape[0]
-        cls_flat = cls_bcd.view(b, -1)
-        return self.head(cls_flat)
-
-
-# -----------------------------------------------------------------------------
-# Base Objective
-# -----------------------------------------------------------------------------
-
-
-class Objective(nn.Module, abc.ABC):
-    """Abstract base class for training objectives."""
-
-    @abc.abstractmethod
-    def wrap_dataset(self, base_ds: Dataset) -> Dataset:
-        """Wrap base dataset with objective-specific behavior."""
-        pass
-
-    @abc.abstractmethod
-    def forward(
-        self, batch: dict, encoder: nn.Module
-    ) -> tuple[dict[str, Tensor], Tensor, Tensor]:
-        """Compute loss terms and return data for online probe.
-
-        Args:
-            batch: Dict from dataloader.
-            encoder: The encoder module (not owned by objective).
-
-        Returns:
-            Tuple of (losses, embeddings, targets) where:
-            - losses: Dict of named loss terms (e.g., {"ce": ..., "sigreg": ...})
-            - embeddings: Detached embeddings for probe training
-            - targets: Corresponding targets (may be repeated for multi-view)
-        """
-        pass
-
-
-# -----------------------------------------------------------------------------
-# Supervised
-# -----------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(frozen=True)
 class SupervisedConfig:
     """Config for supervised objective."""
 
-    pass  # No extra config needed
-
-
-class Supervised(Objective):
-    """Supervised classification objective with optional source prediction."""
-
-    def __init__(
-        self,
-        encoder_cfg: birdjepa.nn.transformer.Config,
-        n_classes: int,
-        n_sources: int = 0,
-        source_rank: int = 0,
-        source_weight: float = 1.0,
-    ):
-        super().__init__()
-        self.encoder_cfg = encoder_cfg
-        self.source_weight = source_weight
-        self.head = nn.Linear(encoder_cfg.embed_dim, n_classes)
-
-        # Optional source prediction head
-        if source_rank > 0 and n_sources > 0:
-            input_dim = encoder_cfg.n_cls_tokens * encoder_cfg.embed_dim
-            self.source_head = SourceHead(input_dim, n_sources, source_rank)
-        else:
-            self.source_head = None
-
-    def wrap_dataset(self, base_ds: Dataset) -> Dataset:
-        return base_ds
-
-    def forward(
-        self, batch: dict, encoder: nn.Module
-    ) -> tuple[dict[str, Tensor], Tensor, Tensor]:
-        data_bhw: Float[Tensor, "b h w"] = batch["data"]
-        target_b: Int[Tensor, " b"] = batch["target"]
-
-        # Patchify and encode
-        x_bnk, grid_bn2 = birdjepa.nn.transformer.patchify(data_bhw, self.encoder_cfg)
-        out = encoder(x_bnk, grid=grid_bn2)
-
-        # Use mean of CLS tokens for classification
-        emb_bd = out["cls"].mean(dim=1)  # (B, D)
-
-        losses = {"ce": F.cross_entropy(self.head(emb_bd), target_b)}
-
-        # Optional source prediction loss (uses index as source ID)
-        if self.source_head is not None:
-            source_logits = self.source_head(out["cls"])
-            losses["source"] = self.source_weight * F.cross_entropy(
-                source_logits, batch["index"]
-            )
-
-        return losses, emb_bd.detach(), target_b
-
-
-# -----------------------------------------------------------------------------
-# LeJEPA
-# -----------------------------------------------------------------------------
+    source_rank: int = 0
+    """Low-rank bottleneck for source prediction head. 0 = disabled."""
+    source_weight: float = 1.0
+    """Loss weight for source prediction."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,151 +37,6 @@ class LeJEPAConfig:
     """Projection head output dimension."""
     lamb: float = 0.02
     """Weight for SIGReg loss (1 - lamb for invariance)."""
-
-
-class LeJEPA(Objective):
-    """LeJEPA: Joint-Embedding Predictive Architecture with SIGReg."""
-
-    def __init__(self, encoder_cfg: birdjepa.nn.transformer.Config, cfg: LeJEPAConfig):
-        super().__init__()
-        self.encoder_cfg = encoder_cfg
-        self.cfg = cfg
-        self.proj = nn.Sequential(
-            nn.Linear(encoder_cfg.embed_dim, 2048),
-            nn.BatchNorm1d(2048),
-            nn.ReLU(),
-            nn.Linear(2048, 2048),
-            nn.BatchNorm1d(2048),
-            nn.ReLU(),
-            nn.Linear(2048, cfg.proj_dim),
-        )
-        self.sigreg = SIGReg()
-
-    def wrap_dataset(self, base_ds: Dataset) -> Dataset:
-        return MultiViewDataset(base_ds, n_views=self.cfg.n_views)
-
-    def forward(
-        self, batch: dict, encoder: nn.Module
-    ) -> tuple[dict[str, Tensor], Tensor, Tensor]:
-        views_bvhw: Float[Tensor, "b v h w"] = batch["views"]
-        target_b: Int[Tensor, " b"] = batch["target"]
-        b, v, h, w = views_bvhw.shape
-
-        # Flatten views for encoder
-        views_flat = views_bvhw.view(b * v, h, w)
-
-        # Patchify and encode
-        x_bnk, grid_bn2 = birdjepa.nn.transformer.patchify(views_flat, self.encoder_cfg)
-        out = encoder(x_bnk, grid=grid_bn2)
-
-        # Use mean of CLS tokens for LeJEPA
-        emb_nd = out["cls"].mean(dim=1)  # (n, D) where n = b*v
-
-        proj_np = self.proj(emb_nd)
-        proj_vbp: Float[Tensor, "v b p"] = proj_np.view(b, v, -1).permute(1, 0, 2)
-
-        # LeJEPA losses
-        inv_loss = (proj_vbp.mean(0) - proj_vbp).square().mean()
-        sigreg_loss = self.sigreg(proj_vbp)
-
-        # Repeat targets for each view
-        target_n = target_b.repeat_interleave(v)
-
-        losses = {
-            "inv": inv_loss * (1 - self.cfg.lamb),
-            "sigreg": sigreg_loss * self.cfg.lamb,
-        }
-        return losses, emb_nd.detach(), target_n
-
-
-# -----------------------------------------------------------------------------
-# Pixio (MAE-style)
-# -----------------------------------------------------------------------------
-
-
-@jaxtyped(typechecker=beartype.beartype)
-def make_block_mask(
-    batch_size: int,
-    n_h: int,
-    n_w: int,
-    block_size: int,
-    mask_ratio: float,
-    *,
-    generator: torch.Generator,
-) -> Bool[Tensor, "batch n"]:
-    """Generate block mask with adjustment for exact mask count.
-
-    1. Divide grid into blocks and randomly mask blocks
-    2. Adjust to hit exact target count (add/remove individual patches)
-
-    Args:
-        batch_size: Number of samples in batch.
-        n_h: Number of patches in height.
-        n_w: Number of patches in width.
-        block_size: Size of masking blocks (2 = 2x2 blocks).
-        mask_ratio: Target fraction of patches to mask.
-        generator: Random number generator for reproducibility.
-
-    Returns:
-        mask_bn: Boolean tensor (B, n_h * n_w) where True = masked.
-    """
-    device = generator.device
-    n_patches = n_h * n_w
-    n_masked_target = int(n_patches * mask_ratio)
-
-    # Number of blocks in each dimension
-    n_blocks_h = (n_h + block_size - 1) // block_size
-    n_blocks_w = (n_w + block_size - 1) // block_size
-    n_blocks = n_blocks_h * n_blocks_w
-
-    # Compute max blocks to mask such that we never exceed target.
-    # This ensures we only ever ADD patches in adjustment, never remove them.
-    max_patches_per_block = block_size * block_size
-    n_blocks_masked = min(n_masked_target // max_patches_per_block, n_blocks)
-
-    masks = []
-    for _ in range(batch_size):
-        # Create block-level mask
-        block_indices = torch.randperm(n_blocks, device=device, generator=generator)[
-            :n_blocks_masked
-        ]
-        block_mask = torch.zeros(
-            n_blocks_h, n_blocks_w, dtype=torch.bool, device=device
-        )
-        for idx in block_indices:
-            bh = idx // n_blocks_w
-            bw = idx % n_blocks_w
-            block_mask[bh, bw] = True
-
-        # Expand blocks to patch-level mask
-        patch_mask = torch.zeros(n_h, n_w, dtype=torch.bool, device=device)
-        for bh in range(n_blocks_h):
-            for bw in range(n_blocks_w):
-                if block_mask[bh, bw]:
-                    h_start = bh * block_size
-                    h_end = min(h_start + block_size, n_h)
-                    w_start = bw * block_size
-                    w_end = min(w_start + block_size, n_w)
-                    patch_mask[h_start:h_end, w_start:w_end] = True
-
-        patch_mask = patch_mask.flatten()
-
-        # Add individual patches to reach exact target count
-        n_masked_current = patch_mask.sum().item()
-        assert n_masked_current <= n_masked_target
-        if n_masked_current < n_masked_target:
-            unmasked, _ = (~patch_mask).nonzero(as_tuple=True)
-            n_to_mask = n_masked_target - n_masked_current
-            extra = unmasked[
-                torch.randperm(len(unmasked), device=device, generator=generator)[
-                    :n_to_mask
-                ]
-            ]
-            patch_mask[extra] = True
-
-        masks.append(patch_mask)
-
-    return torch.stack(masks)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -383,22 +57,160 @@ class PixioConfig:
     """Base seed for masking RNG. Combined with worker_id for per-worker seeding."""
 
 
-class PixioDecoder(nn.Module):
+Config = SupervisedConfig | LeJEPAConfig | PixioConfig
+
+
+class Objective(abc.ABC):
+    """Abstract base class for training objectives."""
+
+    @abc.abstractmethod
+    def wrap_dataset(self, base_ds: birdjepa.data.Dataset) -> birdjepa.data.Dataset:
+        """Wrap a dataset for this objective (e.g., add multi-view augmentation)."""
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def __call__(
+        self,
+        batch: dict,
+        encoder: eqx.Module,
+        *,
+        key: PRNGKeyArray,
+    ) -> tuple[dict[str, Array], Float[Array, "b d"], Int[Array, " b"]]:
+        """Compute objective losses.
+
+        Args:
+            batch: Dict with at least "data" and "target" keys.
+            encoder: Transformer encoder.
+            key: PRNG key for forward pass.
+
+        Returns:
+            (losses, embeddings, targets) where losses is a dict of named losses.
+        """
+        ...
+
+
+# -----------------------------------------------------------------------------
+# Supervised
+# -----------------------------------------------------------------------------
+
+
+# (sam) TODO: Use jaxtyped
+def softmax_cross_entropy(
+    logits: Float[Array, "b c"], labels: Int[Array, " b"]
+) -> Float[Array, ""]:
+    """Cross-entropy loss for classification."""
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    one_hot = jax.nn.one_hot(labels, logits.shape[-1])
+    return -jnp.sum(one_hot * log_probs, axis=-1).mean()
+
+
+# (sam) TODO: Use jaxtyped
+class Supervised(eqx.Module, Objective):
+    """Supervised classification objective."""
+
+    encoder_cfg: birdjepa.nn.transformer.Config = eqx.field(static=True)
+    head: eqx.nn.Linear
+
+    def __init__(
+        self,
+        encoder_cfg: birdjepa.nn.transformer.Config,
+        *,
+        n_classes: int,
+        key: PRNGKeyArray,
+    ):
+        self.encoder_cfg = encoder_cfg
+        self.head = eqx.nn.Linear(encoder_cfg.embed_dim, n_classes, key=key)
+
+    def wrap_dataset(self, base_ds: birdjepa.data.Dataset) -> birdjepa.data.Dataset:
+        """Supervised doesn't need to wrap the dataset."""
+        return base_ds
+
+    def __call__(
+        self,
+        batch: dict,
+        encoder: eqx.Module,
+        *,
+        key: PRNGKeyArray,
+    ) -> tuple[dict[str, Array], Float[Array, "b d"], Int[Array, " b"]]:
+        """Compute supervised loss.
+
+        Args:
+            batch: Dict with "data" (B, H, W) and "target" (B,).
+            encoder: Transformer encoder.
+            key: PRNG key for encoder forward pass.
+
+        Returns:
+            (losses, embeddings, targets) where losses has "ce" key.
+        """
+        data_bhw = batch["data"]
+        target_b = batch["target"]
+
+        # Patchify and encode
+        x_bnk, grid_bn2 = birdjepa.nn.transformer.patchify(data_bhw, self.encoder_cfg)
+        out = encoder(x_bnk, grid=grid_bn2, key=key)
+
+        # Use mean of CLS tokens for classification
+        emb_bd = out["cls"].mean(axis=1)  # (B, D)
+
+        # Classification loss
+        logits = jax.vmap(self.head)(emb_bd)
+        ce_loss = softmax_cross_entropy(logits, target_b)
+
+        losses = {"ce": ce_loss}
+        return losses, emb_bd, target_b
+
+
+# -----------------------------------------------------------------------------
+# LeJEPA (placeholder)
+# -----------------------------------------------------------------------------
+
+
+class LeJEPA(eqx.Module, Objective):
+    """JAX LeJEPA objective placeholder."""
+
+    def __init__(self, *args: tp.Any, **kwargs: tp.Any) -> None:
+        raise NotImplementedError("JAX LeJEPA not implemented yet")
+
+    def __call__(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+        raise NotImplementedError("JAX LeJEPA not implemented yet")
+
+
+# -----------------------------------------------------------------------------
+# Pixio (MAE-style)
+# -----------------------------------------------------------------------------
+
+
+class PixioDecoder(eqx.Module):
     """Lightweight decoder for MAE reconstruction.
 
-    CLS token participates in decoder attention to learn better representations,
-    as recommended by Pixio paper.
+    CLS token participates in decoder attention to learn better representations.
     """
 
-    def __init__(self, encoder_cfg: birdjepa.nn.transformer.Config, cfg: PixioConfig):
-        super().__init__()
+    encoder_cfg: birdjepa.nn.transformer.Config = eqx.field(static=True)
+    cfg: PixioConfig = eqx.field(static=True)
+
+    embed: eqx.nn.Linear
+    blocks: list[birdjepa.nn.transformer.Block]
+    norm: eqx.nn.LayerNorm
+    head: eqx.nn.Linear
+    pos_embed: Float[Array, "1 n d"]
+
+    def __init__(
+        self,
+        encoder_cfg: birdjepa.nn.transformer.Config,
+        cfg: PixioConfig,
+        *,
+        key: PRNGKeyArray,
+    ):
         self.encoder_cfg = encoder_cfg
         self.cfg = cfg
 
-        # Project encoder dim to decoder dim
-        self.embed = nn.Linear(encoder_cfg.embed_dim, cfg.decoder_dim)
+        keys = jax.random.split(key, cfg.decoder_depth + 3)
 
-        # Decoder blocks (simpler than encoder, shared architecture)
+        # Project encoder dim to decoder dim
+        self.embed = eqx.nn.Linear(encoder_cfg.embed_dim, cfg.decoder_dim, key=keys[0])
+
+        # Decoder blocks
         decoder_cfg = birdjepa.nn.transformer.Config(
             input_h=encoder_cfg.input_h,
             input_w=encoder_cfg.input_w,
@@ -408,113 +220,124 @@ class PixioDecoder(nn.Module):
             depth=cfg.decoder_depth,
             n_heads=cfg.decoder_heads,
         )
-        self.blocks = nn.ModuleList([
-            birdjepa.nn.transformer.Block(decoder_cfg) for _ in range(cfg.decoder_depth)
-        ])
-        self.norm = nn.LayerNorm(cfg.decoder_dim)
+        self.blocks = [
+            birdjepa.nn.transformer.Block(decoder_cfg, key=keys[i + 1])
+            for i in range(cfg.decoder_depth)
+        ]
+        self.norm = eqx.nn.LayerNorm(cfg.decoder_dim)
 
         # Project to pixel space
         kernel_size = encoder_cfg.patch_h * encoder_cfg.patch_w
-        self.head = nn.Linear(cfg.decoder_dim, kernel_size)
+        self.head = eqx.nn.Linear(cfg.decoder_dim, kernel_size, key=keys[-2])
 
-        # Positional embeddings for decoder (patches only, CLS has no position)
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, encoder_cfg.n_patches, cfg.decoder_dim)
+        # Positional embeddings for decoder (patches only)
+        self.pos_embed = (
+            jax.random.truncated_normal(
+                keys[-1], -2, 2, (1, encoder_cfg.n_patches, cfg.decoder_dim)
+            )
+            * 0.02
         )
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-    @jaxtyped(typechecker=beartype.beartype)
-    def forward(
-        self, cls_be: Float[Tensor, "b e"], x_bne: Float[Tensor, "b n e"]
-    ) -> tuple[Float[Tensor, "b d"], Float[Tensor, "b n k"]]:
+    def __call__(
+        self,
+        cls_bd: Float[Array, "b d"],
+        x_bnd: Float[Array, "b n d"],
+        *,
+        key: PRNGKeyArray | None = None,
+    ) -> tuple[Float[Array, "b d"], Float[Array, "b n k"]]:
         """Decode to pixel predictions with CLS participating in attention.
 
         Args:
-            cls_be: CLS token from encoder (B, encoder_dim).
-            x_bne: Encoder output + mask tokens (B, n_patches, encoder_dim).
+            cls_bd: CLS token from encoder (B, encoder_dim).
+            x_bnd: Encoder output + mask tokens (B, n_patches, encoder_dim).
+            key: Optional PRNG key for dropout.
 
         Returns:
             cls_out: Decoded CLS token (B, decoder_dim) for downstream use.
             pred_bnk: Pixel predictions (B, n_patches, patch_h * patch_w).
         """
         # Project to decoder dim
-        cls = self.embed(cls_be.unsqueeze(1))  # (B, 1, decoder_dim)
-        x = self.embed(x_bne)  # (B, N, decoder_dim)
+        cls = jax.vmap(self.embed)(cls_bd)[:, None, :]  # (B, 1, decoder_dim)
+        x = jax.vmap(jax.vmap(self.embed))(x_bnd)  # (B, N, decoder_dim)
 
-        # Add positional embeddings (patches only, CLS has no position)
+        # Add positional embeddings (patches only)
         x = x + self.pos_embed
 
         # Concatenate CLS + patches for attention
-        x = torch.cat([cls, x], dim=1)  # (B, 1+N, decoder_dim)
+        x = jnp.concatenate([cls, x], axis=1)  # (B, 1+N, decoder_dim)
 
-        for block in self.blocks:
-            x = block(x)
+        # Decoder blocks
+        if key is not None:
+            keys = jax.random.split(key, len(self.blocks))
+        else:
+            keys = [None] * len(self.blocks)
 
-        x = self.norm(x)
+        for block, block_key in zip(self.blocks, keys):
+            x = block(x, key=block_key)
+
+        x = jax.vmap(jax.vmap(self.norm))(x)
 
         # Split CLS and patches
         cls_out = x[:, 0]  # (B, decoder_dim)
         patches = x[:, 1:]  # (B, N, decoder_dim)
 
-        return cls_out, self.head(patches)
+        return cls_out, jax.vmap(jax.vmap(self.head))(patches)
 
 
-class Pixio(Objective):
+class Pixio(eqx.Module, Objective):
     """Pixio: Enhanced MAE with deeper decoder and block masking.
 
     Reference: "In Pursuit of Pixel Supervision for Visual Pre-training"
     https://arxiv.org/abs/2512.15715
     """
 
+    encoder_cfg: birdjepa.nn.transformer.Config = eqx.field(static=True)
+    cfg: PixioConfig = eqx.field(static=True)
+
+    decoder: PixioDecoder
+    mask_token: Float[Array, "1 1 d"]
+
     def __init__(
         self,
         encoder_cfg: birdjepa.nn.transformer.Config,
         cfg: PixioConfig,
-        probe_pooling: str = "cls",
-        n_sources: int = 0,
-        source_rank: int = 0,
-        source_weight: float = 1.0,
+        *,
+        key: PRNGKeyArray,
     ):
-        super().__init__()
         self.encoder_cfg = encoder_cfg
         self.cfg = cfg
-        self.probe_pooling = probe_pooling
-        self.source_weight = source_weight
 
-        # Decoder
-        self.decoder = PixioDecoder(encoder_cfg, cfg)
+        dec_key, mask_key = jax.random.split(key)
+        self.decoder = PixioDecoder(encoder_cfg, cfg, key=dec_key)
+        self.mask_token = (
+            jax.random.normal(mask_key, (1, 1, encoder_cfg.embed_dim)) * 0.02
+        )
 
-        # Mask token (in encoder dim, will be projected by decoder)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, encoder_cfg.embed_dim))
-        nn.init.normal_(self.mask_token, std=0.02)
-
-        # Optional source prediction head
-        if source_rank > 0 and n_sources > 0:
-            input_dim = encoder_cfg.n_cls_tokens * encoder_cfg.embed_dim
-            self.source_head = SourceHead(input_dim, n_sources, source_rank)
-        else:
-            self.source_head = None
-
-        # RNG for masking (will be moved to correct device on first forward)
-        self._rng: torch.Generator | None = None
-
-    def _get_rng(self, device: torch.device) -> torch.Generator:
-        """Get or create generator on the correct device."""
-        if self._rng is None:
-            self._rng = torch.Generator(device=device)
-            self._rng.manual_seed(self.cfg.seed)
-
-        assert self._rng.device == device
-        return self._rng
-
-    def wrap_dataset(self, base_ds: Dataset) -> Dataset:
+    def wrap_dataset(self, base_ds: birdjepa.data.Dataset) -> birdjepa.data.Dataset:
+        """Pixio doesn't need to wrap the dataset."""
         return base_ds
 
-    def forward(
-        self, batch: dict, encoder: nn.Module
-    ) -> tuple[dict[str, Tensor], Tensor, Tensor]:
-        data_bhw: Float[Tensor, "b h w"] = batch["data"]
-        target_b: Int[Tensor, " b"] = batch["target"]
+    def __call__(
+        self,
+        batch: dict,
+        encoder: eqx.Module,
+        *,
+        key: PRNGKeyArray,
+    ) -> tuple[dict[str, Array], Float[Array, "b d"], Int[Array, " b"]]:
+        """Compute Pixio (MAE) loss.
+
+        Args:
+            batch: Dict with "data" (B, H, W) and "target" (B,).
+            encoder: Transformer encoder.
+            key: PRNG key for masking and forward pass.
+
+        Returns:
+            (losses, embeddings, targets) where losses has "mse" key.
+        """
+        mask_key, enc_key, dec_key = jax.random.split(key, 3)
+
+        data_bhw = batch["data"]
+        target_b = batch["target"]
         b = data_bhw.shape[0]
 
         # 1. Patchify
@@ -528,113 +351,154 @@ class Pixio(Objective):
             self.encoder_cfg.n_patches_w,
             self.cfg.block_size,
             self.cfg.mask_ratio,
-            generator=self._get_rng(data_bhw.device),
+            key=mask_key,
         )
 
-        # 3. Select visible patches for encoder
-        visible_mask = ~mask_bn  # (B, N), True = visible
-        n_visible_per_sample = visible_mask.sum(dim=1)
-        assert (n_visible_per_sample == n_visible_per_sample[0]).all()
-        n_visible = n_visible_per_sample[0].item()
-        n_masked = n_patches - n_visible
-        assert n_masked == int(n_patches * self.cfg.mask_ratio)
+        # 3. Compute visible count
+        n_visible = int(n_patches * (1 - self.cfg.mask_ratio))
 
-        # Gather visible patches (same number for all samples due to adjustment)
-        x_visible = torch.zeros(b, n_visible, x_bnk.shape[2], device=x_bnk.device)
-        grid_visible = torch.zeros(
-            b, n_visible, 2, dtype=torch.long, device=x_bnk.device
+        # 4. Gather visible patches using argsort trick for static shapes
+        # Sort by mask value (False=0 comes first), then take first n_visible
+        sort_indices = jnp.argsort(mask_bn.astype(jnp.int32), axis=1)
+        visible_indices = sort_indices[:, :n_visible]
+
+        # Gather visible patches and grid coords
+        x_visible = jnp.take_along_axis(x_bnk, visible_indices[:, :, None], axis=1)
+        grid_visible = jnp.take_along_axis(
+            grid_bn2, visible_indices[:, :, None], axis=1
         )
-        for i in range(b):
-            vis_idx = visible_mask[i].nonzero(as_tuple=True)[0]
-            x_visible[i] = x_bnk[i, vis_idx]
-            grid_visible[i] = grid_bn2[i, vis_idx]
 
-        # 4. Encode visible patches only
-        out = encoder(x_visible, grid=grid_visible)
+        # 5. Encode visible patches only
+        out = encoder(x_visible, grid=grid_visible, key=enc_key)
         enc_visible = out["patches"]
-        assert enc_visible.shape == (b, n_visible, self.encoder_cfg.embed_dim)
 
-        # Mean of CLS tokens for decoder (handles n_cls_tokens >= 1)
-        cls_bd = out["cls"].mean(dim=1)  # (B, D)
+        # Mean of CLS tokens
+        cls_bd = out["cls"].mean(axis=1)  # (B, D)
 
-        # 5. Prepare decoder input: insert mask tokens at masked positions
-        dec_input = torch.zeros(
-            b, n_patches, self.encoder_cfg.embed_dim, device=x_bnk.device
-        )
-        for i in range(b):
-            vis_idx = visible_mask[i].nonzero(as_tuple=True)[0]
-            mask_idx = mask_bn[i].nonzero(as_tuple=True)[0]
-            dec_input[i, vis_idx] = enc_visible[i]
-            dec_input[i, mask_idx] = self.mask_token[0, 0]
+        # 6. Prepare decoder input: insert mask tokens at masked positions
+        # Start with zeros, add mask tokens, then scatter visible patches
+        dec_input = jnp.zeros((b, n_patches, self.encoder_cfg.embed_dim))
+        dec_input = dec_input + self.mask_token
+        # Then scatter visible patches
+        for i in range(n_visible):
+            idx = visible_indices[:, i]  # (B,)
+            vals = enc_visible[:, i]  # (B, D)
+            dec_input = dec_input.at[jnp.arange(b), idx].set(vals)
 
-        # 6. Decode to pixel predictions (CLS participates in attention)
-        # Reconstruction loss flows back to encoder CLS via decoder attention
-        _, pred_bnk = self.decoder(cls_bd, dec_input)
-        assert pred_bnk.shape == x_bnk.shape
+        # 7. Decode to pixel predictions
+        _, pred_bnk = self.decoder(cls_bd, dec_input, key=dec_key)
 
-        # 7. Compute MSE loss on masked patches only (with per-patch normalization)
-        target_bnk = x_bnk.clone()
-        mean = target_bnk.mean(dim=-1, keepdim=True)
-        var = target_bnk.var(dim=-1, keepdim=True)
-        target_bnk = (target_bnk - mean) / (var + 1e-6).sqrt()
-        loss = F.mse_loss(pred_bnk[mask_bn], target_bnk[mask_bn])
+        # 8. Compute MSE loss on masked patches only (with per-patch normalization)
+        target_bnk = x_bnk
+        mean = target_bnk.mean(axis=-1, keepdims=True)
+        var = target_bnk.var(axis=-1, keepdims=True)
+        target_bnk = (target_bnk - mean) / jnp.sqrt(var + 1e-6)
 
-        # 8. Get embedding for probe based on pooling config
-        if self.probe_pooling == "cls":
-            emb_bd = out["cls"].mean(dim=1)  # Mean of CLS tokens
-        elif self.probe_pooling == "patches":
-            emb_bd = out["patches"].mean(dim=1)  # Mean of visible patches
-        else:
-            raise ValueError(f"Unknown probe_pooling: {self.probe_pooling}")
+        # Masked MSE: only compute loss on masked patches
+        mask_bnk = mask_bn[:, :, None]  # (B, N, 1)
+        diff_sq = (pred_bnk - target_bnk) ** 2
+        masked_diff = diff_sq * mask_bnk
+        mse_loss = masked_diff.sum() / (mask_bn.sum() * pred_bnk.shape[-1])
 
-        losses = {"mse": loss}
+        losses = {"mse": mse_loss}
 
-        # 9. Optional source prediction loss (uses index as source ID)
-        if self.source_head is not None:
-            source_logits = self.source_head(out["cls"])
-            losses["source"] = self.source_weight * F.cross_entropy(
-                source_logits, batch["index"]
-            )
+        # 9. Return CLS embedding for probe
+        emb_bd = cls_bd
 
-        return losses, emb_bd.detach(), target_b
-
-
-###########
-# Factory #
-###########
-
-Config = SupervisedConfig | LeJEPAConfig | PixioConfig
+        return losses, emb_bd, target_b
 
 
 @beartype.beartype
 def make_objective(
     cfg: Config,
     model_cfg: birdjepa.nn.transformer.Config,
-    n_classes: int,
-    probe_pooling: str = "cls",
-    n_sources: int = 0,
-    source_rank: int = 0,
-    source_weight: float = 1.0,
+    dataset: birdjepa.data.Dataset,
+    *,
+    key: chex.PRNGKey,
 ) -> Objective:
-    """Create an objective from config."""
+    """Factory for JAX objectives."""
     if isinstance(cfg, SupervisedConfig):
-        return Supervised(
-            model_cfg,
-            n_classes,
-            n_sources=n_sources,
-            source_rank=source_rank,
-            source_weight=source_weight,
-        )
+        return Supervised(model_cfg, n_classes=dataset.n_classes, key=key)
     elif isinstance(cfg, LeJEPAConfig):
-        return LeJEPA(model_cfg, cfg)
+        return LeJEPA(cfg, model_cfg, key=key)
     elif isinstance(cfg, PixioConfig):
-        return Pixio(
-            model_cfg,
-            cfg,
-            probe_pooling=probe_pooling,
-            n_sources=n_sources,
-            source_rank=source_rank,
-            source_weight=source_weight,
-        )
+        return Pixio(model_cfg, cfg, key=key)
     else:
         raise ValueError(f"Unknown objective config: {type(cfg)}")
+
+
+@beartype.beartype
+def make_block_mask(
+    batch_size: int,
+    n_h: int,
+    n_w: int,
+    block_size: int,
+    mask_ratio: float,
+    *,
+    key: chex.PRNGKey,
+) -> Array:
+    """Generate block mask with adjustment for exact mask count.
+
+    1. Divide grid into blocks and randomly mask blocks
+    2. Adjust to hit exact target count (add individual patches)
+
+    Args:
+        batch_size: Number of samples in batch.
+        n_h: Number of patches in height.
+        n_w: Number of patches in width.
+        block_size: Size of masking blocks (2 = 2x2 blocks).
+        mask_ratio: Target fraction of patches to mask.
+        key: PRNG key for reproducibility.
+
+    Returns:
+        Boolean array (B, n_h * n_w) where True = masked.
+    """
+    n_patches = n_h * n_w
+    n_masked_target = int(n_patches * mask_ratio)
+
+    n_blocks_h = (n_h + block_size - 1) // block_size
+    n_blocks_w = (n_w + block_size - 1) // block_size
+    n_blocks = n_blocks_h * n_blocks_w
+
+    max_patches_per_block = block_size * block_size
+    n_blocks_masked = min(n_masked_target // max_patches_per_block, n_blocks)
+
+    keys = jax.random.split(key, batch_size)
+
+    def make_single_mask(sample_key: chex.PRNGKey) -> Array:
+        block_key, extra_key = jax.random.split(sample_key)
+
+        # Shuffle blocks and select first n_blocks_masked
+        block_perm = jax.random.permutation(block_key, n_blocks)
+        masked_block_indices = block_perm[:n_blocks_masked]
+
+        # Create block mask (n_blocks,) then reshape
+        block_mask_flat = (
+            jnp.zeros(n_blocks, dtype=bool).at[masked_block_indices].set(True)
+        )
+        block_mask = block_mask_flat.reshape(n_blocks_h, n_blocks_w)
+
+        # Map each patch to its block
+        patch_block_h = jnp.arange(n_h) // block_size
+        patch_block_w = jnp.arange(n_w) // block_size
+
+        # Create 2D mask by indexing block_mask
+        patch_mask_2d = block_mask[patch_block_h[:, None], patch_block_w[None, :]]
+        patch_mask = patch_mask_2d.flatten()
+
+        # Add extra patches to reach exact target using priority-based selection.
+        # Already-masked patches get priority -inf, unmasked get random priority.
+        # Sort descending and mark top n_masked_target as masked.
+        priorities = jax.random.uniform(extra_key, (n_patches,))
+        priorities = jnp.where(patch_mask, jnp.inf, priorities)
+        sorted_indices = jnp.argsort(-priorities)
+        new_mask = (
+            jnp
+            .zeros(n_patches, dtype=bool)
+            .at[sorted_indices[:n_masked_target]]
+            .set(True)
+        )
+
+        return new_mask
+
+    return jax.vmap(make_single_mask)(keys)

@@ -4,6 +4,21 @@ import collections.abc
 import logging
 import time
 
+import jax
+import jax.numpy as jnp
+
+
+def jax_has_gpu() -> bool:
+    """Check if JAX has GPU available.
+
+    From https://github.com/jax-ml/jax/issues/971
+    """
+    try:
+        _ = jax.device_put(jnp.ones(1), device=jax.devices("gpu")[0])
+        return True
+    except Exception:
+        return False
+
 
 class progress:
     """Wraps an iterable with logging instead of tqdm (works better with log files)."""

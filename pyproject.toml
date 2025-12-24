@@ -9,13 +9,18 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "beartype>=0.22.9",
+    "chex>=0.1.91",
     "datasets>=4.4.1",
     "duckdb>=1.4.3",
+    "equinox>=0.13.2",
+    "grain>=0.2.15",
     "huggingface-hub>=1.2.3",
+    "jax>=0.8.2",
     "jaxtyping>=0.2.38",
     "librosa>=0.11.0",
     "marimo>=0.18.4",
     "matplotlib>=3.10.8",
+    "optax>=0.2.6",
     "polars>=1.36.1",
     "requests>=2.32.0",
     "safetensors>=0.5.0",
@@ -51,4 +56,7 @@ dev = [
 testpaths = ["tests"]
 filterwarnings = [
     "ignore::DeprecationWarning",
+]
+markers = [
+    "slow: slow tests (e.g., large models, long-running parity checks)",
 ]

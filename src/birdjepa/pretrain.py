@@ -5,17 +5,18 @@ Based on https://github.com/rbalestr-lab/lejepa/blob/main/MINIMAL.md
 """
 
 import dataclasses
+import json
 import logging
 import pathlib
+import typing as tp
 
 import beartype
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import equinox as eqx
+import jax
+import jax.random as jr
+import jax.numpy as jnp
+import optax
 import wandb
-from torch.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader
 
 import birdjepa.data
 import birdjepa.helpers
@@ -26,6 +27,7 @@ log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 logger = logging.getLogger("birdjepa.pretrain")
 
 
+@beartype.beartype
 @dataclasses.dataclass(frozen=True)
 class Config:
     """Training configuration for BirdJEPA."""
@@ -54,7 +56,9 @@ class Config:
     """Number of training epochs."""
     log_every: int = 50
     """Log training metrics every N steps."""
-    device: str = "cuda"
+    seed: int = 42
+    """Random seed."""
+    device: tp.Literal["cpu", "gpu"] = "gpu"
     """Device to train on."""
     probe_pooling: str = "cls"
     """Pooling for probe: 'cls' (mean of CLS tokens) or 'patches' (mean of patches)."""
@@ -91,30 +95,88 @@ def make_dataset(cfg: birdjepa.data.Config):
         raise ValueError(f"Unknown data config type: {type(cfg)}")
 
 
-def save_checkpoint(path, epoch, encoder, objective, optimizer, scheduler, scaler):
-    """Save training checkpoint."""
-    ckpt = {
-        "epoch": epoch,
-        "encoder": encoder.state_dict(),
-        "objective": objective.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "scaler": scaler.state_dict(),
-    }
-    torch.save(ckpt, path)
+def save_checkpoint(path, epoch, encoder, objective, probe, opt_state):
+    """Save training checkpoint using Equinox serialization."""
+    metadata = {"epoch": epoch}
+    models = {"encoder": encoder, "objective": objective, "probe": probe}
+    with open(path, "wb") as f:
+        f.write((json.dumps(metadata) + "\n").encode())
+        eqx.tree_serialise_leaves(f, models)
+        eqx.tree_serialise_leaves(f, opt_state)
     logger.info("Saved checkpoint to %s", path)
 
 
-def load_checkpoint(path, encoder, objective, optimizer, scheduler, scaler):
-    """Load training checkpoint. Returns starting epoch."""
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    encoder.load_state_dict(ckpt["encoder"])
-    objective.load_state_dict(ckpt["objective"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scheduler.load_state_dict(ckpt["scheduler"])
-    scaler.load_state_dict(ckpt["scaler"])
-    logger.info("Loaded checkpoint from %s (epoch %d)", path, ckpt["epoch"])
-    return ckpt["epoch"] + 1
+def load_checkpoint(path, encoder, objective, probe, opt_state):
+    """Load training checkpoint. Returns (encoder, objective, probe, opt_state, start_epoch)."""
+    with open(path, "rb") as f:
+        metadata = json.loads(f.readline().decode())
+        models = {"encoder": encoder, "objective": objective, "probe": probe}
+        models = eqx.tree_deserialise_leaves(f, models)
+        opt_state = eqx.tree_deserialise_leaves(f, opt_state)
+    logger.info("Loaded checkpoint from %s (epoch %d)", path, metadata["epoch"])
+    return (
+        models["encoder"],
+        models["objective"],
+        models["probe"],
+        opt_state,
+        metadata["epoch"] + 1,
+    )
+
+
+def softmax_cross_entropy(logits, labels):
+    """Cross-entropy loss for classification."""
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    one_hot = jax.nn.one_hot(labels, logits.shape[-1])
+    return -jnp.sum(one_hot * log_probs, axis=-1).mean()
+
+
+@eqx.filter_jit
+def train_step(models, optim, opt_state, batch):
+    """Single training step.
+
+    Args:
+        models: Dict with 'encoder', 'objective', 'probe'.
+        optim: Optax optimizer.
+        opt_state: Optimizer state.
+        batch: Training batch dict.
+
+    Returns:
+        (updated_models, new_opt_state, metrics_dict)
+    """
+
+    def loss_fn(models):
+        encoder, objective, probe = (
+            models["encoder"],
+            models["objective"],
+            models["probe"],
+        )
+        losses, emb, targets = objective(batch, encoder)
+        obj_loss = sum(losses.values())
+        probe_logits = probe(emb)
+        probe_loss = softmax_cross_entropy(probe_logits, targets)
+        total_loss = obj_loss + probe_loss
+        return total_loss, {
+            "losses": losses,
+            "probe_loss": probe_loss,
+            "emb": emb,
+            "targets": targets,
+        }
+
+    (loss, aux), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(models)
+
+    # Get trainable params
+    params = {k: eqx.filter(v, eqx.is_inexact_array) for k, v in models.items()}
+    grad_params = {k: eqx.filter(v, eqx.is_inexact_array) for k, v in grads.items()}
+
+    updates, new_opt_state = optim.update(grad_params, opt_state, params)
+
+    # Apply updates to models
+    new_models = {}
+    for k in models:
+        new_models[k] = eqx.apply_updates(models[k], updates[k])
+
+    metrics = {"loss": loss, "probe_loss": aux["probe_loss"], **aux["losses"]}
+    return new_models, new_opt_state, metrics
 
 
 @beartype.beartype
@@ -122,77 +184,72 @@ def worker_fn(cfg: Config):
     """Main training function."""
     logging.basicConfig(level=logging.INFO, format=log_format)
 
-    if cfg.device == "cuda":
-        assert torch.cuda.is_available(), "CUDA not available"
+    if cfg.device == "gpu":
+        assert birdjepa.helpers.jax_has_gpu(), "GPU not available"
 
     wandb.init(project="birdjepa", config=dataclasses.asdict(cfg))
-    torch.manual_seed(42)
+    key = jr.key(cfg.seed)
 
     # Data
-    base_ds = make_dataset(cfg.train_data)
-    assert cfg.test_data is not None, "test_data is required for evaluation"
+    train_ds = make_dataset(cfg.train_data)
     test_ds = make_dataset(cfg.test_data)
+    n_classes = train_ds.n_classes
 
     # Model and objective
-    n_classes = base_ds.n_classes
-    n_sources = getattr(base_ds, "n_sources", 0)
-    encoder = birdjepa.nn.transformer.Transformer(cfg.model).to(cfg.device)
+    model_key, key = jr.split(key)
+    encoder = birdjepa.nn.transformer.Transformer(cfg.model, key=model_key)
+    obj_key, key = jr.split(key)
     objective = birdjepa.nn.objectives.make_objective(
-        cfg.objective,
-        cfg.model,
-        n_classes,
-        probe_pooling=cfg.probe_pooling,
-        n_sources=n_sources,
-        source_rank=cfg.source_rank,
-        source_weight=cfg.source_weight,
-    ).to(cfg.device)
+        cfg.objective, cfg.model, train_ds, key=obj_key
+    )
 
     # Wrap dataset for objective (e.g., multi-view for LeJEPA)
-    train_ds = objective.wrap_dataset(base_ds)
-    train_loader = DataLoader(
+    train_ds = objective.wrap_dataset(train_ds)
+    train_loader = birdjepa.data.make_dataloader(
         train_ds,
+        seed=cfg.seed,
         batch_size=cfg.batch_size,
+        n_workers=cfg.n_workers,
         shuffle=True,
         drop_last=True,
-        num_workers=cfg.n_workers,
-        pin_memory=True,
     )
-    test_loader = DataLoader(
+    test_loader = birdjepa.data.make_dataloader(
         test_ds,
+        seed=cfg.seed,
         batch_size=cfg.batch_size,
+        n_workers=cfg.n_workers,
         shuffle=False,
-        num_workers=cfg.n_workers,
-        pin_memory=True,
+        drop_last=False,
     )
 
     # Online linear probe
-    probe = nn.Sequential(
-        nn.LayerNorm(cfg.model.embed_dim),
-        nn.Linear(cfg.model.embed_dim, n_classes),
-    ).to(cfg.device)
+    key, probe_key = jax.random.split(key)
+    probe = eqx.nn.Sequential([
+        eqx.nn.LayerNorm(cfg.model.embed_dim),
+        eqx.nn.Linear(cfg.model.embed_dim, n_classes, key=probe_key),
+    ])
 
     # Optimizer and scheduler
-    param_groups = [
-        {
-            "params": encoder.parameters(),
-            "lr": cfg.lr,
-            "weight_decay": cfg.weight_decay,
-        },
-        {
-            "params": objective.parameters(),
-            "lr": cfg.lr,
-            "weight_decay": cfg.weight_decay,
-        },
-        {"params": probe.parameters(), "lr": 1e-3, "weight_decay": 1e-7},
-    ]
-    optimizer = torch.optim.AdamW(param_groups)
-    warmup_steps = len(train_loader)
-    total_steps = len(train_loader) * cfg.epochs
-    s1 = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-    s2 = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6)
-    scheduler = SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
+    # TODO: Add separate param groups for probe (lr=1e-3, weight_decay=1e-7)
+    steps_per_epoch = len(train_ds) // cfg.batch_size
+    warmup_steps = steps_per_epoch
+    total_steps = steps_per_epoch * cfg.epochs
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=cfg.lr * 0.01,
+        peak_value=cfg.lr,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
+        end_value=1e-6,
+    )
+    optim = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
 
-    scaler = GradScaler(enabled=cfg.device == "cuda")
+    # Combined params for optimizer
+    params = {
+        "encoder": eqx.filter(encoder, eqx.is_inexact_array),
+        "objective": eqx.filter(objective, eqx.is_inexact_array),
+        "probe": eqx.filter(probe, eqx.is_inexact_array),
+    }
+    opt_state = optim.init(params)
 
     # Resume from checkpoint
     start_epoch = 0
@@ -204,58 +261,58 @@ def worker_fn(cfg: Config):
 
     # Training loop
     step = 0
+    models = {"encoder": encoder, "objective": objective, "probe": probe}
+    n_batches = 0
     epochs = birdjepa.helpers.progress(
         range(start_epoch, cfg.epochs), every=1, desc="pretrain"
     )
     for epoch in epochs:
-        encoder.train()
-        objective.train()
-        probe.train()
         epoch_losses: dict[str, float] = {}
         epoch_probe_loss = 0.0
+        n_batches = 0
 
         for batch in train_loader:
+            # Convert batch arrays to JAX
             batch = {
-                k: v.to(cfg.device, non_blocking=True)
-                if isinstance(v, torch.Tensor)
-                else v
+                k: jnp.asarray(v) if hasattr(v, "__array__") else v
                 for k, v in batch.items()
             }
 
-            with autocast(cfg.device, dtype=torch.bfloat16):
-                losses, emb, targets = objective(batch, encoder)
-                obj_loss = sum(losses.values())
-                probe_loss = F.cross_entropy(probe(emb), targets)
-                loss = obj_loss + probe_loss
-
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            models, opt_state, metrics = train_step(models, optim, opt_state, batch)
             step += 1
+            n_batches += 1
 
-            for k, v in losses.items():
-                epoch_losses[k] = epoch_losses.get(k, 0.0) + v.item()
-            epoch_probe_loss += probe_loss.item()
+            # Accumulate epoch losses
+            for k, v in metrics.items():
+                if k not in ("loss", "probe_loss"):
+                    epoch_losses[k] = epoch_losses.get(k, 0.0) + float(v)
+            epoch_probe_loss += float(metrics["probe_loss"])
 
             if step % cfg.log_every == 0:
-                lr = scheduler.get_last_lr()[0]
-                loss_strs = " | ".join(f"{k} {v.item():.4f}" for k, v in losses.items())
+                lr = float(schedule(step))
+                loss_strs = " | ".join(
+                    f"{k} {float(v):.4f}"
+                    for k, v in metrics.items()
+                    if k not in ("loss", "probe_loss")
+                )
                 logger.info(
                     "step %d | %s | probe %.4f | lr %.2e",
                     step,
                     loss_strs,
-                    probe_loss.item(),
+                    float(metrics["probe_loss"]),
                     lr,
                 )
-                log_dict = {"step": step, "lr": lr, "train/probe": probe_loss.item()}
-                for k, v in losses.items():
-                    log_dict[f"train/{k}"] = v.item()
+                log_dict = {
+                    "step": step,
+                    "lr": lr,
+                    "train/probe": float(metrics["probe_loss"]),
+                }
+                for k, v in metrics.items():
+                    if k not in ("loss", "probe_loss"):
+                        log_dict[f"train/{k}"] = float(v)
                 wandb.log(log_dict)
 
         # Log epoch summary
-        n_batches = len(train_loader)
         avg_strs = " | ".join(
             f"avg_{k} {v / n_batches:.4f}" for k, v in epoch_losses.items()
         )
@@ -267,45 +324,41 @@ def worker_fn(cfg: Config):
         )
 
         # Per-epoch evaluation
-        encoder.eval()
-        probe.eval()
+        encoder = models["encoder"]
+        probe = models["probe"]
         correct = 0
         total = 0
 
-        with torch.inference_mode():
-            for batch in test_loader:
-                data = batch["data"].to(cfg.device, non_blocking=True)
-                targets = batch["target"].to(cfg.device, non_blocking=True)
-                with autocast(cfg.device, dtype=torch.bfloat16):
-                    x_bnk, grid = birdjepa.nn.transformer.patchify(data, cfg.model)
-                    out = encoder(x_bnk, grid=grid)
-                    if cfg.probe_pooling == "cls":
-                        emb = out["cls"].mean(dim=1)
-                    else:
-                        emb = out["patches"].mean(dim=1)
-                    logits = probe(emb)
-                    preds = logits.argmax(dim=1)
-                correct += (preds == targets).sum().item()
-                total += targets.size(0)
+        for batch in test_loader:
+            data = jnp.asarray(batch["data"])
+            targets = jnp.asarray(batch["target"])
+            x_bnk, grid = birdjepa.nn.transformer.patchify(data, cfg.model)
+            out = encoder(x_bnk, grid=grid)
+            if cfg.probe_pooling == "cls":
+                emb = out["cls"].mean(axis=1)
+            else:
+                emb = out["patches"].mean(axis=1)
+            logits = probe(emb)
+            preds = jnp.argmax(logits, axis=1)
+            correct += int(jnp.sum(preds == targets))
+            total += targets.shape[0]
         acc = correct / total
         logger.info("epoch %d | test_acc %.4f", epoch, acc)
         wandb.log({"test/epoch": epoch, "test/acc": acc})
 
         # Save checkpoint
         if (epoch + 1) % cfg.save_every == 0:
-            ckpt_path = cfg.ckpt_to / f"epoch_{epoch:04d}.pt"
-            save_checkpoint(
-                ckpt_path, epoch, encoder, objective, optimizer, scheduler, scaler
+            ckpt_path = cfg.ckpt_to / f"epoch_{epoch:04d}.eqx"
+            encoder, objective, probe = (
+                models["encoder"],
+                models["objective"],
+                models["probe"],
             )
+            save_checkpoint(ckpt_path, epoch, encoder, objective, probe, opt_state)
 
     # Save final checkpoint
+    encoder, objective, probe = models["encoder"], models["objective"], models["probe"]
     save_checkpoint(
-        cfg.ckpt_to / "final.pt",
-        cfg.epochs - 1,
-        encoder,
-        objective,
-        optimizer,
-        scheduler,
-        scaler,
+        cfg.ckpt_to / "final.eqx", cfg.epochs - 1, encoder, objective, probe, opt_state
     )
     wandb.finish()
