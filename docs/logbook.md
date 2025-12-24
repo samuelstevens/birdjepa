@@ -485,3 +485,57 @@ Code changes needed:
 4. Get `n_classes` from `datasets.load_dataset_builder(...).info` instead of `dataset.features`
 
 Tradeoff: Streaming may be slightly slower than cached reads for repeated iterations, but for benchmarking where we iterate once, this is acceptable.
+
+Hardcoded decisions that should be configurable
+
+High value to make configurable:
+- Spectrogram preprocessing in `src/birdjepa/data/__init__.py` and `src/birdjepa/nn/bird_mae.py`: sample rate, n_mels, frame_shift, mean/std, padding strategy, htk_compat, dither
+- Dataset sources/columns/splits fixed to BirdSet: dataset name, label columns, streaming on/off, `test_5s` split, 32kHz cast
+- W&B always enabled with fixed project name in `src/birdjepa/pretrain.py`
+- Training seed fixed in `src/birdjepa/pretrain.py`
+- Scheduler details fixed in `src/birdjepa/pretrain.py` (warmup length, start factor, eta_min)
+- Online probe always on and always added to loss in `src/birdjepa/pretrain.py` (no toggle/weighting)
+- Probe optimizer hyperparams fixed in `src/birdjepa/pretrain.py`
+- Mixed precision fixed to bf16 in `src/birdjepa/pretrain.py`
+- DataLoader `drop_last` and `pin_memory` fixed in `src/birdjepa/pretrain.py`
+
+Benchmarking/reporting knobs:
+- AsymmetricLoss hyperparams fixed in `src/birdjepa/benchmark/__init__.py`
+- Centroid temperature fixed in `src/birdjepa/benchmark/__init__.py`
+- Evaluation threshold fixed at 0.5 and cmAP-only reporting in `src/birdjepa/benchmark/__init__.py`
+- Prediction saving cutoff fixed at 50k in `src/birdjepa/benchmark/reporting.py`
+
+Model/weights plumbing:
+- Bird-MAE checkpoint list fixed to three variants and download URL is fixed in `src/birdjepa/nn/bird_mae.py`
+- Slurm resource defaults fixed in `launch.py` and `src/birdjepa/benchmark/__init__.py`
+
+# 12/24/2025
+
+I am going to train a couple runs to justify the "modern" training stack.
+
+Fixed
+
+- Dataset: BirdSet XCL, same split, same augmentations, same global batch size.
+- Model: regular 12-layer ViT-S, patch = 16x16
+- Budget: define a fixed number of steps that fits in 12h on 4xA100 / 6h on 4xH100, then keep that constant for every run.
+- LR schedule: WSD with the same S (total steps) for every run in this comparison.
+
+Run 3–5 learning rates (log-spaced) with:
+
+- Optimizer: AdamW
+- Architecture: baseline (no RoPE, no QK-norm, no SwiGLU, no register tokens)
+
+Output: pick best LR by validation metric at end-of-budget (and sanity-check stability).
+
+Run 3–5 learning rates (log-spaced, independent of Adam’s range) with:
+
+- Optimizer: Muon
+- Architecture: RoPE (2D), QK-Norm, SwiGLU, register tokens
+- Everything else identical (data, steps, WSD S, batch, aug)
+
+Output: pick best LR.
+
+If something goes wrong, we could do
+
+- Arch-only: AdamW + (RoPE + QK-Norm + SwiGLU + registers)
+- Opt-only: Muon + baseline architecture
