@@ -254,8 +254,6 @@ class Cifar100Dataset(grain.RandomAccessDataSource):
         return len(self.ds)
 
     def __getitem__(self, idx: int) -> dict:
-        import jax.numpy as jnp
-
         img, target = self.ds[idx]  # PIL Image, int
         # Convert to grayscale array: (H, W)
         img = np.array(img, dtype=np.float32)  # (32, 32, 3)
@@ -264,7 +262,6 @@ class Cifar100Dataset(grain.RandomAccessDataSource):
         # Normalize to [0, 1] then standardize
         img = img / 255.0
         img = (img - CIFAR_MEAN) / CIFAR_STD
-        img = jnp.asarray(img)
         img = birdjepa.augment.apply(img, self.cfg.augmentations)
         label = CIFAR100_CLASSES[target]
         return {"data": img, "label": label, "target": target, "index": idx}

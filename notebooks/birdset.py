@@ -27,7 +27,7 @@ def _(beartype, duckdb, os, pathlib, pl):
         raw_dir = report_to / "raw"
         assert raw_dir.exists()
         pattern = str(raw_dir / "*.parquet")
-        query = """SELECT * FROM read_parquet(?)"""
+        query = """SELECT task_name, model_org, model_ckpt, clf, n_train, cmap, n_classes, exp_cfg, argv, git_commit, posix, gpu_name, hostname FROM read_parquet(?)"""
         return duckdb.execute(query, [pattern]).pl()
 
     df = load_df(pathlib.Path("./results")).drop("^pred.*$")
@@ -51,59 +51,61 @@ def _(colors, df, get_n_train, pl, plt):
     def _():
         # Does more data help on each task?
         fig, axes = plt.subplots(
-            figsize=(8, 4),
-            nrows=2,
+            figsize=(8, 12),
+            nrows=6,
             ncols=4,
             sharex=True,
             sharey=True,
             layout="constrained",
             dpi=150,
         )
-        axes = axes.reshape(-1)
+        all_axes = axes.reshape(3, -1)
 
         tasks = df.get_column("task_name").unique().sort().to_list()
 
-        for i, (task, ax) in enumerate(zip(tasks, axes)):
-            for model, color in zip(("base", "large", "huge"), colors):
-                xs, ys = (
-                    df
-                    .filter(
-                        pl.col("model_ckpt").str.to_lowercase().str.contains(model)
-                        & (pl.col("task_name") == task)
-                        & (pl.col("clf") == "linear")
+        for clf, marker, axes in zip(
+            ("Linear", "MLP", "Centroid"), ("o", "^", "s"), all_axes
+        ):
+            for i, (task, ax) in enumerate(zip(tasks, axes)):
+                for model, color in zip(("base", "large", "huge"), colors):
+                    xs, ys = (
+                        df
+                        .filter(
+                            pl.col("model_ckpt").str.to_lowercase().str.contains(model)
+                            & (pl.col("task_name") == task)
+                            & (pl.col("clf") == clf.lower())
+                        )
+                        .select("n_train", "cmap")
+                        .to_numpy()
+                        .T
                     )
-                    .select("n_train", "cmap")
-                    .to_numpy()
-                    .T
-                )
 
-                if xs.size == 0:
-                    continue
+                    if xs.size == 0:
+                        continue
 
-                xs = sorted([get_n_train(task, x) for x in xs.tolist()])
-                print(task, xs)
+                    xs = sorted([get_n_train(task, x) for x in xs.tolist()])
 
-                ax.plot(
-                    xs,
-                    ys,
-                    marker="o",
-                    color=color,
-                    alpha=0.5,
-                    label=f"Bird-MAE {model[0].upper()}",
-                )
+                    ax.plot(
+                        xs,
+                        ys,
+                        marker=marker,
+                        color=color,
+                        alpha=0.5,
+                        label=f"BirdMAE-{model[0].upper()}+{clf}",
+                    )
 
-            ax.set_xscale("log")
-            ax.set_title(f"{task.upper()}")
-            ax.spines[["top", "right"]].set_visible(False)
+                ax.set_xscale("log")
+                ax.set_title(f"{task.upper()}")
+                ax.spines[["top", "right"]].set_visible(False)
 
-            if i in (0, 4):
-                ax.set_ylabel("cmAP")
+                if i in (0, 4):
+                    ax.set_ylabel("cmAP")
 
-            if i in (4, 5, 6, 7):
-                ax.set_xlabel("Training Samples")
+                if i in (4, 5, 6, 7):
+                    ax.set_xlabel("Training Samples")
 
-            if i in (3,):
-                ax.legend()
+                if i in (3,):
+                    ax.legend()
 
         return fig
 

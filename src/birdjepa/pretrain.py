@@ -15,6 +15,7 @@ import equinox as eqx
 import jax
 import jax.random as jr
 import jax.numpy as jnp
+import numpy as np
 import optax
 import wandb
 
@@ -25,6 +26,25 @@ import birdjepa.nn.transformer
 
 log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 logger = logging.getLogger("birdjepa.pretrain")
+
+
+def _is_numeric_array(x: object) -> bool:
+    """Check if x is a numeric array that can be converted to JAX."""
+    if not isinstance(x, (jax.Array, np.ndarray)):
+        return False
+    dt = getattr(x, "dtype", None)
+    if dt is None:
+        return False
+    return (
+        np.issubdtype(dt, np.bool_)
+        or np.issubdtype(dt, np.integer)
+        or np.issubdtype(dt, np.floating)
+    )
+
+
+def _batch_to_jax(batch: dict) -> dict:
+    """Convert numeric arrays in batch to JAX, drop non-numeric fields."""
+    return {k: jnp.asarray(v) for k, v in batch.items() if _is_numeric_array(v)}
 
 
 @beartype.beartype
@@ -131,7 +151,7 @@ def softmax_cross_entropy(logits, labels):
 
 
 @eqx.filter_jit
-def train_step(models, optim, opt_state, batch):
+def train_step(models, optim, opt_state, batch, *, key):
     """Single training step.
 
     Args:
@@ -139,6 +159,7 @@ def train_step(models, optim, opt_state, batch):
         optim: Optax optimizer.
         opt_state: Optimizer state.
         batch: Training batch dict.
+        key: PRNG key for stochastic operations.
 
     Returns:
         (updated_models, new_opt_state, metrics_dict)
@@ -150,9 +171,9 @@ def train_step(models, optim, opt_state, batch):
             models["objective"],
             models["probe"],
         )
-        losses, emb, targets = objective(batch, encoder)
+        losses, emb, targets = objective(batch, encoder, key=key)
         obj_loss = sum(losses.values())
-        probe_logits = probe(emb)
+        probe_logits = jax.vmap(probe)(emb)
         probe_loss = softmax_cross_entropy(probe_logits, targets)
         total_loss = obj_loss + probe_loss
         return total_loss, {
@@ -232,8 +253,13 @@ def worker_fn(cfg: Config):
     # Optimizer and scheduler
     # TODO: Add separate param groups for probe (lr=1e-3, weight_decay=1e-7)
     steps_per_epoch = len(train_ds) // cfg.batch_size
-    warmup_steps = steps_per_epoch
     total_steps = steps_per_epoch * cfg.epochs
+    warmup_steps = min(
+        steps_per_epoch, total_steps // 10
+    )  # 10% warmup, at most 1 epoch
+    assert total_steps > warmup_steps, (
+        f"total_steps={total_steps} must be > warmup_steps={warmup_steps}"
+    )
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=cfg.lr * 0.01,
         peak_value=cfg.lr,
@@ -272,13 +298,12 @@ def worker_fn(cfg: Config):
         n_batches = 0
 
         for batch in train_loader:
-            # Convert batch arrays to JAX
-            batch = {
-                k: jnp.asarray(v) if hasattr(v, "__array__") else v
-                for k, v in batch.items()
-            }
+            batch = _batch_to_jax(batch)
+            step_key, key = jr.split(key)
 
-            models, opt_state, metrics = train_step(models, optim, opt_state, batch)
+            models, opt_state, metrics = train_step(
+                models, optim, opt_state, batch, key=step_key
+            )
             step += 1
             n_batches += 1
 
@@ -329,16 +354,17 @@ def worker_fn(cfg: Config):
         correct = 0
         total = 0
 
+        eval_key = jr.key(0)  # Fixed key for deterministic eval
         for batch in test_loader:
             data = jnp.asarray(batch["data"])
             targets = jnp.asarray(batch["target"])
             x_bnk, grid = birdjepa.nn.transformer.patchify(data, cfg.model)
-            out = encoder(x_bnk, grid=grid)
+            out = encoder(x_bnk, grid=grid, key=eval_key)
             if cfg.probe_pooling == "cls":
                 emb = out["cls"].mean(axis=1)
             else:
                 emb = out["patches"].mean(axis=1)
-            logits = probe(emb)
+            logits = jax.vmap(probe)(emb)
             preds = jnp.argmax(logits, axis=1)
             correct += int(jnp.sum(preds == targets))
             total += targets.shape[0]

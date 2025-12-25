@@ -15,5 +15,6 @@ vendored/
 .claude/
 .coverage/
 .hypothesis/
-results/
-checkpoints/
+/results/
+/checkpoints/
+/data/

@@ -128,9 +128,10 @@ See docs/logbook.md for experiment logs and findings.
 
 # Slurm (Ascend cluster)
 
-Two main GPU partitions on Ascend:
+GPU partitions on Ascend:
 - `nextgen`: Standard partition, 7-day time limit
 - `preemptible-nextgen`: Preemptible jobs, 1-day time limit
+- `debug`: Debug partition for quick testing (check availability with `sinfo -p debug`)
 
 Account is `PAS2136`. Example job submission:
 ```bash

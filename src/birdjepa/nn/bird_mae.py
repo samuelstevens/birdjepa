@@ -237,7 +237,7 @@ def kaldi_fbank(
 @jaxtyped(typechecker=beartype.beartype)
 def transform(
     waveform: Float[np.ndarray, " samples"],
-) -> Float[Array, "time mels"]:
+) -> Float[np.ndarray, "time mels"]:
     """
     Transform waveform to log-mel spectrogram for Bird-MAE.
 
@@ -245,7 +245,7 @@ def transform(
         waveform: 1D numpy array of audio samples
 
     Returns:
-        JAX array of shape [512, 128] matching HF's feature extractor output
+        Numpy array of shape [512, 128] matching HF's feature extractor output
     """
     (n_samples,) = waveform.shape
     waveform = waveform.astype(np.float32)
@@ -261,7 +261,7 @@ def transform(
     # 2) mean-center (per clip)
     waveform = waveform - np.mean(waveform)
 
-    # 3) Kaldi fbank: [T, 128] - returns JAX array
+    # 3) Kaldi fbank: [T, 128] - convert JAX array to numpy
     fb = kaldi_fbank(
         waveform,
         htk_compat=True,
@@ -271,13 +271,14 @@ def transform(
         dither=0.0,
         frame_shift=10.0,
     )
+    fb = np.asarray(fb)
 
     # 4) pad to 512 frames with min value
     t = fb.shape[0]
     if t < BIRDMAE_TARGET_T:
         diff = BIRDMAE_TARGET_T - t
         min_val = float(fb.min())
-        fb = jnp.pad(fb, ((0, diff), (0, 0)), mode="constant", constant_values=min_val)
+        fb = np.pad(fb, ((0, diff), (0, 0)), mode="constant", constant_values=min_val)
     elif t > BIRDMAE_TARGET_T:
         fb = fb[:BIRDMAE_TARGET_T]
 

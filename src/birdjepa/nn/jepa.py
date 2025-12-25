@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-import birdjepa.nn.transformer
+import birdjepa.nn.transformer_pt as transformer
 
 
 class SIGReg(nn.Module):
@@ -44,9 +44,9 @@ class SIGReg(nn.Module):
 class Encoder(nn.Module):
     """Transformer encoder with projection head for LeJEPA."""
 
-    def __init__(self, cfg: birdjepa.nn.transformer.Config, proj_dim: int = 256):
+    def __init__(self, cfg: transformer.Config, proj_dim: int = 256):
         super().__init__()
-        self.encoder = birdjepa.nn.transformer.Transformer(cfg)
+        self.encoder = transformer.Transformer(cfg)
         embed_dim = cfg.embed_dim
 
         # 3-layer projection head (LeJEPA uses BatchNorm + GELU)

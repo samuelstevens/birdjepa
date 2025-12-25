@@ -133,9 +133,9 @@ def test_supervised_forward_smoke():
 def test_lejepa_forward_smoke():
     """LeJEPA objective forward pass with new API."""
     model_cfg = transformer.Config(
-        input_h=32, input_w=32, patch_h=4, patch_w=4, embed_dim=64, depth=2, n_heads=4
+        input_h=16, input_w=16, patch_h=4, patch_w=4, embed_dim=32, depth=1, n_heads=2
     )
-    lejepa_cfg = objectives.LeJEPAConfig(n_views=2, proj_dim=16)
+    lejepa_cfg = objectives.LeJEPAConfig(n_views=2, proj_dim=8)
 
     key = jax.random.key(0)
     enc_key, obj_key, data_key, fwd_key = jax.random.split(key, 4)
@@ -143,7 +143,7 @@ def test_lejepa_forward_smoke():
     lejepa = objectives.LeJEPA(model_cfg, lejepa_cfg, key=obj_key)
 
     batch = {
-        "views": jax.random.normal(data_key, (2, 2, 32, 32)),
+        "views": jax.random.normal(data_key, (2, 2, 16, 16)),
         "target": jnp.array([0, 1]),
     }
 
@@ -151,5 +151,5 @@ def test_lejepa_forward_smoke():
 
     assert "inv" in losses
     assert "sigreg" in losses
-    assert emb.shape == (4, 64)
+    assert emb.shape == (4, 32)  # batch * n_views = 4, embed_dim = 32
     assert targets.shape == (4,)

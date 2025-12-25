@@ -2,7 +2,6 @@
 
 import abc
 import dataclasses
-import typing as tp
 
 import beartype
 import chex
@@ -55,6 +54,10 @@ class PixioConfig:
     """Mask in blocks of this many patches (1 = random patch masking)."""
     seed: int = 42
     """Base seed for masking RNG. Combined with worker_id for per-worker seeding."""
+    source_rank: int = 0
+    """Low-rank bottleneck for source prediction head. 0 = disabled."""
+    source_weight: float = 1.0
+    """Loss weight for source prediction."""
 
 
 Config = SupervisedConfig | LeJEPAConfig | PixioConfig
@@ -161,18 +164,169 @@ class Supervised(eqx.Module, Objective):
 
 
 # -----------------------------------------------------------------------------
-# LeJEPA (placeholder)
+# LeJEPA
 # -----------------------------------------------------------------------------
 
 
+class MultiViewDataset:
+    """Wraps a base dataset to return multiple views per sample.
+
+    Each call to base_ds[idx] should return a different random crop/augmentation.
+    """
+
+    def __init__(self, base_ds: birdjepa.data.Dataset, n_views: int):
+        self.ds = base_ds
+        self.n_views = n_views
+        self.n_classes = base_ds.n_classes
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx: int) -> dict:
+        items = [self.ds[idx] for _ in range(self.n_views)]
+        views = jnp.stack([item["data"] for item in items])
+        first = items[0]
+        return {"views": views, "target": first["target"], "index": first["index"]}
+
+
+class SIGReg(eqx.Module):
+    """Sketched Isotropic Gaussian Regularization.
+
+    Encourages embeddings to follow a standard Gaussian distribution
+    using characteristic function matching.
+    """
+
+    t: Float[Array, " k"]
+    phi: Float[Array, " k"]
+    weights: Float[Array, " k"]
+
+    def __init__(self, n_knots: int = 17):
+        t = jnp.linspace(0, 3, n_knots)
+        dt = 3 / (n_knots - 1)
+        weights = jnp.full((n_knots,), 2 * dt)
+        weights = weights.at[0].set(dt)
+        weights = weights.at[-1].set(dt)
+        window = jnp.exp(-(t**2) / 2.0)
+        self.t = t
+        self.phi = window
+        self.weights = weights * window
+
+    def __call__(
+        self, proj_vbd: Float[Array, "v b d"], *, key: PRNGKeyArray
+    ) -> Float[Array, ""]:
+        """Compute SIGReg loss."""
+        d = proj_vbd.shape[-1]
+        A_dk = jax.random.normal(key, (d, 256))
+        A_dk = A_dk / jnp.linalg.norm(A_dk, axis=0, keepdims=True)
+        x_t = (proj_vbd @ A_dk)[..., None] * self.t  # (v, b, 256, k)
+        err = (jnp.cos(x_t).mean(axis=-3) - self.phi) ** 2 + jnp.sin(x_t).mean(
+            axis=-3
+        ) ** 2
+        statistic = (err @ self.weights) * proj_vbd.shape[-2]
+        return statistic.mean()
+
+
 class LeJEPA(eqx.Module, Objective):
-    """JAX LeJEPA objective placeholder."""
+    """LeJEPA: Joint-Embedding Predictive Architecture with SIGReg."""
 
-    def __init__(self, *args: tp.Any, **kwargs: tp.Any) -> None:
-        raise NotImplementedError("JAX LeJEPA not implemented yet")
+    encoder_cfg: birdjepa.nn.transformer.Config = eqx.field(static=True)
+    cfg: LeJEPAConfig = eqx.field(static=True)
 
-    def __call__(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
-        raise NotImplementedError("JAX LeJEPA not implemented yet")
+    proj_linear1: eqx.nn.Linear
+    proj_norm1: eqx.nn.LayerNorm
+    proj_linear2: eqx.nn.Linear
+    proj_norm2: eqx.nn.LayerNorm
+    proj_linear3: eqx.nn.Linear
+    sigreg: SIGReg
+
+    def __init__(
+        self,
+        encoder_cfg: birdjepa.nn.transformer.Config,
+        cfg: LeJEPAConfig,
+        *,
+        key: PRNGKeyArray,
+    ):
+        self.encoder_cfg = encoder_cfg
+        self.cfg = cfg
+
+        keys = jax.random.split(key, 3)
+        # Projection head: Linear -> LayerNorm -> ReLU -> Linear -> LayerNorm -> ReLU -> Linear
+        # Using LayerNorm instead of BatchNorm for simplicity (no running stats needed)
+        self.proj_linear1 = eqx.nn.Linear(encoder_cfg.embed_dim, 2048, key=keys[0])
+        self.proj_norm1 = eqx.nn.LayerNorm(2048)
+        self.proj_linear2 = eqx.nn.Linear(2048, 2048, key=keys[1])
+        self.proj_norm2 = eqx.nn.LayerNorm(2048)
+        self.proj_linear3 = eqx.nn.Linear(2048, cfg.proj_dim, key=keys[2])
+        self.sigreg = SIGReg()
+
+    def _project(self, x: Float[Array, " d"]) -> Float[Array, " p"]:
+        """Project a single embedding through the projection head."""
+        x = self.proj_linear1(x)
+        x = self.proj_norm1(x)
+        x = jax.nn.relu(x)
+        x = self.proj_linear2(x)
+        x = self.proj_norm2(x)
+        x = jax.nn.relu(x)
+        x = self.proj_linear3(x)
+        return x
+
+    def wrap_dataset(self, base_ds: birdjepa.data.Dataset) -> birdjepa.data.Dataset:
+        """Wrap dataset with multi-view augmentation."""
+        return MultiViewDataset(base_ds, n_views=self.cfg.n_views)
+
+    def __call__(
+        self,
+        batch: dict,
+        encoder: eqx.Module,
+        *,
+        key: PRNGKeyArray,
+    ) -> tuple[dict[str, Array], Float[Array, "n d"], Int[Array, " n"]]:
+        """Compute LeJEPA loss.
+
+        Args:
+            batch: Dict with "views" (B, V, H, W) and "target" (B,).
+            encoder: Transformer encoder.
+            key: PRNG key for SIGReg and encoder.
+
+        Returns:
+            (losses, embeddings, targets) where losses has "inv" and "sigreg" keys.
+        """
+        enc_key, sigreg_key = jax.random.split(key)
+
+        views_bvhw = batch["views"]
+        target_b = batch["target"]
+        b, v, h, w = views_bvhw.shape
+
+        # Flatten views for encoder: (B, V, H, W) -> (B*V, H, W)
+        views_flat = views_bvhw.reshape(b * v, h, w)
+
+        # Patchify and encode
+        x_bnk, grid_bn2 = birdjepa.nn.transformer.patchify(views_flat, self.encoder_cfg)
+        out = encoder(x_bnk, grid=grid_bn2, key=enc_key)
+
+        # Use mean of CLS tokens: (n, n_cls, D) -> (n, D) where n = b*v
+        emb_nd = out["cls"].mean(axis=1)
+
+        # Project through projection head
+        proj_np = jax.vmap(self._project)(emb_nd)  # (n, proj_dim)
+        proj_vbp = proj_np.reshape(b, v, -1).transpose(1, 0, 2)  # (v, b, proj_dim)
+
+        # LeJEPA losses
+        # Invariance loss: embeddings from different views should match
+        mean_proj = proj_vbp.mean(axis=0)  # (b, p)
+        inv_loss = ((mean_proj - proj_vbp) ** 2).mean()
+
+        # SIGReg loss: encourage standard Gaussian distribution
+        sigreg_loss = self.sigreg(proj_vbp, key=sigreg_key)
+
+        # Repeat targets for each view
+        target_n = jnp.repeat(target_b, v)
+
+        losses = {
+            "inv": inv_loss * (1 - self.cfg.lamb),
+            "sigreg": sigreg_loss * self.cfg.lamb,
+        }
+        return losses, emb_nd, target_n
 
 
 # -----------------------------------------------------------------------------
@@ -420,7 +574,7 @@ def make_objective(
     if isinstance(cfg, SupervisedConfig):
         return Supervised(model_cfg, n_classes=dataset.n_classes, key=key)
     elif isinstance(cfg, LeJEPAConfig):
-        return LeJEPA(cfg, model_cfg, key=key)
+        return LeJEPA(model_cfg, cfg, key=key)
     elif isinstance(cfg, PixioConfig):
         return Pixio(model_cfg, cfg, key=key)
     else:

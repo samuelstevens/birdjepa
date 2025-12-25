@@ -1,6 +1,6 @@
 """Augmentation configs and transforms for Grain pipelines.
 
-Implementation note: Augmentations should match standard libraries (torchvision.transforms.v2, torchaudio) or cite papers. This ensures reproducibility and makes it easier to compare with published results. Always cite the source when implementing an augmentation.
+Implementation note: Augmentations run in dataloader worker processes and must use numpy/scipy only (no JAX). This avoids GPU memory contention with the main training process.
 
 Each augmentation is a frozen dataclass that subclasses grain.transforms.Map, with a `map` method that transforms the sample dict in-place.
 """
@@ -10,13 +10,17 @@ import dataclasses
 import beartype
 import grain.python as grain
 import jax
-import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array, Float
+
+
+def _assert_numpy(x, name: str = "x"):
+    """Assert that x is a numpy array, not a JAX array."""
+    assert isinstance(x, np.ndarray), f"{name} must be numpy array, got {type(x)}"
+    assert not isinstance(x, jax.Array), f"{name} must not be JAX array"
 
 
 # -----------------------------------------------------------------------------
-# Augmentation Transforms (Grain-compatible)
+# Augmentation Transforms (Grain-compatible, numpy-only)
 # -----------------------------------------------------------------------------
 
 
@@ -32,11 +36,12 @@ class RandomCrop(grain.MapTransform):
 
     def map(self, sample: dict) -> dict:
         x = sample["data"]
+        _assert_numpy(x, "data")
         h, w = x.shape
-        padded = jnp.pad(x, self.padding)
+        padded = np.pad(x, self.padding)
         top = np.random.randint(0, 2 * self.padding + 1)
         left = np.random.randint(0, 2 * self.padding + 1)
-        sample["data"] = jax.lax.dynamic_slice(padded, (top, left), (h, w))
+        sample["data"] = padded[top : top + h, left : left + w]
         return sample
 
 
@@ -51,8 +56,10 @@ class HorizontalFlip(grain.MapTransform):
     p: float = 0.5
 
     def map(self, sample: dict) -> dict:
+        x = sample["data"]
+        _assert_numpy(x, "data")
         if np.random.random() < self.p:
-            sample["data"] = jnp.flip(sample["data"], axis=-1)
+            sample["data"] = np.flip(x, axis=-1).copy()
         return sample
 
 
@@ -68,6 +75,7 @@ class GaussianNoise(grain.MapTransform):
 
     def map(self, sample: dict) -> dict:
         x = sample["data"]
+        _assert_numpy(x, "data")
         noise = np.random.randn(*x.shape).astype(np.float32) * self.std
         sample["data"] = x + noise
         return sample
@@ -86,13 +94,14 @@ class FreqMask(grain.MapTransform):
 
     def map(self, sample: dict) -> dict:
         x = sample["data"]
+        _assert_numpy(x, "data")
         h, w = x.shape
-        x_np = np.asarray(x).copy()
+        x = x.copy()
         for _ in range(self.n_masks):
             width = np.random.randint(0, self.max_width + 1)
             start = np.random.randint(0, max(1, h - width + 1))
-            x_np[start : start + width, :] = 0
-        sample["data"] = jnp.asarray(x_np)
+            x[start : start + width, :] = 0
+        sample["data"] = x
         return sample
 
 
@@ -109,13 +118,14 @@ class TimeMask(grain.MapTransform):
 
     def map(self, sample: dict) -> dict:
         x = sample["data"]
+        _assert_numpy(x, "data")
         h, w = x.shape
-        x_np = np.asarray(x).copy()
+        x = x.copy()
         for _ in range(self.n_masks):
             width = np.random.randint(0, self.max_width + 1)
             start = np.random.randint(0, max(1, w - width + 1))
-            x_np[:, start : start + width] = 0
-        sample["data"] = jnp.asarray(x_np)
+            x[:, start : start + width] = 0
+        sample["data"] = x
         return sample
 
 
@@ -133,7 +143,10 @@ class RandomResizedCrop(grain.MapTransform):
     ratio_max: float = 1.333
 
     def map(self, sample: dict) -> dict:
+        from scipy.ndimage import zoom
+
         x = sample["data"]
+        _assert_numpy(x, "data")
         h, w = x.shape
         area = h * w
 
@@ -152,7 +165,8 @@ class RandomResizedCrop(grain.MapTransform):
                 top = np.random.randint(0, h - crop_h + 1)
                 left = np.random.randint(0, w - crop_w + 1)
                 cropped = x[top : top + crop_h, left : left + crop_w]
-                sample["data"] = jax.image.resize(cropped, (h, w), method="bilinear")
+                zoom_h, zoom_w = h / crop_h, w / crop_w
+                sample["data"] = zoom(cropped, (zoom_h, zoom_w), order=1)
                 return sample
 
         return sample
@@ -171,6 +185,7 @@ class ColorJitter(grain.MapTransform):
 
     def map(self, sample: dict) -> dict:
         x = sample["data"]
+        _assert_numpy(x, "data")
 
         if self.brightness > 0:
             factor = 1.0 + (np.random.random() * 2 - 1) * self.brightness
@@ -178,7 +193,7 @@ class ColorJitter(grain.MapTransform):
 
         if self.contrast > 0:
             factor = 1.0 + (np.random.random() * 2 - 1) * self.contrast
-            mean = jnp.mean(x)
+            mean = np.mean(x)
             x = (x - mean) * factor + mean
 
         sample["data"] = x
@@ -198,19 +213,12 @@ class GaussianBlur(grain.MapTransform):
     sigma_max: float = 2.0
 
     def map(self, sample: dict) -> dict:
-        from jax.scipy.signal import convolve2d
+        from scipy.ndimage import gaussian_filter
 
         x = sample["data"]
+        _assert_numpy(x, "data")
         sigma = self.sigma_min + np.random.random() * (self.sigma_max - self.sigma_min)
-
-        k = self.kernel_size
-        half = k // 2
-        x_coords = jnp.arange(k, dtype=x.dtype) - half
-        kernel_1d = jnp.exp(-(x_coords**2) / (2 * sigma**2))
-        kernel_1d = kernel_1d / jnp.sum(kernel_1d)
-        kernel_2d = jnp.outer(kernel_1d, kernel_1d)
-
-        sample["data"] = convolve2d(x, kernel_2d, mode="same")
+        sample["data"] = gaussian_filter(x, sigma=sigma)
         return sample
 
 
@@ -226,9 +234,10 @@ class Solarize(grain.MapTransform):
     p: float = 0.2
 
     def map(self, sample: dict) -> dict:
+        x = sample["data"]
+        _assert_numpy(x, "data")
         if np.random.random() < self.p:
-            x = sample["data"]
-            sample["data"] = jnp.where(x > self.threshold, 1.0 - x, x)
+            sample["data"] = np.where(x > self.threshold, 1.0 - x, x)
         return sample
 
 
@@ -252,12 +261,13 @@ Config = (
 
 
 @beartype.beartype
-def apply(x_hw: Float[Array, "h w"], augmentations: list[Config]) -> Array:
-    """Apply a list of augmentations to a 2D array.
+def apply(x_hw: np.ndarray, augmentations: list[Config]) -> np.ndarray:
+    """Apply a list of augmentations to a 2D numpy array.
 
     This is a convenience function for applying augmentations outside of a Grain pipeline.
     For Grain pipelines, use the transforms directly with dataset.map().
     """
+    _assert_numpy(x_hw, "x_hw")
     sample = {"data": x_hw}
     for aug in augmentations:
         sample = aug.map(sample)

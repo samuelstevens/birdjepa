@@ -351,7 +351,7 @@ def make_block_mask(
         n_masked_current = patch_mask.sum().item()
         assert n_masked_current <= n_masked_target
         if n_masked_current < n_masked_target:
-            unmasked, _ = (~patch_mask).nonzero(as_tuple=True)
+            (unmasked,) = (~patch_mask).nonzero(as_tuple=True)
             n_to_mask = n_masked_target - n_masked_current
             extra = unmasked[
                 torch.randperm(len(unmasked), device=device, generator=generator)[
