@@ -126,6 +126,8 @@ class Config:
     """Number of register tokens (discarded at inference)."""
     use_scan: bool = True
     """Use jax.lax.scan for blocks (faster compile). False = explicit loop (for debugging)."""
+    grad_ckpt: bool = True
+    """Use gradient checkpointing to reduce memory (recompute activations during backward)."""
 
     @property
     def n_patches_h(self) -> int:
@@ -515,6 +517,8 @@ class Transformer(eqx.Module):
             ) -> tuple[Float[Array, "b n d"], None]:
                 arrays_i, key_i = inputs
                 block = eqx.combine(arrays_i, block_static)
+                if self.cfg.grad_ckpt:
+                    return jax.checkpoint(lambda x: block(x, key=key_i))(x), None
                 return block(x, key=key_i), None
 
             x, _ = jax.lax.scan(scan_fn, x, (block_arrays, block_keys))
@@ -522,7 +526,12 @@ class Transformer(eqx.Module):
             # Explicit loop (for debugging gradient flow)
             assert isinstance(self.blocks, tuple)
             for i, block in enumerate(self.blocks):
-                x = block(x, key=block_keys[i])
+                if self.cfg.grad_ckpt:
+                    x = jax.checkpoint(lambda x, b=block, k=block_keys[i]: b(x, key=k))(
+                        x
+                    )
+                else:
+                    x = block(x, key=block_keys[i])
 
         # Final norm
         x = jax.vmap(jax.vmap(self.norm))(x)
