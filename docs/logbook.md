@@ -1,3 +1,40 @@
+# 12/30/2025
+
+## Bug fixed: JAX Transformer attention shape
+
+Root cause: `jax.nn.dot_product_attention` expects shape `(B, seq_len, n_heads, head_dim)` but we were passing `(B, n_heads, seq_len, head_dim)` (PyTorch convention).
+
+Also missing: `cls_pos_embed` - CLS tokens had no positional embedding in JAX version.
+
+Fixes:
+1. Changed QKV transpose from `(2, 0, 3, 1, 4)` to `(2, 0, 1, 3, 4)` to get correct shape
+2. Added `cls_pos_embed` parameter to Transformer class
+3. Created parity tests (tests/test_transformer_parity.py) for forward AND backward passes
+
+Result: Transformer now learns on CIFAR-100!
+- Epoch 0 test_acc: 7.14% (was stuck at 1%)
+- Epoch 1 test_acc: 12.28%
+- Epoch 2 test_acc: 16.01%
+- Epoch 3 test_acc: 19.17%
+- Loss decreasing: 4.37 -> 3.95 in first two epochs
+
+## Earlier debugging (morning)
+
+The JAX Transformer was stuck at 1% test accuracy (random for 100 classes) on CIFAR-100 supervised pretraining. Loss stuck at ~4.6 = ln(100). Gradients flowed, updates were applied, but no learning.
+
+Isolation tests:
+1. **DebugEncoder (linear projection only)**: test_acc improved 2.7% -> 3.5% over 10 epochs. Loss decreased.
+2. **Transformer without augmentations**: test_acc stuck at 1% after 4 epochs.
+3. **Transformer with scan vs for-loop**: identical behavior (scan is NOT the issue).
+
+Conclusion: Bug is in the JAX Transformer architecture (transformer.py), NOT in:
+- Data pipeline (CIFAR-100 loading works)
+- Optimizer (AdamW works)
+- Augmentations (removed, still doesn't learn)
+- Training loop (DebugEncoder learns)
+- jax.lax.scan (for-loop has same issue)
+
+
 # 12/18/2025
 
 Evaluation methods from Bird MAE and Song MAE papers
@@ -539,3 +576,42 @@ If something goes wrong, we could do
 
 - Arch-only: AdamW + (RoPE + QK-Norm + SwiGLU + registers)
 - Opt-only: Muon + baseline architecture
+
+# 12/25/2025
+
+Merry Christmas!
+I think I finished the port to jax.
+
+# 12/29/2025
+
+Now I have finished the port to jax.
+So we can submit a sweep on AdamW as a baseline.
+
+Batch size memory profiling (A100 40GB):
+
+Tested maximum batch size for supervised training on single A100 40GB with ViT-S encoder.
+
+| Batch Size | Peak Memory | Status |
+|------------|-------------|--------|
+| 128        | 5.65 GB     | OK     |
+| 256        | 10.07 GB    | OK     |
+| 384        | 12.56 GB    | OK     |
+| 512        | 17.73 GB    | OK     |
+| 768        | 25.62 GB    | OK     |
+| 1024       | 31.32 GB    | OK     |
+| 1280       | 38.19 GB[^1]   | OOM    |
+| 1536       | 45.56 GB[^1]   | OOM    |
+
+[^1]: XLA rematerialization estimate before OOM
+
+Findings:
+- Maximum batch size is 1024 (uses ~31 GB, leaves ~9 GB headroom for dynamic allocations)
+- bs=1280 needs ~38 GB after rematerialization, but OOM'd trying to allocate additional 33 GB during training
+- bs=1536 exceeds 40 GB even after XLA's best rematerialization effort
+- Memory scales roughly linearly: ~30 MB per sample in batch
+
+Technical notes:
+- Using `jax.nn.dot_product_attention` (flash attention) - O(seq_len) memory vs O(seq_len^2)
+- `jax.lax.scan` with `jax.checkpoint` for transformer blocks
+- Single-GPU mode skips `jax.distributed.initialize()` to avoid heartbeat timeouts during long JIT compilation
+- Jobs at bs=768 and bs=1024 hit a separate data loading bug (`RuntimeError: Failed to open input buffer: End of file`) unrelated to GPU memory

@@ -124,6 +124,8 @@ class Config:
     """Number of CLS tokens (Pixio uses 4-8)."""
     n_reg_tokens: int = 0
     """Number of register tokens (discarded at inference)."""
+    use_scan: bool = True
+    """Use jax.lax.scan for blocks (faster compile). False = explicit loop (for debugging)."""
 
     @property
     def n_patches_h(self) -> int:
@@ -136,6 +138,76 @@ class Config:
     @property
     def n_patches(self) -> int:
         return self.n_patches_h * self.n_patches_w
+
+
+# -----------------------------------------------------------------------------
+# Debug Encoder (minimal for testing)
+# -----------------------------------------------------------------------------
+
+
+@beartype.beartype
+@dataclasses.dataclass(frozen=True)
+class DebugConfig:
+    """Config for DebugEncoder (minimal linear projection)."""
+
+    input_h: int = 32
+    input_w: int = 32
+    patch_h: int = 4
+    patch_w: int = 4
+    embed_dim: int = 64
+
+    @property
+    def n_patches_h(self) -> int:
+        return self.input_h // self.patch_h
+
+    @property
+    def n_patches_w(self) -> int:
+        return self.input_w // self.patch_w
+
+    @property
+    def n_patches(self) -> int:
+        return self.n_patches_h * self.n_patches_w
+
+
+class DebugEncoder(eqx.Module):
+    """Minimal encoder for debugging: just linear projection, no transformer.
+
+    Takes patches, projects to embed_dim, returns mean as CLS token.
+    If this doesn't learn, bug is in data/optimizer. If this learns but
+    Transformer doesn't, bug is in transformer architecture.
+    """
+
+    cfg: DebugConfig = eqx.field(static=True)
+    proj: eqx.nn.Linear
+
+    def __init__(self, cfg: DebugConfig, *, key: PRNGKeyArray):
+        self.cfg = cfg
+        kernel_size = cfg.patch_h * cfg.patch_w
+        self.proj = eqx.nn.Linear(kernel_size, cfg.embed_dim, key=key)
+
+    def __call__(
+        self,
+        x_btk: Float[Array, "b t k"],
+        *,
+        grid: Int[Array, "b t 2"],
+        key: PRNGKeyArray,
+    ) -> dict[str, Array]:
+        """Forward pass matching Transformer interface."""
+        # Project patches: (B, T, K) -> (B, T, D)
+        x = jax.vmap(jax.vmap(self.proj))(x_btk)
+
+        # CLS = mean of patches, no actual CLS token
+        cls = x.mean(axis=1, keepdims=True)  # (B, 1, D)
+
+        return {
+            "cls": cls,
+            "patches": x,
+            "reg": jnp.zeros((x.shape[0], 0, self.cfg.embed_dim)),
+        }
+
+
+# Union type for encoder configs
+EncoderConfig = Config | DebugConfig
 
 
 # -----------------------------------------------------------------------------
@@ -166,7 +238,6 @@ class Attention(eqx.Module):
     scale: float = eqx.field(static=True)
     use_qk_norm: bool = eqx.field(static=True)
     use_rope: bool = eqx.field(static=True)
-    dropout_rate: float = eqx.field(static=True)
 
     qkv: eqx.nn.Linear
     proj: eqx.nn.Linear
@@ -181,7 +252,6 @@ class Attention(eqx.Module):
         self.scale = self.head_dim**-0.5
         self.use_qk_norm = cfg.use_qk_norm
         self.use_rope = cfg.use_rope
-        self.dropout_rate = cfg.dropout
 
         self.qkv = eqx.nn.Linear(cfg.embed_dim, 3 * cfg.embed_dim, key=key1)
         self.proj = eqx.nn.Linear(cfg.embed_dim, cfg.embed_dim, key=key2)
@@ -194,18 +264,17 @@ class Attention(eqx.Module):
             self.k_norm = None
 
     @jaxtyped(typechecker=beartype.beartype)
-    def __call__(
-        self, x_bnd: Float[Array, "b n d"], *, key: PRNGKeyArray | None = None
-    ) -> Float[Array, "b n d"]:
+    def __call__(self, x_bnd: Float[Array, "b n d"]) -> Float[Array, "b n d"]:
         b, n, d = x_bnd.shape
 
         # Compute QKV
         qkv = jax.vmap(jax.vmap(self.qkv))(x_bnd)  # (B, N, 3*D)
         qkv = qkv.reshape(b, n, 3, self.n_heads, self.head_dim)
-        qkv = qkv.transpose(2, 0, 3, 1, 4)  # (3, B, H, N, head_dim)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, N, head_dim)
+        # JAX dot_product_attention expects (B, T, N, H) = (batch, seq_len, n_heads, head_dim)
+        qkv = qkv.transpose(2, 0, 1, 3, 4)  # (3, B, N, n_heads, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, N, n_heads, head_dim)
 
-        # QK-norm
+        # QK-norm (applied per head)
         if self.q_norm is not None and self.k_norm is not None:
             q = jax.vmap(jax.vmap(jax.vmap(self.q_norm)))(q)
             k = jax.vmap(jax.vmap(jax.vmap(self.k_norm)))(k)
@@ -214,22 +283,11 @@ class Attention(eqx.Module):
         if self.use_rope:
             raise NotImplementedError("RoPE not yet implemented")
 
-        # Scaled dot-product attention
-        attn_weights = jnp.einsum("bhnd,bhmd->bhnm", q, k) * self.scale
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+        # Use JAX's memory-efficient attention (flash attention on GPU)
+        out = jax.nn.dot_product_attention(q, k, v, scale=self.scale)
 
-        # Dropout on attention weights
-        if key is not None and self.dropout_rate > 0:
-            keep = jr.bernoulli(key, 1.0 - self.dropout_rate, attn_weights.shape)
-            attn_weights = jnp.where(
-                keep, attn_weights / (1.0 - self.dropout_rate), 0.0
-            )
-
-        # Apply attention to values
-        out = jnp.einsum("bhnm,bhmd->bhnd", attn_weights, v)
-
-        # Merge heads
-        out_bnd = out.transpose(0, 2, 1, 3).reshape(b, n, d)
+        # Merge heads - already (B, N, n_heads, head_dim), just reshape
+        out_bnd = out.reshape(b, n, d)
 
         # Output projection
         out_bnd = jax.vmap(jax.vmap(self.proj))(out_bnd)
@@ -328,21 +386,16 @@ class Block(eqx.Module):
     def __call__(
         self, x_bnd: Float[Array, "b n d"], *, key: PRNGKeyArray | None = None
     ) -> Float[Array, "b n d"]:
-        if key is not None:
-            key1, key2 = jr.split(key)
-        else:
-            key1, key2 = None, None
-
-        # Attention block
+        # Attention block (no dropout - uses flash attention)
         normed = jax.vmap(jax.vmap(self.norm1))(x_bnd)
-        attn_out = self.attn(normed, key=key1)
+        attn_out = self.attn(normed)
         if self.gamma1 is not None:
             attn_out = self.gamma1 * attn_out
         x = x_bnd + attn_out
 
         # MLP block
         normed = jax.vmap(jax.vmap(self.norm2))(x)
-        mlp_out = self.mlp(normed, key=key2)
+        mlp_out = self.mlp(normed, key=key)
         if self.gamma2 is not None:
             mlp_out = self.gamma2 * mlp_out
         x = x + mlp_out
@@ -363,27 +416,37 @@ class Transformer(eqx.Module):
 
     patch_embed: PatchEmbed
     cls_tokens: Float[Array, "1 n_cls d"]
+    cls_pos_embed: Float[Array, "1 n_cls d"] | None
     reg_tokens: Float[Array, "1 n_reg d"]
     pos_embed_hw: Float[Array, "1 nh nw d"] | None
-    cls_pos_embed: Float[Array, "1 n_cls d"] | None
-    blocks: list[Block]
+    blocks: Block | tuple[Block, ...]  # Stacked (scan) or tuple (loop)
     norm: eqx.nn.LayerNorm
 
     def __init__(self, cfg: Config, *, key: PRNGKeyArray):
-        keys = jr.split(key, cfg.depth + 3)
+        keys = jr.split(key, cfg.depth + 5)
+        patch_key, cls_key, cls_pos_key, reg_key, pos_key = keys[:5]
+        block_keys = keys[5:]  # Stacked array for filter_vmap
 
         self.cfg = cfg
-        self.patch_embed = PatchEmbed(cfg, key=keys[0])
+        self.patch_embed = PatchEmbed(cfg, key=patch_key)
 
         # CLS tokens (initialized with truncated normal)
         self.cls_tokens = (
-            jr.truncated_normal(keys[1], -2, 2, (1, cfg.n_cls_tokens, cfg.embed_dim))
+            jr.truncated_normal(cls_key, -2, 2, (1, cfg.n_cls_tokens, cfg.embed_dim))
+            * 0.02
+        )
+
+        # CLS positional embeddings (separate from patch pos embed)
+        self.cls_pos_embed = (
+            jr.truncated_normal(
+                cls_pos_key, -2, 2, (1, cfg.n_cls_tokens, cfg.embed_dim)
+            )
             * 0.02
         )
 
         # Register tokens
         self.reg_tokens = (
-            jr.truncated_normal(keys[2], -2, 2, (1, cfg.n_reg_tokens, cfg.embed_dim))
+            jr.truncated_normal(reg_key, -2, 2, (1, cfg.n_reg_tokens, cfg.embed_dim))
             * 0.02
         )
 
@@ -393,19 +456,18 @@ class Transformer(eqx.Module):
         else:
             self.pos_embed_hw = (
                 jr.truncated_normal(
-                    keys[2], -2, 2, (1, cfg.n_patches_h, cfg.n_patches_w, cfg.embed_dim)
-                )
-                * 0.02
-            )
-            self.cls_pos_embed = (
-                jr.truncated_normal(
-                    keys[2], -2, 2, (1, cfg.n_cls_tokens, cfg.embed_dim)
+                    pos_key, -2, 2, (1, cfg.n_patches_h, cfg.n_patches_w, cfg.embed_dim)
                 )
                 * 0.02
             )
 
         # Transformer blocks
-        self.blocks = [Block(cfg, key=keys[3 + i]) for i in range(cfg.depth)]
+        if cfg.use_scan:
+            # Stacked via filter_vmap for scan optimization
+            self.blocks = eqx.filter_vmap(lambda k: Block(cfg, key=k))(block_keys)
+        else:
+            # Tuple of blocks for explicit loop (debugging)
+            self.blocks = tuple(Block(cfg, key=k) for k in block_keys)
         self.norm = eqx.nn.LayerNorm(cfg.embed_dim)
 
     def __call__(
@@ -440,7 +502,7 @@ class Transformer(eqx.Module):
             pos_embed = self.pos_embed_hw[0, grid[..., 0], grid[..., 1]]  # (B, T, D)
             x = x + pos_embed
 
-        # Prepend CLS tokens
+        # Prepend CLS tokens with positional embeddings
         cls = jnp.broadcast_to(self.cls_tokens, (b, n_cls, self.cfg.embed_dim))
         if self.cls_pos_embed is not None:
             cls = cls + self.cls_pos_embed
@@ -452,10 +514,26 @@ class Transformer(eqx.Module):
             x = jnp.concatenate([x, reg], axis=1)  # (B, n_cls+T+n_reg, D)
 
         # Transformer blocks
-        keys = jr.split(key, self.cfg.depth)
+        block_keys = jr.split(key, self.cfg.depth)
 
-        for block, block_key in zip(self.blocks, keys):
-            x = block(x, key=block_key)
+        if self.cfg.use_scan:
+            # Scan implementation (faster compilation, better memory)
+            assert not isinstance(self.blocks, tuple)
+            block_arrays, block_static = eqx.partition(self.blocks, eqx.is_array)
+
+            def scan_fn(
+                x: Float[Array, "b n d"], inputs: tuple
+            ) -> tuple[Float[Array, "b n d"], None]:
+                arrays_i, key_i = inputs
+                block = eqx.combine(arrays_i, block_static)
+                return block(x, key=key_i), None
+
+            x, _ = jax.lax.scan(scan_fn, x, (block_arrays, block_keys))
+        else:
+            # Explicit loop (for debugging gradient flow)
+            assert isinstance(self.blocks, tuple)
+            for i, block in enumerate(self.blocks):
+                x = block(x, key=block_keys[i])
 
         # Final norm
         x = jax.vmap(jax.vmap(self.norm))(x)
