@@ -22,6 +22,11 @@ TYPE_REGISTRY: dict[str, type] = {
     # Data configs
     "XenoCanto": birdjepa.data.XenoCanto,
     "Cifar100": birdjepa.data.Cifar100,
+    # Model configs
+    "TransformerConfig": birdjepa.nn.transformer.Transformer,
+    "Transformer": birdjepa.nn.transformer.Transformer,
+    "DebugConfig": birdjepa.nn.transformer.Debug,
+    "Debug": birdjepa.nn.transformer.Debug,
     # Objective configs
     "SupervisedConfig": birdjepa.nn.objectives.SupervisedConfig,
     "LeJEPAConfig": birdjepa.nn.objectives.LeJEPAConfig,
