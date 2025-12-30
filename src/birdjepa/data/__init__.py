@@ -6,6 +6,7 @@ import typing as tp
 import beartype
 import grain.python as grain
 import numpy as np
+import tyro.conf
 
 import birdjepa.augment
 from birdjepa.nn import bird_mae
@@ -18,6 +19,7 @@ SR_HZ = bird_mae.BIRDMAE_SR_HZ
 class XenoCanto:
     """Configuration for XenoCanto dataset."""
 
+    key: tyro.conf.Suppress[tp.Literal["xeno-canto"]] = "xeno-canto"
     subset: tp.Literal["XCM", "XCL"] = "XCM"
     """XCM (90k samples, 409 species) or XCL (530k samples, 10k species)."""
     split: str = "train"
@@ -40,6 +42,7 @@ class XenoCanto:
 class Cifar100:
     """Configuration for CIFAR-100 dataset."""
 
+    key: tyro.conf.Suppress[tp.Literal["cifar100"]] = "cifar100"
     split: tp.Literal["train", "test"] = "train"
     """Dataset split."""
     augmentations: list[birdjepa.augment.Config] = dataclasses.field(
@@ -58,6 +61,8 @@ class Dataset(tp.Protocol):
     n_classes: int
 
     def __len__(self) -> int: ...
+
+    def __getitem__(self, idx: int) -> dict: ...
 
 
 class XenoCantoDataset(grain.RandomAccessDataSource):

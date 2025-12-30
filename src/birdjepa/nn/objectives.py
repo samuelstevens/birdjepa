@@ -344,7 +344,7 @@ class PixioDecoder(eqx.Module):
     cfg: PixioConfig = eqx.field(static=True)
 
     embed: eqx.nn.Linear
-    blocks: list[birdjepa.nn.transformer.Block]
+    blocks: birdjepa.nn.transformer.Block  # Stacked via filter_vmap
     norm: eqx.nn.LayerNorm
     head: eqx.nn.Linear
     pos_embed: Float[Array, "1 n d"]
@@ -364,7 +364,7 @@ class PixioDecoder(eqx.Module):
         # Project encoder dim to decoder dim
         self.embed = eqx.nn.Linear(encoder_cfg.embed_dim, cfg.decoder_dim, key=keys[0])
 
-        # Decoder blocks
+        # Decoder blocks (stacked via filter_vmap for scan optimization)
         decoder_cfg = birdjepa.nn.transformer.Config(
             input_h=encoder_cfg.input_h,
             input_w=encoder_cfg.input_w,
@@ -374,10 +374,12 @@ class PixioDecoder(eqx.Module):
             depth=cfg.decoder_depth,
             n_heads=cfg.decoder_heads,
         )
-        self.blocks = [
-            birdjepa.nn.transformer.Block(decoder_cfg, key=keys[i + 1])
-            for i in range(cfg.decoder_depth)
-        ]
+
+        def make_block(block_key: PRNGKeyArray) -> birdjepa.nn.transformer.Block:
+            return birdjepa.nn.transformer.Block(decoder_cfg, key=block_key)
+
+        block_keys = keys[1 : 1 + cfg.decoder_depth]
+        self.blocks = eqx.filter_vmap(make_block)(block_keys)
         self.norm = eqx.nn.LayerNorm(cfg.decoder_dim)
 
         # Project to pixel space
@@ -420,14 +422,26 @@ class PixioDecoder(eqx.Module):
         # Concatenate CLS + patches for attention
         x = jnp.concatenate([cls, x], axis=1)  # (B, 1+N, decoder_dim)
 
-        # Decoder blocks
-        if key is not None:
-            keys = jax.random.split(key, len(self.blocks))
-        else:
-            keys = [None] * len(self.blocks)
+        # Decoder blocks via scan (faster compilation, better memory)
+        block_arrays, block_static = eqx.partition(self.blocks, eqx.is_array)
 
-        for block, block_key in zip(self.blocks, keys):
-            x = block(x, key=block_key)
+        if key is not None:
+            # Training: use scan with actual keys + checkpointing
+            block_keys = jax.random.split(key, self.cfg.decoder_depth)
+
+            def scan_fn(x, inputs):
+                arrays_i, key_i = inputs
+                block = eqx.combine(arrays_i, block_static)
+                return jax.checkpoint(lambda x: block(x, key=key_i))(x), None
+
+            x, _ = jax.lax.scan(scan_fn, x, (block_arrays, block_keys))
+        else:
+            # Inference: scan without dropout keys (no checkpointing needed)
+            def scan_fn_no_key(x, arrays_i):
+                block = eqx.combine(arrays_i, block_static)
+                return block(x, key=None), None
+
+            x, _ = jax.lax.scan(scan_fn_no_key, x, block_arrays)
 
         x = jax.vmap(jax.vmap(self.norm))(x)
 

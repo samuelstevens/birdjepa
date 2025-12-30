@@ -1,40 +1,3 @@
-# 12/30/2025
-
-## Bug fixed: JAX Transformer attention shape
-
-Root cause: `jax.nn.dot_product_attention` expects shape `(B, seq_len, n_heads, head_dim)` but we were passing `(B, n_heads, seq_len, head_dim)` (PyTorch convention).
-
-Also missing: `cls_pos_embed` - CLS tokens had no positional embedding in JAX version.
-
-Fixes:
-1. Changed QKV transpose from `(2, 0, 3, 1, 4)` to `(2, 0, 1, 3, 4)` to get correct shape
-2. Added `cls_pos_embed` parameter to Transformer class
-3. Created parity tests (tests/test_transformer_parity.py) for forward AND backward passes
-
-Result: Transformer now learns on CIFAR-100!
-- Epoch 0 test_acc: 7.14% (was stuck at 1%)
-- Epoch 1 test_acc: 12.28%
-- Epoch 2 test_acc: 16.01%
-- Epoch 3 test_acc: 19.17%
-- Loss decreasing: 4.37 -> 3.95 in first two epochs
-
-## Earlier debugging (morning)
-
-The JAX Transformer was stuck at 1% test accuracy (random for 100 classes) on CIFAR-100 supervised pretraining. Loss stuck at ~4.6 = ln(100). Gradients flowed, updates were applied, but no learning.
-
-Isolation tests:
-1. **DebugEncoder (linear projection only)**: test_acc improved 2.7% -> 3.5% over 10 epochs. Loss decreased.
-2. **Transformer without augmentations**: test_acc stuck at 1% after 4 epochs.
-3. **Transformer with scan vs for-loop**: identical behavior (scan is NOT the issue).
-
-Conclusion: Bug is in the JAX Transformer architecture (transformer.py), NOT in:
-- Data pipeline (CIFAR-100 loading works)
-- Optimizer (AdamW works)
-- Augmentations (removed, still doesn't learn)
-- Training loop (DebugEncoder learns)
-- jax.lax.scan (for-loop has same issue)
-
-
 # 12/18/2025
 
 Evaluation methods from Bird MAE and Song MAE papers
@@ -615,3 +578,27 @@ Technical notes:
 - `jax.lax.scan` with `jax.checkpoint` for transformer blocks
 - Single-GPU mode skips `jax.distributed.initialize()` to avoid heartbeat timeouts during long JIT compilation
 - Jobs at bs=768 and bs=1024 hit a separate data loading bug (`RuntimeError: Failed to open input buffer: End of file`) unrelated to GPU memory
+
+# 12/30/2025
+
+Bug fixed: JAX Transformer attention shape
+
+Root cause: `jax.nn.dot_product_attention` expects shape `(B, T, N, H)` (batch, seq_len, n_heads, head_dim) but we were passing `(B, N, T, H)` (PyTorch's convention where heads come before sequence).
+
+The bug was in the QKV transpose after reshaping:
+
+```python
+# WRONG (PyTorch convention):
+qkv = qkv.transpose(2, 0, 3, 1, 4)  # -> (3, B, H, N, head_dim)
+
+# CORRECT (JAX convention):
+qkv = qkv.transpose(2, 0, 1, 3, 4)  # -> (3, B, N, H, head_dim)
+```
+
+This caused attention to compute over wrong dimensions. Model could compute gradients but learned nothing meaningful (stuck at 1% test accuracy on CIFAR-100).
+
+How we found it: Created parity tests (`tests/test_transformer_parity.py`) that copy weights from PyTorch to JAX and compare outputs step-by-step. The QKV projection passed but `jax.nn.dot_product_attention` output diverged completely.
+
+Additional cleanup: Removed redundant `cls_pos_embed` from both transformers (can be folded into learned `cls_tokens`).
+
+Result: Transformer now learns on CIFAR-100 (7% -> 11% -> 16% over first 3 epochs).

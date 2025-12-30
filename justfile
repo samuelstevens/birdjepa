@@ -1,5 +1,5 @@
 test: lint
-    uv run pytest tests/ --cov=birdjepa --cov-report=term-missing
+    uv run pytest tests/ --cov birdjepa --cov-report term-missing
 
 fmt:
     uvx ruff format --preview .

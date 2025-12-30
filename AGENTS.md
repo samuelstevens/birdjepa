@@ -1,6 +1,13 @@
 - Use `uv run SCRIPT.py` or `uv run python ARGS` to run python instead of Just plain `python`.
 - After making edits, run `uvx ruff format --preview .` to format the file, then run `uvx ruff check --fix .` to lint, then run `uvx ty check FILEPATH` to type check (`ty` is prerelease software, and typechecking often will have false positives). Only do this if you think you're finished, or if you can't figure out a bug. Maybe linting will make it obvious. Don't fix linting or typing errors in files you haven't modified.
 
+# Git Workflow
+
+- Before committing, run `git status` to check for already-staged files. If asked to commit only specific files, unstage everything first, then stage only the requested files, then after the commit, restage the already-staged files.
+- Write single-line commit messages; never say you co-authored a commit.
+- Never use `git stash`. It's error-prone and easy to lose work. Instead, create WIP commits and push to remote branches when you need to switch context or test old code.
+- To test old code: commit current work as "wip: description", push to a (new) remote branch, then checkout the old commit.
+
 # Gather Context
 
 - Public docs for developers and users are in markdown in docs/src. Internal, messier design and implementation docs are in markdown in docs/research/issues. Both are valuable sources of context when getting started.
@@ -20,8 +27,6 @@
 - Only use `setup` for naming functions that don't return anything.
 - submitit and jaxtyping don't work in the same file. See [this issue]. To solve this, all jaxtyped functions/classes need to be in a different file to the submitit launcher script.
 - Never create a simple script to demonstrate functionality unless explicitly asked..
-- Write single-line commit messages; never say you co-authored a commit.
-- Before committing, run `git status` to check for already-staged files. If asked to commit only specific files, unstage everything first, then stage only the requested files, then after the commit, restage the already-staged files.
 - Only use ascii characters. If you would use unicode to represent math, use pseudo-LaTeX instead in comments: 10⁶ should be 10^6, 3×10⁷ should be 3x10^7.
 - Prefix variables with `n_` for totals and cardinalities, but ignore it for dimensions `..._per_...` and dimensions. Examples: `n_examples`, `n_models`, but `tokens_per_example`, `examples_per_shard`
 - Try to keep code short. Shorter code is in principle easier to read. If variable names are really long, shorten based on conventions in this codebase (..._indices -> ..._i). Since you use `uvx ruff format --preview`, if you can make a small variable name change to fit everything on one line, that's a good idea. When variables are used once, simply inline it.

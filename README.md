@@ -23,8 +23,11 @@ On OSC, we need ffmpeg, which can be loaded with `module load ffmpeg/6.1.1`.
 ## TODO
 
 ### Pretraining
-- [ ] Move train.py to src/birdjepa/pretrain.py
-- [ ] Create src/birdjepa/data/ for XCM dataloader (random 5s crops, on-the-fly spectrograms)
+
+- [x] Move train.py to src/birdjepa/pretrain.py
+- [x] Create src/birdjepa/data/ for XCM dataloader (random 5s crops, on-the-fly spectrograms)
+- [ ] Use jax.lax.scan for unpatchify to reduce JIT compilation time
+- [ ] Reuse Grain dataloader across epochs instead of recreating (pool shuts down every epoch)
 - [ ] Implement checkpointing (save/resume model, optimizer, scheduler, epoch)
 - [ ] Auto-resubmit with submitit for long training runs (JEPA doesn't need massive batch sizes, so we can train longer with smaller batches across multiple jobs)
 - [ ] Deepen understanding of LeJEPA (SIGReg, invariance loss, projection head design)
@@ -35,13 +38,15 @@ On OSC, we need ffmpeg, which can be loaded with `module load ffmpeg/6.1.1`.
   - [ ] NEPA ([sihanxu.me/nepa](https://sihanxu.me/nepa)): modern ViT training tricks
   - [ ] Perception Encoder ([arxiv.org/abs/2504.13181](https://arxiv.org/abs/2504.13181)): modern ViT training tricks
 - [ ] Implement asymmetric patch sizes (16x16, 8x32, 4x64)
-- [ ] BIRB benchmark (https://arxiv.org/pdf/2312.07439)
 
 ### Data
+
 - [ ] Add iNat Sounds 2024 ([github.com/visipedia/inat_sounds/tree/main/2024](https://github.com/visipedia/inat_sounds/tree/main/2024))
 - [ ] Add FSD50K for non-bird sounds ([zenodo.org/record/4060432](https://zenodo.org/record/4060432))
 - [ ] Full Xeno-Canto (beyond XCL/XCM subsets)
 
 ### Benchmark
+
 - [ ] Add Perch2 to benchmark registry (requires TensorFlow, see [arxiv.org/abs/2508.04665](https://arxiv.org/abs/2508.04665))
 - [ ] Add benchmark result visualization/summarization (bootstrap CIs, comparison tables, plots)
+- [ ] BIRB benchmark (https://arxiv.org/pdf/2312.07439)

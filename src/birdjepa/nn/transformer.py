@@ -10,6 +10,137 @@ import jax.random as jr
 from jaxtyping import Array, Float, Int, PRNGKeyArray, jaxtyped
 
 
+# -------
+# Config
+# -------
+
+
+@beartype.beartype
+@dataclasses.dataclass(frozen=True)
+class Transformer:
+    """Transformer configuration."""
+
+    input_h: int = 512
+    """Input height (e.g., time frames for audio, image height for vision)."""
+    input_w: int = 128
+    """Input width (e.g., mel bins for audio, image width for vision)."""
+    patch_h: int = 16
+    """Patch size in height dimension."""
+    patch_w: int = 16
+    """Patch size in width dimension."""
+    embed_dim: int = 768
+    """Transformer embedding dimension."""
+    depth: int = 12
+    """Number of transformer blocks."""
+    n_heads: int = 12
+    """Number of attention heads."""
+    mlp_ratio: float = 4.0
+    """MLP hidden dim = embed_dim * mlp_ratio."""
+    dropout: float = 0.0
+    """Dropout rate."""
+    # "Free wins" from recent papers
+    use_rope: bool = False
+    """Use rotary positional embeddings instead of absolute."""
+    use_qk_norm: bool = False
+    """Apply LayerNorm to queries and keys for attention stability."""
+    use_swiglu: bool = False
+    """Use SwiGLU activation instead of GELU in MLP."""
+    use_layerscale: bool = False
+    """Use learnable per-layer residual scaling (from CaiT)."""
+    layerscale_init: float = 1e-4
+    """Initial value for LayerScale parameters."""
+    n_cls_tokens: int = 1
+    """Number of CLS tokens (Pixio uses 4-8)."""
+    n_reg_tokens: int = 0
+    """Number of register tokens (discarded at inference)."""
+    use_scan: bool = True
+    """Use jax.lax.scan for blocks (faster compile). False = explicit loop (for debugging)."""
+    grad_ckpt: bool = True
+    """Use gradient checkpointing to reduce memory (recompute activations during backward)."""
+
+    @property
+    def n_patches_h(self) -> int:
+        return self.input_h // self.patch_h
+
+    @property
+    def n_patches_w(self) -> int:
+        return self.input_w // self.patch_w
+
+    @property
+    def n_patches(self) -> int:
+        return self.n_patches_h * self.n_patches_w
+
+
+# --------------
+# Debug Encoder
+# --------------
+
+
+@beartype.beartype
+@dataclasses.dataclass(frozen=True)
+class Debug:
+    """Config for DebugModel (minimal linear projection)."""
+
+    input_h: int = 32
+    input_w: int = 32
+    patch_h: int = 4
+    patch_w: int = 4
+    embed_dim: int = 64
+
+    @property
+    def n_patches_h(self) -> int:
+        return self.input_h // self.patch_h
+
+    @property
+    def n_patches_w(self) -> int:
+        return self.input_w // self.patch_w
+
+    @property
+    def n_patches(self) -> int:
+        return self.n_patches_h * self.n_patches_w
+
+
+@jaxtyped(typechecker=beartype.beartype)
+class DebugModel(eqx.Module):
+    """Minimal encoder for debugging: just linear projection, no transformer.
+
+    Takes patches, projects to embed_dim, returns mean as CLS token.
+    If this doesn't learn, bug is in data/optimizer. If this learns but
+    Transformer doesn't, bug is in transformer architecture.
+    """
+
+    cfg: Debug = eqx.field(static=True)
+    proj: eqx.nn.Linear
+
+    def __init__(self, cfg: Debug, *, key: PRNGKeyArray):
+        self.cfg = cfg
+        kernel_size = cfg.patch_h * cfg.patch_w
+        self.proj = eqx.nn.Linear(kernel_size, cfg.embed_dim, key=key)
+
+    def __call__(
+        self,
+        x_btk: Float[Array, "b t k"],
+        *,
+        grid: Int[Array, "b t 2"],
+        key: PRNGKeyArray,
+    ) -> dict[str, Array]:
+        """Forward pass matching Transformer interface."""
+        # Project patches: (B, T, K) -> (B, T, D)
+        x = jax.vmap(jax.vmap(self.proj))(x_btk)
+
+        # CLS = mean of patches, no actual CLS token
+        cls = x.mean(axis=1, keepdims=True)  # (B, 1, D)
+
+        return {
+            "cls": cls,
+            "patches": x,
+            "reg": jnp.zeros((x.shape[0], 0, self.cfg.embed_dim)),
+        }
+
+
+# Union type for encoder configs
+Config = Transformer | Debug
+
 # ----------------------------
 # Patchify/Unpatchify Helpers
 # ----------------------------
@@ -82,137 +213,6 @@ def unpatchify(
 
 
 # -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-
-
-@beartype.beartype
-@dataclasses.dataclass(frozen=True)
-class Config:
-    """Transformer configuration."""
-
-    input_h: int = 512
-    """Input height (e.g., time frames for audio, image height for vision)."""
-    input_w: int = 128
-    """Input width (e.g., mel bins for audio, image width for vision)."""
-    patch_h: int = 16
-    """Patch size in height dimension."""
-    patch_w: int = 16
-    """Patch size in width dimension."""
-    embed_dim: int = 768
-    """Transformer embedding dimension."""
-    depth: int = 12
-    """Number of transformer blocks."""
-    n_heads: int = 12
-    """Number of attention heads."""
-    mlp_ratio: float = 4.0
-    """MLP hidden dim = embed_dim * mlp_ratio."""
-    dropout: float = 0.0
-    """Dropout rate."""
-    # "Free wins" from recent papers
-    use_rope: bool = False
-    """Use rotary positional embeddings instead of absolute."""
-    use_qk_norm: bool = False
-    """Apply LayerNorm to queries and keys for attention stability."""
-    use_swiglu: bool = False
-    """Use SwiGLU activation instead of GELU in MLP."""
-    use_layerscale: bool = False
-    """Use learnable per-layer residual scaling (from CaiT)."""
-    layerscale_init: float = 1e-4
-    """Initial value for LayerScale parameters."""
-    n_cls_tokens: int = 1
-    """Number of CLS tokens (Pixio uses 4-8)."""
-    n_reg_tokens: int = 0
-    """Number of register tokens (discarded at inference)."""
-    use_scan: bool = True
-    """Use jax.lax.scan for blocks (faster compile). False = explicit loop (for debugging)."""
-    grad_ckpt: bool = True
-    """Use gradient checkpointing to reduce memory (recompute activations during backward)."""
-
-    @property
-    def n_patches_h(self) -> int:
-        return self.input_h // self.patch_h
-
-    @property
-    def n_patches_w(self) -> int:
-        return self.input_w // self.patch_w
-
-    @property
-    def n_patches(self) -> int:
-        return self.n_patches_h * self.n_patches_w
-
-
-# -----------------------------------------------------------------------------
-# Debug Encoder (minimal for testing)
-# -----------------------------------------------------------------------------
-
-
-@beartype.beartype
-@dataclasses.dataclass(frozen=True)
-class DebugConfig:
-    """Config for DebugEncoder (minimal linear projection)."""
-
-    input_h: int = 32
-    input_w: int = 32
-    patch_h: int = 4
-    patch_w: int = 4
-    embed_dim: int = 64
-
-    @property
-    def n_patches_h(self) -> int:
-        return self.input_h // self.patch_h
-
-    @property
-    def n_patches_w(self) -> int:
-        return self.input_w // self.patch_w
-
-    @property
-    def n_patches(self) -> int:
-        return self.n_patches_h * self.n_patches_w
-
-
-class DebugEncoder(eqx.Module):
-    """Minimal encoder for debugging: just linear projection, no transformer.
-
-    Takes patches, projects to embed_dim, returns mean as CLS token.
-    If this doesn't learn, bug is in data/optimizer. If this learns but
-    Transformer doesn't, bug is in transformer architecture.
-    """
-
-    cfg: DebugConfig = eqx.field(static=True)
-    proj: eqx.nn.Linear
-
-    def __init__(self, cfg: DebugConfig, *, key: PRNGKeyArray):
-        self.cfg = cfg
-        kernel_size = cfg.patch_h * cfg.patch_w
-        self.proj = eqx.nn.Linear(kernel_size, cfg.embed_dim, key=key)
-
-    def __call__(
-        self,
-        x_btk: Float[Array, "b t k"],
-        *,
-        grid: Int[Array, "b t 2"],
-        key: PRNGKeyArray,
-    ) -> dict[str, Array]:
-        """Forward pass matching Transformer interface."""
-        # Project patches: (B, T, K) -> (B, T, D)
-        x = jax.vmap(jax.vmap(self.proj))(x_btk)
-
-        # CLS = mean of patches, no actual CLS token
-        cls = x.mean(axis=1, keepdims=True)  # (B, 1, D)
-
-        return {
-            "cls": cls,
-            "patches": x,
-            "reg": jnp.zeros((x.shape[0], 0, self.cfg.embed_dim)),
-        }
-
-
-# Union type for encoder configs
-EncoderConfig = Config | DebugConfig
-
-
-# -----------------------------------------------------------------------------
 # Modules
 # -----------------------------------------------------------------------------
 
@@ -222,7 +222,7 @@ class PatchEmbed(eqx.Module):
 
     proj: eqx.nn.Linear
 
-    def __init__(self, cfg: Config, *, key: PRNGKeyArray):
+    def __init__(self, cfg: Transformer, *, key: PRNGKeyArray):
         kernel_size = cfg.patch_h * cfg.patch_w
         self.proj = eqx.nn.Linear(kernel_size, cfg.embed_dim, key=key)
 
@@ -246,7 +246,7 @@ class Attention(eqx.Module):
     q_norm: eqx.nn.LayerNorm | None
     k_norm: eqx.nn.LayerNorm | None
 
-    def __init__(self, cfg: Config, *, key: PRNGKeyArray):
+    def __init__(self, cfg: Transformer, *, key: PRNGKeyArray):
         key1, key2 = jr.split(key)
 
         self.n_heads = cfg.n_heads
@@ -310,7 +310,7 @@ class MLP(eqx.Module):
     w2: eqx.nn.Linear | None
     w3: eqx.nn.Linear | None
 
-    def __init__(self, cfg: Config, *, key: PRNGKeyArray):
+    def __init__(self, cfg: Transformer, *, key: PRNGKeyArray):
         self.use_swiglu = cfg.use_swiglu
         self.dropout_rate = cfg.dropout
         hidden_dim = int(cfg.embed_dim * cfg.mlp_ratio)
@@ -369,7 +369,7 @@ class Block(eqx.Module):
     gamma1: Float[Array, " d"] | None
     gamma2: Float[Array, " d"] | None
 
-    def __init__(self, cfg: Config, *, key: PRNGKeyArray):
+    def __init__(self, cfg: Transformer, *, key: PRNGKeyArray):
         key1, key2 = jr.split(key)
 
         self.use_layerscale = cfg.use_layerscale
@@ -406,7 +406,7 @@ class Block(eqx.Module):
 
 
 @jaxtyped(typechecker=beartype.beartype)
-class Transformer(eqx.Module):
+class TransformerModel(eqx.Module):
     """Simple bidirectional transformer encoder.
 
     Takes pre-patchified input (B, T, kernel) + grid coordinates. This allows encoder to process any subset of patches (for MAE efficiency).
@@ -414,7 +414,7 @@ class Transformer(eqx.Module):
     Returns a dict with "cls", "patches", and "reg" keys for flexible pooling.
     """
 
-    cfg: Config = eqx.field(static=True)
+    cfg: Transformer = eqx.field(static=True)
 
     patch_embed: PatchEmbed
     cls_tokens: Float[Array, "1 n_cls d"]
@@ -423,7 +423,7 @@ class Transformer(eqx.Module):
     blocks: Block | tuple[Block, ...]  # Stacked (scan) or tuple (loop)
     norm: eqx.nn.LayerNorm
 
-    def __init__(self, cfg: Config, *, key: PRNGKeyArray):
+    def __init__(self, cfg: Transformer, *, key: PRNGKeyArray):
         keys = jr.split(key, cfg.depth + 4)
         patch_key, cls_key, reg_key, pos_key = keys[:4]
         block_keys = keys[4:]
@@ -512,6 +512,7 @@ class Transformer(eqx.Module):
             assert not isinstance(self.blocks, tuple)
             block_arrays, block_static = eqx.partition(self.blocks, eqx.is_array)
 
+            @jaxtyped(typechecker=beartype.beartype)
             def scan_fn(
                 x: Float[Array, "b n d"], inputs: tuple
             ) -> tuple[Float[Array, "b n d"], None]:
@@ -525,13 +526,11 @@ class Transformer(eqx.Module):
         else:
             # Explicit loop (for debugging gradient flow)
             assert isinstance(self.blocks, tuple)
-            for i, block in enumerate(self.blocks):
+            for block, key in zip(self.blocks, block_keys):
                 if self.cfg.grad_ckpt:
-                    x = jax.checkpoint(lambda x, b=block, k=block_keys[i]: b(x, key=k))(
-                        x
-                    )
+                    x = jax.checkpoint(lambda x, b=block, k=key: b(x, key=k))(x)
                 else:
-                    x = block(x, key=block_keys[i])
+                    x = block(x, key=key)
 
         # Final norm
         x = jax.vmap(jax.vmap(self.norm))(x)
