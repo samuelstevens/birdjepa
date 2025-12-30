@@ -416,16 +416,15 @@ class Transformer(eqx.Module):
 
     patch_embed: PatchEmbed
     cls_tokens: Float[Array, "1 n_cls d"]
-    cls_pos_embed: Float[Array, "1 n_cls d"] | None
     reg_tokens: Float[Array, "1 n_reg d"]
     pos_embed_hw: Float[Array, "1 nh nw d"] | None
     blocks: Block | tuple[Block, ...]  # Stacked (scan) or tuple (loop)
     norm: eqx.nn.LayerNorm
 
     def __init__(self, cfg: Config, *, key: PRNGKeyArray):
-        keys = jr.split(key, cfg.depth + 5)
-        patch_key, cls_key, cls_pos_key, reg_key, pos_key = keys[:5]
-        block_keys = keys[5:]  # Stacked array for filter_vmap
+        keys = jr.split(key, cfg.depth + 4)
+        patch_key, cls_key, reg_key, pos_key = keys[:4]
+        block_keys = keys[4:]
 
         self.cfg = cfg
         self.patch_embed = PatchEmbed(cfg, key=patch_key)
@@ -433,14 +432,6 @@ class Transformer(eqx.Module):
         # CLS tokens (initialized with truncated normal)
         self.cls_tokens = (
             jr.truncated_normal(cls_key, -2, 2, (1, cfg.n_cls_tokens, cfg.embed_dim))
-            * 0.02
-        )
-
-        # CLS positional embeddings (separate from patch pos embed)
-        self.cls_pos_embed = (
-            jr.truncated_normal(
-                cls_pos_key, -2, 2, (1, cfg.n_cls_tokens, cfg.embed_dim)
-            )
             * 0.02
         )
 
@@ -502,10 +493,8 @@ class Transformer(eqx.Module):
             pos_embed = self.pos_embed_hw[0, grid[..., 0], grid[..., 1]]  # (B, T, D)
             x = x + pos_embed
 
-        # Prepend CLS tokens with positional embeddings
+        # Prepend CLS tokens
         cls = jnp.broadcast_to(self.cls_tokens, (b, n_cls, self.cfg.embed_dim))
-        if self.cls_pos_embed is not None:
-            cls = cls + self.cls_pos_embed
         x = jnp.concatenate([cls, x], axis=1)  # (B, n_cls+T, D)
 
         # Append register tokens

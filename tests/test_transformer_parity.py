@@ -94,13 +94,6 @@ def _copy_transformer(
     cls_tokens = pt_model.cls_tokens.detach().numpy()
     jax_model = eqx.tree_at(lambda m: m.cls_tokens, jax_model, jnp.array(cls_tokens))
 
-    # CLS positional embeddings
-    if pt_model.cls_pos_embed is not None:
-        cls_pos_embed = pt_model.cls_pos_embed.detach().numpy()
-        jax_model = eqx.tree_at(
-            lambda m: m.cls_pos_embed, jax_model, jnp.array(cls_pos_embed)
-        )
-
     # Reg tokens
     if pt_model.reg_tokens is not None:
         reg_tokens = pt_model.reg_tokens.detach().numpy()

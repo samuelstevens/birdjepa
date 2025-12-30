@@ -300,10 +300,6 @@ class Transformer(nn.Module):
             self.pos_embed_hw = nn.Parameter(
                 torch.zeros(1, cfg.n_patches_h, cfg.n_patches_w, cfg.embed_dim)
             )
-            # Separate pos embed for each CLS token
-            self.cls_pos_embed = nn.Parameter(
-                torch.zeros(1, cfg.n_cls_tokens, cfg.embed_dim)
-            )
 
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.depth)])
         self.norm = nn.LayerNorm(cfg.embed_dim)
@@ -313,7 +309,6 @@ class Transformer(nn.Module):
     def _init_weights(self):
         if self.pos_embed_hw is not None:
             nn.init.trunc_normal_(self.pos_embed_hw, std=0.02)
-            nn.init.trunc_normal_(self.cls_pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
         if self.reg_tokens is not None:
             nn.init.trunc_normal_(self.reg_tokens, std=0.02)
@@ -346,8 +341,6 @@ class Transformer(nn.Module):
 
         # Prepend CLS tokens
         cls = self.cls_tokens.expand(b, -1, -1)
-        if self.cls_pos_embed is not None:
-            cls = cls + self.cls_pos_embed
         x = torch.cat([cls, x], dim=1)  # (B, n_cls+T, D)
 
         # Append register tokens (no positional embedding)
