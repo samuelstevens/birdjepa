@@ -39,6 +39,10 @@ On OSC, we need ffmpeg, which can be loaded with `module load ffmpeg/6.1.1`.
   - [ ] Perception Encoder ([arxiv.org/abs/2504.13181](https://arxiv.org/abs/2504.13181)): modern ViT training tricks
 - [ ] Implement asymmetric patch sizes (16x16, 8x32, 4x64)
 
+### Objective
+
+- [ ] Source prediction from DIET requires a huge cross-entropy vector. https://github.com/apple/ml-cross-entropy/ and https://github.com/mgmalek/efficient_cross_entropy/ and the discussion in https://github.com/pytorch/pytorch/issues/124480 would help with this problem.
+
 ### Data
 
 - [ ] Add iNat Sounds 2024 ([github.com/visipedia/inat_sounds/tree/main/2024](https://github.com/visipedia/inat_sounds/tree/main/2024))
@@ -50,3 +54,5 @@ On OSC, we need ffmpeg, which can be loaded with `module load ffmpeg/6.1.1`.
 - [ ] Add Perch2 to benchmark registry (requires TensorFlow, see [arxiv.org/abs/2508.04665](https://arxiv.org/abs/2508.04665))
 - [ ] Add benchmark result visualization/summarization (bootstrap CIs, comparison tables, plots)
 - [ ] BIRB benchmark (https://arxiv.org/pdf/2312.07439)
+
+

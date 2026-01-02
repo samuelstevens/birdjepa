@@ -1,6 +1,7 @@
 """Data loading for BirdJEPA pretraining."""
 
 import dataclasses
+import logging
 import typing as tp
 
 import beartype
@@ -12,6 +13,16 @@ import birdjepa.augment
 from birdjepa.nn import bird_mae
 
 SR_HZ = bird_mae.BIRDMAE_SR_HZ
+
+logger = logging.getLogger(__name__)
+
+BAD_XCL_INDICES = {
+    495640,
+    495763,
+    497541,
+    498645,
+    501254,
+}
 
 
 @beartype.beartype
@@ -88,13 +99,48 @@ class XenoCantoDataset(grain.RandomAccessDataSource):
         # Each row is a unique recording - use index as source ID
         self.n_sources = len(self.ds)
 
+        exclude_indices: set[int] = set()
+        if cfg.subset == "XCL" and cfg.split == "train":
+            exclude_indices.update(BAD_XCL_INDICES)
+
+        if exclude_indices:
+            n_total = len(self.ds)
+            msg = f"exclude_indices has out-of-range indices (0..{n_total - 1})"
+            assert min(exclude_indices) >= 0 and max(exclude_indices) < n_total, msg
+            allowed_indices = np.array(
+                [i for i in range(n_total) if i not in exclude_indices],
+                dtype=np.int64,
+            )
+            n_excluded = len(exclude_indices)
+            if n_excluded < 10:
+                logger.info(
+                    "Excluding %d/%d samples from %s %s: %s",
+                    n_excluded,
+                    n_total,
+                    cfg.subset,
+                    cfg.split,
+                    sorted(exclude_indices),
+                )
+            else:
+                logger.info(
+                    "Excluding %d/%d samples from %s %s",
+                    n_excluded,
+                    n_total,
+                    cfg.subset,
+                    cfg.split,
+                )
+        else:
+            allowed_indices = None
+
         # Fixed random subset if n_samples specified
         if cfg.n_samples is not None:
             subset_rng = np.random.default_rng(cfg.seed)
-            n = min(cfg.n_samples, len(self.ds))
-            self._indices = subset_rng.choice(len(self.ds), size=n, replace=False)
+            if allowed_indices is None:
+                allowed_indices = np.arange(len(self.ds), dtype=np.int64)
+            n = min(cfg.n_samples, len(allowed_indices))
+            self._indices = subset_rng.choice(allowed_indices, size=n, replace=False)
         else:
-            self._indices = None
+            self._indices = allowed_indices if allowed_indices is not None else None
 
     def __len__(self) -> int:
         if self._indices is not None:
@@ -103,7 +149,7 @@ class XenoCantoDataset(grain.RandomAccessDataSource):
 
     def __getitem__(self, idx: int) -> dict:
         if self._indices is not None:
-            idx = self._indices[idx]
+            idx = int(self._indices[idx])
         item = self.ds[idx]
         audio = item["audio"]
         waveform = np.array(audio["array"], dtype=np.float32)
@@ -281,6 +327,7 @@ def make_dataloader(
     n_workers: int,
     shuffle: bool,
     drop_last: bool,
+    repeat: bool = False,
 ):
     """Create a Grain dataloader from a dataset source.
 
@@ -291,6 +338,7 @@ def make_dataloader(
         n_workers: Number of prefetch workers.
         shuffle: Whether to shuffle.
         drop_last: Whether to drop the last incomplete batch.
+        repeat: Whether to repeat indefinitely (for step-based training with checkpointing).
 
     Returns:
         Grain IterDataset for iteration.
@@ -298,6 +346,8 @@ def make_dataloader(
     ds = grain.MapDataset.source(source).seed(seed)
     if shuffle:
         ds = ds.shuffle()
+    if repeat:
+        ds = ds.repeat()
     ds = ds.batch(batch_size=batch_size, drop_remainder=drop_last)
     iter_ds = ds.to_iter_dataset(
         read_options=grain.ReadOptions(num_threads=2, prefetch_buffer_size=64)

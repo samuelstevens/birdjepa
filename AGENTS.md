@@ -1,5 +1,7 @@
 - Use `uv run SCRIPT.py` or `uv run python ARGS` to run python instead of Just plain `python`.
+- If you think running a script will take less than 10 minutes, run it yourself with a timeout. If the full script will take longer than 10 minutes, this can be a lightweight check like `uv run script.py --help` to confirm it runs, or use a short timeout to check that the script gets started.
 - After making edits, run `uvx ruff format --preview .` to format the file, then run `uvx ruff check --fix .` to lint, then run `uvx ty check FILEPATH` to type check (`ty` is prerelease software, and typechecking often will have false positives). Only do this if you think you're finished, or if you can't figure out a bug. Maybe linting will make it obvious. Don't fix linting or typing errors in files you haven't modified.
+- Use `launch.py` to run training and benchmarking: `uv run python launch.py train --sweep <sweep_file>` or `uv run python launch.py benchmark <args>`.
 
 # Git Workflow
 

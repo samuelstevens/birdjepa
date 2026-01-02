@@ -30,17 +30,19 @@ def make_cfgs() -> list[dict]:
             "test_data": test_data,
             "model": model,
             "objective": {"__class__": "SupervisedConfig"},
-            "batch_size": 4096,
+            "batch_size": 2048,  # 1024 per GPU (max for A100 40GB)
             "lr": lr,
             "schedule": "wsd",
             "warmup_steps": 5000,
             "decay_steps": 0,
-            "epochs": 20_000,
+            "n_steps": 50_000,
+            "eval_every": 1000,
             "n_workers": 4,
-            "n_gpus": 4,
+            "n_gpus": 2,
             "n_hours": 12.0,
+            "mem_gb": 128,  # Request 128GB RAM (needs 13 CPUs on OSC)
             "slurm_acct": "PAS2136",
-            "slurm_partition": "quad",
+            "slurm_partition": "preemptible-nextgen",
             "ckpt_to": "/fs/ess/PAS2136/samuelstevens/birdjepa",
         })
 

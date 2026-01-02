@@ -21,6 +21,7 @@ dependencies = [
     "marimo>=0.18.4",
     "matplotlib>=3.10.8",
     "optax>=0.2.6",
+    "orbax-checkpoint>=0.11.31",
     "polars>=1.36.1",
     "requests>=2.32.0",
     "safetensors>=0.5.0",
@@ -34,9 +35,6 @@ dependencies = [
     "tyro>=1.0.2",
     "wandb>=0.23.1",
 ]
-
-[project.scripts]
-birdjepa = "birdjepa:main"
 
 [build-system]
 requires = ["hatchling"]
