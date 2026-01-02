@@ -9,14 +9,14 @@ import dataclasses
 
 import beartype
 import grain.python as grain
-import jax
 import numpy as np
 
 
 def _assert_numpy(x, name: str = "x"):
     """Assert that x is a numpy array, not a JAX array."""
     assert isinstance(x, np.ndarray), f"{name} must be numpy array, got {type(x)}"
-    assert not isinstance(x, jax.Array), f"{name} must not be JAX array"
+    # Check for JAX arrays without importing JAX (grain workers shouldn't import JAX)
+    assert type(x).__module__.split(".")[0] != "jax", f"{name} must not be JAX array"
 
 
 # -----------------------------------------------------------------------------

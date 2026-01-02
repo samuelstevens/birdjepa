@@ -418,7 +418,7 @@ class TransformerModel(eqx.Module):
 
     patch_embed: PatchEmbed
     cls_tokens: Float[Array, "1 n_cls d"]
-    reg_tokens: Float[Array, "1 n_reg d"]
+    reg_tokens: Float[Array, "1 n_reg d"] | None
     pos_embed_hw: Float[Array, "1 nh nw d"] | None
     blocks: Block | tuple[Block, ...]  # Stacked (scan) or tuple (loop)
     norm: eqx.nn.LayerNorm
@@ -437,10 +437,12 @@ class TransformerModel(eqx.Module):
             * 0.02
         )
 
-        # Register tokens
+        # Register tokens (None if n_reg_tokens=0 to avoid zero-size array serialization issues)
         self.reg_tokens = (
             jr.truncated_normal(reg_key, -2, 2, (1, cfg.n_reg_tokens, cfg.embed_dim))
             * 0.02
+            if cfg.n_reg_tokens > 0
+            else None
         )
 
         # Positional embeddings
@@ -512,7 +514,6 @@ class TransformerModel(eqx.Module):
             assert not isinstance(self.blocks, tuple)
             block_arrays, block_static = eqx.partition(self.blocks, eqx.is_array)
 
-            @jaxtyped(typechecker=beartype.beartype)
             def scan_fn(
                 x: Float[Array, "b n d"], inputs: tuple
             ) -> tuple[Float[Array, "b n d"], None]:

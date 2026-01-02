@@ -5,7 +5,6 @@ Based on https://github.com/rbalestr-lab/lejepa/blob/main/MINIMAL.md
 """
 
 import dataclasses
-import json
 import logging
 import os
 import pathlib
@@ -14,11 +13,13 @@ import typing as tp
 
 import beartype
 import equinox as eqx
+import grain.python as grain
 import jax
 import jax.random as jr
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 import wandb
 import wandb.util as wandb_util
 
@@ -75,10 +76,12 @@ class Config:
     """Batch size."""
     n_workers: int = 4
     """Number of dataloader workers."""
-    epochs: int = 100
-    """Number of training epochs."""
+    n_steps: int = 10000
+    """Total number of training steps."""
     log_every: int = 50
     """Log training metrics every N steps."""
+    eval_every: int = 1000
+    """Evaluate on test set every N steps."""
     seed: int = 42
     """Random seed."""
     device: tp.Literal["cpu", "gpu"] = "gpu"
@@ -101,8 +104,6 @@ class Config:
     # Checkpointing
     ckpt_to: pathlib.Path = pathlib.Path("./checkpoints")
     """Directory for checkpoints."""
-    save_every: int = 10
-    """Save checkpoint every N epochs."""
     resume_from: str = ""
     """Path to checkpoint to resume from."""
     # Multi-GPU
@@ -115,6 +116,8 @@ class Config:
     """Slurm partition."""
     n_hours: float = 24.0
     """Slurm job length in hours."""
+    mem_gb: int = 0
+    """Node memory in GB. If set, requests enough CPUs to get this much RAM (~10GB/CPU on OSC)."""
     log_to: pathlib.Path = pathlib.Path("./logs")
     """Where to log Slurm job stdout/stderr."""
     sweep: str = ""
@@ -134,31 +137,40 @@ def make_dataset(cfg: birdjepa.data.Config) -> birdjepa.data.Dataset:
         tp.assert_never(cfg)
 
 
-def save_checkpoint(path, epoch, encoder, objective, probe, opt_state):
-    """Save training checkpoint using Equinox serialization."""
-    metadata = {"epoch": epoch}
-    models = {"encoder": encoder, "objective": objective, "probe": probe}
-    with open(path, "wb") as f:
-        f.write((json.dumps(metadata) + "\n").encode())
-        eqx.tree_serialise_leaves(f, models)
-        eqx.tree_serialise_leaves(f, opt_state)
-    logger.info("Saved checkpoint to %s", path)
+@beartype.beartype
+def load_checkpoint(
+    mngr: ocp.CheckpointManager, encoder, objective, probe, opt_state, key
+):
+    """Load latest checkpoint. Returns (encoder, objective, probe, opt_state, key, start_step) or None."""
+    step = mngr.latest_step()
+    if step is None:
+        return None
 
-
-def load_checkpoint(path, encoder, objective, probe, opt_state):
-    """Load training checkpoint. Returns (encoder, objective, probe, opt_state, start_epoch)."""
-    with open(path, "rb") as f:
-        metadata = json.loads(f.readline().decode())
-        models = {"encoder": encoder, "objective": objective, "probe": probe}
-        models = eqx.tree_deserialise_leaves(f, models)
-        opt_state = eqx.tree_deserialise_leaves(f, opt_state)
-    logger.info("Loaded checkpoint from %s (epoch %d)", path, metadata["epoch"])
+    # Create abstract structure for restore
+    abstract_state = {
+        "encoder": encoder,
+        "objective": objective,
+        "probe": probe,
+        "opt_state": opt_state,
+        "key": key,
+    }
+    restored = mngr.restore(
+        step,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(abstract_state),
+            metadata=ocp.args.JsonRestore(),
+        ),
+    )
+    state = restored["state"]
+    metadata = restored["metadata"]
+    logger.info("Loaded checkpoint step=%d", metadata["step"])
     return (
-        models["encoder"],
-        models["objective"],
-        models["probe"],
-        opt_state,
-        metadata["epoch"] + 1,
+        state["encoder"],
+        state["objective"],
+        state["probe"],
+        state["opt_state"],
+        state["key"],
+        metadata["step"],
     )
 
 
@@ -169,6 +181,7 @@ def softmax_cross_entropy(logits, labels):
     return -jnp.sum(one_hot * log_probs, axis=-1).mean()
 
 
+@beartype.beartype
 def wsd_schedule(
     peak_value: float,
     total_steps: int,
@@ -309,16 +322,20 @@ def make_train_step(optim, data_sharding, model_sharding):
 @beartype.beartype
 def worker_fn(cfg: Config):
     """Main training function with optional data parallel support."""
-    logging.basicConfig(level=logging.INFO, format=log_format)
+    # Use force=True to override any handlers set by submitit
+    logging.basicConfig(level=logging.INFO, format=log_format, force=True)
 
     # Initialize multi-process JAX distributed runtime for multi-GPU SLURM jobs
     # Each SLURM task is one process; this coordinates across them
     # Skip for single-GPU to avoid heartbeat timeout issues during long JIT
+    # Also skip in grain worker processes (they inherit this code but shouldn't init JAX)
+    import multiprocessing
+
     n_tasks = int(os.environ.get("SLURM_NTASKS", "1"))
-    if n_tasks > 1:
+    if n_tasks > 1 and multiprocessing.parent_process() is None:
         jax.distributed.initialize()
         logger.info("Initialized JAX distributed: %d processes", jax.process_count())
-    else:
+    elif n_tasks == 1:
         logger.info("Single-GPU mode, skipping JAX distributed initialization")
 
     if cfg.device == "gpu":
@@ -342,27 +359,40 @@ def worker_fn(cfg: Config):
     key = jr.key(cfg.seed)
 
     # Data
+    logger.info("Loading train dataset")
     train_ds = make_dataset(cfg.train_data)
+    logger.info("Loading test dataset")
     test_ds = make_dataset(cfg.test_data)
     n_classes = train_ds.n_classes
+    logger.info(
+        "Datasets loaded: %d train, %d test, %d classes",
+        len(train_ds),
+        len(test_ds),
+        n_classes,
+    )
 
     # Model and objective
+    logger.info("Creating encoder")
     model_key, key = jr.split(key)
     if isinstance(cfg.model, birdjepa.nn.transformer.Debug):
         encoder = birdjepa.nn.transformer.DebugModel(cfg.model, key=model_key)
         logger.info("Using DebugEncoder (linear only, no transformer)")
     elif isinstance(cfg.model, birdjepa.nn.transformer.Transformer):
         encoder = birdjepa.nn.transformer.TransformerModel(cfg.model, key=model_key)
+        logger.info("Created TransformerModel")
     else:
         tp.assert_never(cfg.model)
+    logger.info("Creating objective")
     obj_key, key = jr.split(key)
     objective = birdjepa.nn.objectives.make_objective(
         cfg.objective, cfg.model, train_ds, key=obj_key
     )
+    logger.info("Created objective: %s", type(objective).__name__)
 
     # Wrap dataset for objective (e.g., multi-view for LeJEPA)
     train_ds = objective.wrap_dataset(train_ds)
     # Different seed per process so each loads different data (2x throughput with 2 GPUs)
+    logger.info("Creating train dataloader")
     train_seed = cfg.seed + jax.process_index()
     train_loader = birdjepa.data.make_dataloader(
         train_ds,
@@ -371,7 +401,9 @@ def worker_fn(cfg: Config):
         n_workers=cfg.n_workers,
         shuffle=True,
         drop_last=True,
+        repeat=True,  # Infinite iteration for step-based training with checkpointing
     )
+    logger.info("Creating test dataloader")
     # NOTE: LeJEPA wraps the dataset to return "views" instead of "data", which will break test accuracy below.
     test_ds = objective.wrap_dataset(test_ds)
     test_loader = birdjepa.data.make_dataloader(
@@ -382,8 +414,10 @@ def worker_fn(cfg: Config):
         shuffle=False,
         drop_last=False,
     )
+    logger.info("Dataloaders created")
 
     # Online linear probe
+    logger.info("Creating linear probe")
     key, probe_key = jax.random.split(key)
     probe = eqx.nn.Sequential([
         eqx.nn.LayerNorm(cfg.model.embed_dim),
@@ -391,23 +425,22 @@ def worker_fn(cfg: Config):
     ])
 
     # Optimizer and scheduler
-    steps_per_epoch = len(train_ds) // cfg.batch_size
-    total_steps = steps_per_epoch * cfg.epochs
+    logger.info("Setting up optimizer")
+    logger.info("Training %d total steps", cfg.n_steps)
     if cfg.schedule == "wsd":
         schedule = wsd_schedule(
             peak_value=cfg.lr,
-            total_steps=total_steps,
+            total_steps=cfg.n_steps,
             warmup_steps=cfg.warmup_steps,
             decay_steps=cfg.decay_steps,
             end_value=0.0,
         )
     elif cfg.schedule == "cosine":
-        warmup_steps = cfg.warmup_steps
         schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.0,
             peak_value=cfg.lr,
-            warmup_steps=warmup_steps,
-            decay_steps=total_steps,
+            warmup_steps=cfg.warmup_steps,
+            decay_steps=cfg.n_steps,
             end_value=0.0,
         )
     else:
@@ -426,11 +459,7 @@ def worker_fn(cfg: Config):
         "probe": eqx.filter(probe, eqx.is_inexact_array),
     }
     opt_state = optim.init(params)
-
-    # Resume from checkpoint
-    start_epoch = 0
-    if cfg.resume_from:
-        raise NotImplementedError("Resuming from checkpoint not yet supported")
+    logger.info("Optimizer initialized")
 
     ckpt_dpath = cfg.ckpt_to / cfg.run_id
 
@@ -439,149 +468,152 @@ def worker_fn(cfg: Config):
         ckpt_dpath.mkdir(parents=True, exist_ok=True)
         logger.info("Checkpoint dir: %s", ckpt_dpath)
 
+    # Create checkpoint manager (handles retention, async saves)
+    # save_interval_steps controls how often we save; also saves on preemption
+    logger.info("Creating checkpoint manager")
+    ckpt_mngr = ocp.CheckpointManager(
+        ckpt_dpath,
+        options=ocp.CheckpointManagerOptions(
+            save_interval_steps=500,
+            max_to_keep=5,
+            enable_async_checkpointing=True,
+        ),
+        item_names=("state", "metadata", "train_iter"),
+    )
+    logger.info("Checkpoint manager created (save_interval=500, max_to_keep=5)")
+
+    # Create train iterator (used for checkpointing dataloader state)
+    logger.info("Creating train iterator for checkpointing")
+    train_iter = iter(train_loader)
+
+    # Resume from checkpoint (auto-resume if checkpoint exists)
+    start_step = 0
+    restored = load_checkpoint(ckpt_mngr, encoder, objective, probe, opt_state, key)
+    if restored is not None:
+        encoder, objective, probe, opt_state, key, start_step = restored
+        # Restore dataloader iterator state to resume from correct position
+        ckpt_mngr.restore(
+            start_step,
+            args=ocp.args.Composite(
+                train_iter=grain.PyGrainCheckpointRestore(train_iter)
+            ),
+        )
+        logger.info("Restored dataloader iterator state")
+
     # Create train_step with sharding
+    logger.info("Creating train_step function")
     train_step = make_train_step(optim, data_sharding, model_sharding)
 
-    # Training loop
-    step = 0
+    # Training loop (step-based with infinite iterator)
+    logger.info("Starting training from step %d (total %d)", start_step, cfg.n_steps)
+    step = start_step
     models = {"encoder": encoder, "objective": objective, "probe": probe}
 
     # Initial sharding of models and optimizer state
     models = eqx.filter_shard(models, model_sharding)
     opt_state = eqx.filter_shard(opt_state, model_sharding)
 
-    n_batches = 0
-    epochs = range(start_epoch, cfg.epochs)
-    for epoch in birdjepa.helpers.progress(epochs, every=1, desc="pretrain"):
-        epoch_losses: dict[str, float] = {}
-        epoch_probe_loss = 0.0
-        n_batches = 0
+    for batch in birdjepa.helpers.progress(train_iter):
+        if step >= cfg.n_steps:
+            break
 
-        for batch in train_loader:
-            batch = _batch_to_jax(batch)
-            batch = eqx.filter_shard(batch, data_sharding)
-            step_key, key = jr.split(key)
+        batch = _batch_to_jax(batch)
+        batch = eqx.filter_shard(batch, data_sharding)
+        step_key, key = jr.split(key)
 
-            models, opt_state, metrics = train_step(
-                models, opt_state, batch, key=step_key
+        models, opt_state, metrics = train_step(models, opt_state, batch, key=step_key)
+
+        step += 1
+
+        # Checkpoint model and dataloader state (orbax decides whether to actually save based on interval)
+        # NOTE: All processes must call save() - orbax handles primary host logic internally
+        # NOTE: Don't save JAX PRNG key - it's host-local and can't be serialized in distributed mode
+        # Key can be regenerated from seed + step on restore
+        ckpt_mngr.save(
+            step,
+            args=ocp.args.Composite(
+                state=ocp.args.StandardSave(models | {"opt_state": opt_state}),
+                metadata=ocp.args.JsonSave({"step": step}),
+                train_iter=grain.PyGrainCheckpointSave(train_iter),
+            ),
+        )
+
+        # Log peak memory usage after first step (includes JIT compilation overhead)
+        if step == 1:
+            for device in jax.local_devices():
+                stats = device.memory_stats()
+                if stats:
+                    peak_gb = stats.get("peak_bytes_in_use", 0) / 1e9
+                    logger.info("Device %s peak memory: %.2f GB", device, peak_gb)
+
+        # Average metrics across devices for logging
+        metrics = jax.tree.map(lambda x: float(jnp.mean(x)), metrics)
+
+        if step % cfg.log_every == 0:
+            lr = float(schedule(step))
+            metric_strs = " ".join(
+                f"{k}={float(v):.4g}" for k, v in sorted(metrics.items())
             )
+            logger.info("step=%d lr=%.2e %s", step, lr, metric_strs)
+            if is_main:
+                log_dict = {
+                    "step": step,
+                    "lr": lr,
+                    "train/probe": float(metrics["probe_loss"]),
+                }
+                for k, v in metrics.items():
+                    if k not in ("loss", "probe_loss"):
+                        log_dict[f"train/{k}"] = float(v)
+                wandb.log(log_dict)
 
-            step += 1
-            n_batches += 1
+        # Evaluate periodically
+        if step % cfg.eval_every == 0:
+            encoder = models["encoder"]
+            probe = models["probe"]
+            objective = models["objective"]
+            correct = 0
+            total = 0
+            test_loss = 0.0
+            n_test_batches = 0
 
-            # Log peak memory usage after first step (includes JIT compilation overhead)
-            # Use local_devices() for multi-GPU - memory_stats() only works on addressable devices
-            if step == 1:
-                for device in jax.local_devices():
-                    stats = device.memory_stats()
-                    if stats:
-                        peak_gb = stats.get("peak_bytes_in_use", 0) / 1e9
-                        logger.info("Device %s peak memory: %.2f GB", device, peak_gb)
+            eval_key = jr.key(0)  # Fixed key for deterministic eval
+            for test_batch in test_loader:
+                data = jnp.asarray(test_batch["data"])
+                targets = jnp.asarray(test_batch["target"])
+                x_bnk, grid = birdjepa.nn.transformer.patchify(data, cfg.model)
+                out = encoder(x_bnk, grid=grid, key=eval_key)
+                if cfg.probe_pooling == "cls":
+                    emb = out["cls"].mean(axis=1)
+                else:
+                    emb = out["patches"].mean(axis=1)
+                logits = jax.vmap(probe)(emb)
+                preds = jnp.argmax(logits, axis=1)
+                correct += int(jnp.sum(preds == targets))
+                total += targets.shape[0]
+                eval_key, obj_key = jr.split(eval_key)
+                batch_jax = _batch_to_jax(test_batch)
+                losses, _, _ = objective(batch_jax, encoder, key=obj_key)
+                loss = sum(losses.values())
+                test_loss += float(jnp.mean(loss))
+                n_test_batches += 1
+            acc = correct / total
+            test_loss /= max(1, n_test_batches)
+            logger.info("step=%d test_acc=%.4f test_loss=%.4f", step, acc, test_loss)
+            if is_main:
+                wandb.log({"step": step, "test/acc": acc, "test/loss": test_loss})
 
-            # Average metrics across devices for logging
-            metrics = jax.tree.map(lambda x: float(jnp.mean(x)), metrics)
-
-            # Accumulate epoch losses
-            for k, v in metrics.items():
-                if k not in ("loss", "probe_loss"):
-                    epoch_losses[k] = epoch_losses.get(k, 0.0) + float(v)
-            epoch_probe_loss += float(metrics["probe_loss"])
-
-            if step % cfg.log_every == 0:
-                lr = float(schedule(step))
-                # Log all metrics as k=v pairs
-                metric_strs = " ".join(
-                    f"{k}={float(v):.4g}" for k, v in sorted(metrics.items())
-                )
-                logger.info("step=%d lr=%.2e %s", step, lr, metric_strs)
-                if is_main:
-                    log_dict = {
-                        "step": step,
-                        "lr": lr,
-                        "train/probe": float(metrics["probe_loss"]),
-                    }
-                    for k, v in metrics.items():
-                        if k not in ("loss", "probe_loss"):
-                            log_dict[f"train/{k}"] = float(v)
-                    wandb.log(log_dict)
-
-        # Log epoch summary
-        avg_strs = " | ".join(
-            f"avg_{k} {v / n_batches:.4f}" for k, v in epoch_losses.items()
-        )
-        logger.info(
-            "epoch %d | %s | avg_probe %.4f",
-            epoch,
-            avg_strs,
-            epoch_probe_loss / n_batches,
-        )
-
-        # Per-epoch evaluation
-        encoder = models["encoder"]
-        probe = models["probe"]
-        objective = models["objective"]
-        correct = 0
-        total = 0
-        test_loss = 0.0
-        n_test_batches = 0
-
-        eval_key = jr.key(0)  # Fixed key for deterministic eval
-        for batch in test_loader:
-            data = jnp.asarray(batch["data"])
-            targets = jnp.asarray(batch["target"])
-            x_bnk, grid = birdjepa.nn.transformer.patchify(data, cfg.model)
-            out = encoder(x_bnk, grid=grid, key=eval_key)
-            if cfg.probe_pooling == "cls":
-                emb = out["cls"].mean(axis=1)
-            else:
-                emb = out["patches"].mean(axis=1)
-            logits = jax.vmap(probe)(emb)
-            preds = jnp.argmax(logits, axis=1)
-            correct += int(jnp.sum(preds == targets))
-            total += targets.shape[0]
-            eval_key, obj_key = jr.split(eval_key)
-            batch_jax = _batch_to_jax(batch)
-            losses, _, _ = objective(batch_jax, encoder, key=obj_key)
-            loss = sum(losses.values())
-            test_loss += float(jnp.mean(loss))
-            n_test_batches += 1
-        acc = correct / total
-        logger.info("epoch %d | test_acc %.4f", epoch, acc)
-        test_loss /= max(1, n_test_batches)
-        logger.info("epoch %d | test_loss %.4f", epoch, test_loss)
-        if is_main:
-            log_dict = {
-                "test/epoch": epoch,
-                "test/acc": acc,
-                "test/loss": test_loss,
-            }
-            wandb.log(log_dict)
-
-        # Save checkpoint (only main process)
-        if is_main and (epoch + 1) % cfg.save_every == 0:
-            ckpt_path = ckpt_dpath / f"epoch_{epoch:04d}.eqx"
-            encoder, objective, probe = (
-                models["encoder"],
-                models["objective"],
-                models["probe"],
-            )
-            save_checkpoint(ckpt_path, epoch, encoder, objective, probe, opt_state)
-
-    # Save final checkpoint (only main process)
-    if is_main:
-        encoder, objective, probe = (
-            models["encoder"],
-            models["objective"],
-            models["probe"],
-        )
-        save_checkpoint(
-            ckpt_dpath / "final.eqx",
-            cfg.epochs - 1,
-            encoder,
-            objective,
-            probe,
-            opt_state,
-        )
+    # Save final checkpoint and wait for async saves to complete
+    # NOTE: All processes must call save() - orbax handles primary host logic internally
+    ckpt_mngr.save(
+        step,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardSave(models | {"opt_state": opt_state}),
+            metadata=ocp.args.JsonSave({"step": step}),
+            train_iter=grain.PyGrainCheckpointSave(train_iter),
+        ),
+        force=True,  # Force save at end
+    )
+    ckpt_mngr.wait_until_finished()
     if is_main:
         wandb.finish()
 
@@ -636,12 +668,17 @@ def cli(cfg: Config):
     import submitit.core.utils
 
     executor = submitit.SlurmExecutor(folder=base.log_to)
+    # OSC allocates ~10GB RAM per CPU, so request enough CPUs for desired memory
+    n_cpus = base.n_workers
+    if base.mem_gb > 0 and base.mem_gb // 10 > n_cpus:
+        n_cpus = base.mem_gb // 10
+        logger.info("Requesting %d CPUs to get %dGB RAM", n_cpus, base.mem_gb)
     executor.update_parameters(
         time=int(base.n_hours * 60),
         partition=base.slurm_partition,
         gpus_per_node=base.n_gpus,
         ntasks_per_node=base.n_gpus,  # One process per GPU (stable multi-GPU mode)
-        cpus_per_task=base.n_workers,
+        cpus_per_task=n_cpus,
         stderr_to_stdout=True,
         account=base.slurm_acct,
         setup=[
