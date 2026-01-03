@@ -1,13 +1,12 @@
 """
-JAX implementation of Bird-MAE audio preprocessing.
+Bird-MAE audio preprocessing.
 
-This module provides a torch-free implementation of the Bird-MAE transform pipeline, using JAX for FFT and array operations. Returns JAX arrays, similar to how the PyTorch version returns torch tensors.
+This module provides a torch-free implementation of the Bird-MAE transform pipeline, using numpy for FFT and array operations. Returns numpy arrays.
 """
 
 import beartype
-import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array, Float, jaxtyped
+from jaxtyping import Float, jaxtyped
 
 # Bird-MAE audio preprocessing constants
 
@@ -132,11 +131,11 @@ def kaldi_fbank(
     dither: float = 0.0,
     remove_dc_offset: bool = True,
     raw_energy: bool = True,
-) -> Float[Array, "time mels"]:
+) -> Float[np.ndarray, "time mels"]:
     """
     Compute log-mel filterbank features matching torchaudio.compliance.kaldi.fbank.
 
-    This matches the torchaudio implementation with snip_edges=True, use_power=True, use_log_fbank=True. Uses JAX's FFT for GPU compatibility.
+    This matches the torchaudio implementation with snip_edges=True, use_power=True, use_log_fbank=True.
 
     Args:
         waveform: 1D audio samples (numpy array)
@@ -154,7 +153,7 @@ def kaldi_fbank(
         raw_energy: Compute energy before preemphasis and windowing
 
     Returns:
-        JAX array of log-mel filterbank features, shape [n_frames, num_mel_bins (+ 1 if use_energy)]
+        Numpy array of log-mel filterbank features, shape [n_frames, num_mel_bins (+ 1 if use_energy)]
     """
     sample_rate = float(sample_frequency)
     dtype = waveform.dtype
@@ -170,7 +169,7 @@ def kaldi_fbank(
     frames_np = _get_strided(waveform, window_size, window_shift)
     if frames_np.size == 0:
         n_out = num_mel_bins + (1 if use_energy else 0)
-        return jnp.empty((0, n_out), dtype=dtype)
+        return np.empty((0, n_out), dtype=dtype)
 
     # Dithering (numpy for random generation)
     if dither != 0.0:
@@ -203,33 +202,29 @@ def kaldi_fbank(
     if not raw_energy:
         signal_log_energy = np.log(np.maximum(np.sum(frames_np**2, axis=1), eps))
 
-    # Convert to JAX for FFT and remaining operations
-    frames = jnp.asarray(frames_np)
-
-    # FFT and power spectrum
-    spectrum = jnp.abs(jnp.fft.rfft(frames, axis=1))
+    # FFT and power spectrum (use numpy to avoid JAX GPU init in dataloader workers)
+    spectrum = np.abs(np.fft.rfft(frames_np, axis=1))
     power_spectrum = spectrum**2
 
-    # Mel filterbank - constructed in numpy, converted to JAX
+    # Mel filterbank
     mel_filterbank = _make_mel_filterbank(
         padded_window_size, num_mel_bins, sample_rate, low_freq, high_freq
     ).astype(dtype)
     mel_filterbank = np.pad(mel_filterbank, ((0, 0), (0, 1)), mode="constant")
-    mel_filterbank = jnp.asarray(mel_filterbank)
 
     # Apply filterbank: [n_frames, n_fft_bins] @ [n_fft_bins, num_mel_bins]
-    mel_energies = jnp.dot(power_spectrum, mel_filterbank.T)
+    mel_energies = np.dot(power_spectrum, mel_filterbank.T)
 
     # Log
-    mel_energies = jnp.log(jnp.maximum(mel_energies, eps))
+    mel_energies = np.log(np.maximum(mel_energies, eps))
 
     # Add energy if requested
     if use_energy:
-        energy = jnp.asarray(signal_log_energy).reshape(-1, 1)
+        energy = signal_log_energy.reshape(-1, 1)
         if htk_compat:
-            mel_energies = jnp.concatenate([mel_energies, energy], axis=1)
+            mel_energies = np.concatenate([mel_energies, energy], axis=1)
         else:
-            mel_energies = jnp.concatenate([energy, mel_energies], axis=1)
+            mel_energies = np.concatenate([energy, mel_energies], axis=1)
 
     return mel_energies
 
@@ -261,7 +256,7 @@ def transform(
     # 2) mean-center (per clip)
     waveform = waveform - np.mean(waveform)
 
-    # 3) Kaldi fbank: [T, 128] - convert JAX array to numpy
+    # 3) Kaldi fbank: [T, 128]
     fb = kaldi_fbank(
         waveform,
         htk_compat=True,
@@ -271,7 +266,6 @@ def transform(
         dither=0.0,
         frame_shift=10.0,
     )
-    fb = np.asarray(fb)
 
     # 4) pad to 512 frames with min value
     t = fb.shape[0]
