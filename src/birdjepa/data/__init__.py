@@ -237,8 +237,6 @@ class ShuffledXenoCantoDataset:
         self._class_labels = ds.features["ebird_code"]
         self.n_classes = self._class_labels.num_classes
 
-        # Audio feature for decoding
-        self._audio_feature = datasets.Audio(sampling_rate=SR_HZ)
         self.max_samples = int(SR_HZ * cfg.clip_sec)
 
         # Bad indices to filter (per shard filtering happens in decode)
@@ -280,15 +278,28 @@ class ShuffledXenoCantoDataset:
 
     def decode_and_transform(self, row: dict) -> dict | None:
         """Decode audio bytes and compute spectrogram."""
+        import io
+
+        import soundfile as sf
+
         # Filter bad indices
         idx = row.get("__index_level_0__", -1)
         if idx in self._bad_indices:
             return None
 
-        # Decode audio using HF Audio feature
+        # Decode audio using soundfile (more reliable than torchcodec)
         try:
-            decoded = self._audio_feature.decode_example(row["audio"])
-            waveform = np.array(decoded["array"], dtype=np.float32)
+            audio_bytes = row["audio"]["bytes"]
+            waveform, sr = sf.read(io.BytesIO(audio_bytes))
+            # Convert to mono if stereo
+            if waveform.ndim > 1:
+                waveform = waveform.mean(axis=1)
+            waveform = waveform.astype(np.float32)
+            # Resample if needed
+            if sr != SR_HZ:
+                import soxr
+
+                waveform = soxr.resample(waveform, sr, SR_HZ)
         except Exception as err:
             logger.warning("Failed to decode audio at index %d: %s", idx, err)
             return None
