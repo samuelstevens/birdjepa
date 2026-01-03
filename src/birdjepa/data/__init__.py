@@ -286,8 +286,12 @@ class ShuffledXenoCantoDataset:
             return None
 
         # Decode audio using HF Audio feature
-        decoded = self._audio_feature.decode_example(row["audio"])
-        waveform = np.array(decoded["array"], dtype=np.float32)
+        try:
+            decoded = self._audio_feature.decode_example(row["audio"])
+            waveform = np.array(decoded["array"], dtype=np.float32)
+        except Exception as err:
+            logger.warning("Failed to decode audio at index %d: %s", idx, err)
+            return None
 
         # Truncate or pad to clip_sec
         n_samples = len(waveform)
