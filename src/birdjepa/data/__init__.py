@@ -456,56 +456,6 @@ class Cifar100Dataset(grain.RandomAccessDataSource):
 
 
 @beartype.beartype
-def make_dataloader(
-    source: grain.RandomAccessDataSource,
-    *,
-    seed: int,
-    batch_size: int,
-    n_workers: int,
-    shuffle: bool,
-    drop_last: bool,
-    repeat: bool = False,
-    shard_index: int = 0,
-    shard_count: int = 1,
-):
-    """Create a Grain dataloader from a dataset source.
-
-    Args:
-        source: Dataset implementing RandomAccessDataSource.
-        seed: Random seed for shuffling.
-        batch_size: Batch size.
-        n_workers: Number of prefetch workers.
-        shuffle: Whether to shuffle.
-        drop_last: Whether to drop the last incomplete batch.
-        repeat: Whether to repeat indefinitely (for step-based training with checkpointing).
-        shard_index: Index of this shard (0-indexed). Use jax.process_index().
-        shard_count: Total number of shards. Use jax.process_count().
-
-    Returns:
-        Grain IterDataset for iteration.
-    """
-    ds = grain.MapDataset.source(source).seed(seed)
-    if shard_count > 1:
-        indices = list(range(shard_index, len(source), shard_count))
-        ds = ds.slice(indices)
-    if shuffle:
-        ds = ds.shuffle()
-    if repeat:
-        ds = ds.repeat()
-    ds = ds.batch(batch_size=batch_size, drop_remainder=drop_last)
-    iter_ds = ds.to_iter_dataset(
-        read_options=grain.ReadOptions(num_threads=2, prefetch_buffer_size=64)
-    )
-    if n_workers > 0:
-        iter_ds = iter_ds.mp_prefetch(
-            grain.MultiprocessingOptions(
-                num_workers=n_workers, per_worker_buffer_size=2
-            )
-        )
-    return iter_ds
-
-
-@beartype.beartype
 def make_shuffled_dataloader(
     source: ShuffledXenoCantoDataset,
     *,

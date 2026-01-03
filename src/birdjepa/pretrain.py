@@ -400,66 +400,37 @@ def worker_fn(cfg: Config):
     logger.info("Created objective: %s", type(objective).__name__)
 
     # Wrap dataset for objective (e.g., multi-view for LeJEPA)
-    # NOTE: For ShuffledXenoCantoDataset, wrap happens inside decode_and_transform
-    if not isinstance(train_ds, birdjepa.data.ShuffledXenoCantoDataset):
-        train_ds = objective.wrap_dataset(train_ds)
     # Shard data across processes so each GPU loads different samples
     logger.info("Creating train dataloader")
-    if isinstance(train_ds, birdjepa.data.ShuffledXenoCantoDataset):
-        train_loader = birdjepa.data.make_shuffled_dataloader(
-            train_ds,
-            seed=cfg.seed,
-            batch_size=cfg.batch_size,
-            n_workers=cfg.n_workers,
-            shuffle=True,
-            drop_last=True,
-            repeat=True,
-            shard_index=jax.process_index(),
-            shard_count=jax.process_count(),
-            window_size=cfg.window_size,
-            cycle_length=cfg.cycle_length,
-        )
-    else:
-        train_loader = birdjepa.data.make_dataloader(
-            train_ds,
-            seed=cfg.seed,
-            batch_size=cfg.batch_size,
-            n_workers=cfg.n_workers,
-            shuffle=True,
-            drop_last=True,
-            repeat=True,  # Infinite iteration for step-based training with checkpointing
-            shard_index=jax.process_index(),
-            shard_count=jax.process_count(),
-        )
+    assert isinstance(train_ds, birdjepa.data.ShuffledXenoCantoDataset)
+    train_loader = birdjepa.data.make_shuffled_dataloader(
+        train_ds,
+        seed=cfg.seed,
+        batch_size=cfg.batch_size,
+        n_workers=cfg.n_workers,
+        shuffle=True,
+        drop_last=True,
+        repeat=True,
+        shard_index=jax.process_index(),
+        shard_count=jax.process_count(),
+        window_size=cfg.window_size,
+        cycle_length=cfg.cycle_length,
+    )
     logger.info("Creating test dataloader")
-    # NOTE: LeJEPA wraps the dataset to return "views" instead of "data", which will break test accuracy below.
-    if not isinstance(test_ds, birdjepa.data.ShuffledXenoCantoDataset):
-        test_ds = objective.wrap_dataset(test_ds)
-    if isinstance(test_ds, birdjepa.data.ShuffledXenoCantoDataset):
-        test_loader = birdjepa.data.make_shuffled_dataloader(
-            test_ds,
-            seed=cfg.seed,
-            batch_size=cfg.batch_size,
-            n_workers=cfg.n_workers,
-            shuffle=False,
-            drop_last=False,
-            repeat=False,
-            shard_index=jax.process_index(),
-            shard_count=jax.process_count(),
-            window_size=0,  # No shuffle buffer for eval
-            cycle_length=cfg.cycle_length,
-        )
-    else:
-        test_loader = birdjepa.data.make_dataloader(
-            test_ds,
-            seed=cfg.seed,
-            batch_size=cfg.batch_size,
-            n_workers=cfg.n_workers,
-            shuffle=False,
-            drop_last=False,
-            shard_index=jax.process_index(),
-            shard_count=jax.process_count(),
-        )
+    assert isinstance(test_ds, birdjepa.data.ShuffledXenoCantoDataset)
+    test_loader = birdjepa.data.make_shuffled_dataloader(
+        test_ds,
+        seed=cfg.seed,
+        batch_size=cfg.batch_size,
+        n_workers=cfg.n_workers,
+        shuffle=False,
+        drop_last=False,
+        repeat=False,
+        shard_index=jax.process_index(),
+        shard_count=jax.process_count(),
+        window_size=0,  # No shuffle buffer for eval
+        cycle_length=cfg.cycle_length,
+    )
     logger.info("Dataloaders created")
 
     # Online linear probe
