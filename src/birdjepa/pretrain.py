@@ -28,6 +28,9 @@ import birdjepa.helpers
 import birdjepa.nn.objectives
 import birdjepa.nn.transformer
 
+# Enable grain debug mode (only useful with n_workers=0)
+grain.config.update("py_debug_mode", True)
+
 log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 logger = logging.getLogger("birdjepa.pretrain")
 
@@ -124,13 +127,20 @@ class Config:
     """Path to sweep file with make_cfgs() function."""
     run_id: str = ""
     """Optional W&B run id for deterministic runs and checkpoint paths."""
+    # Sequential dataloader settings (for ShuffledXenoCantoDataset)
+    window_size: int = 8000
+    """Shuffle buffer size for sequential loading (samples)."""
+    cycle_length: int = 4
+    """Number of Arrow shards to interleave concurrently."""
 
 
 @beartype.beartype
-def make_dataset(cfg: birdjepa.data.Config) -> birdjepa.data.Dataset:
+def make_dataset(
+    cfg: birdjepa.data.Config,
+) -> birdjepa.data.Dataset | birdjepa.data.ShuffledXenoCantoDataset:
     """Create dataset from config."""
     if isinstance(cfg, birdjepa.data.XenoCanto):
-        return birdjepa.data.XenoCantoDataset(cfg)
+        return birdjepa.data.ShuffledXenoCantoDataset(cfg)
     elif isinstance(cfg, birdjepa.data.Cifar100):
         return birdjepa.data.Cifar100Dataset(cfg)
     else:
@@ -390,30 +400,66 @@ def worker_fn(cfg: Config):
     logger.info("Created objective: %s", type(objective).__name__)
 
     # Wrap dataset for objective (e.g., multi-view for LeJEPA)
-    train_ds = objective.wrap_dataset(train_ds)
-    # Different seed per process so each loads different data (2x throughput with 2 GPUs)
+    # NOTE: For ShuffledXenoCantoDataset, wrap happens inside decode_and_transform
+    if not isinstance(train_ds, birdjepa.data.ShuffledXenoCantoDataset):
+        train_ds = objective.wrap_dataset(train_ds)
+    # Shard data across processes so each GPU loads different samples
     logger.info("Creating train dataloader")
-    train_seed = cfg.seed + jax.process_index()
-    train_loader = birdjepa.data.make_dataloader(
-        train_ds,
-        seed=train_seed,
-        batch_size=cfg.batch_size,
-        n_workers=cfg.n_workers,
-        shuffle=True,
-        drop_last=True,
-        repeat=True,  # Infinite iteration for step-based training with checkpointing
-    )
+    if isinstance(train_ds, birdjepa.data.ShuffledXenoCantoDataset):
+        train_loader = birdjepa.data.make_dataloader_sequential(
+            train_ds,
+            seed=cfg.seed,
+            batch_size=cfg.batch_size,
+            n_workers=cfg.n_workers,
+            shuffle=True,
+            drop_last=True,
+            repeat=True,
+            shard_index=jax.process_index(),
+            shard_count=jax.process_count(),
+            window_size=cfg.window_size,
+            cycle_length=cfg.cycle_length,
+        )
+    else:
+        train_loader = birdjepa.data.make_dataloader(
+            train_ds,
+            seed=cfg.seed,
+            batch_size=cfg.batch_size,
+            n_workers=cfg.n_workers,
+            shuffle=True,
+            drop_last=True,
+            repeat=True,  # Infinite iteration for step-based training with checkpointing
+            shard_index=jax.process_index(),
+            shard_count=jax.process_count(),
+        )
     logger.info("Creating test dataloader")
     # NOTE: LeJEPA wraps the dataset to return "views" instead of "data", which will break test accuracy below.
-    test_ds = objective.wrap_dataset(test_ds)
-    test_loader = birdjepa.data.make_dataloader(
-        test_ds,
-        seed=cfg.seed,
-        batch_size=cfg.batch_size,
-        n_workers=cfg.n_workers,
-        shuffle=False,
-        drop_last=False,
-    )
+    if not isinstance(test_ds, birdjepa.data.ShuffledXenoCantoDataset):
+        test_ds = objective.wrap_dataset(test_ds)
+    if isinstance(test_ds, birdjepa.data.ShuffledXenoCantoDataset):
+        test_loader = birdjepa.data.make_dataloader_sequential(
+            test_ds,
+            seed=cfg.seed,
+            batch_size=cfg.batch_size,
+            n_workers=cfg.n_workers,
+            shuffle=False,
+            drop_last=False,
+            repeat=False,
+            shard_index=jax.process_index(),
+            shard_count=jax.process_count(),
+            window_size=0,  # No shuffle buffer for eval
+            cycle_length=cfg.cycle_length,
+        )
+    else:
+        test_loader = birdjepa.data.make_dataloader(
+            test_ds,
+            seed=cfg.seed,
+            batch_size=cfg.batch_size,
+            n_workers=cfg.n_workers,
+            shuffle=False,
+            drop_last=False,
+            shard_index=jax.process_index(),
+            shard_count=jax.process_count(),
+        )
     logger.info("Dataloaders created")
 
     # Online linear probe
@@ -513,7 +559,7 @@ def worker_fn(cfg: Config):
     models = eqx.filter_shard(models, model_sharding)
     opt_state = eqx.filter_shard(opt_state, model_sharding)
 
-    for batch in birdjepa.helpers.progress(train_iter):
+    for batch in birdjepa.helpers.progress(train_iter, every=cfg.log_every):
         if step >= cfg.n_steps:
             break
 
