@@ -101,12 +101,12 @@ def test_shuffled_xenocanto_init():
     assert all(fpath.endswith(".arrow") for fpath in ds.arrow_fpaths)
 
 
-def test_make_dataloader_sequential_basic():
-    """make_dataloader_sequential creates a working dataloader."""
+def test_make_shuffled_dataloader_basic():
+    """make_shuffled_dataloader creates a working dataloader."""
     cfg = birdjepa.data.XenoCanto(subset="XCM")
     ds = birdjepa.data.ShuffledXenoCantoDataset(cfg)
 
-    loader = birdjepa.data.make_dataloader_sequential(
+    loader = birdjepa.data.make_shuffled_dataloader(
         ds,
         seed=42,
         batch_size=2,
@@ -126,12 +126,12 @@ def test_make_dataloader_sequential_basic():
     assert len(batch["data"].shape) == 3  # (batch, height, width)
 
 
-def test_make_dataloader_sequential_repeat():
-    """make_dataloader_sequential with repeat=True yields infinite batches."""
+def test_make_shuffled_dataloader_repeat():
+    """make_shuffled_dataloader with repeat=True yields infinite batches."""
     cfg = birdjepa.data.XenoCanto(subset="XCM")
     ds = birdjepa.data.ShuffledXenoCantoDataset(cfg)
 
-    loader = birdjepa.data.make_dataloader_sequential(
+    loader = birdjepa.data.make_shuffled_dataloader(
         ds,
         seed=42,
         batch_size=2,
@@ -150,8 +150,8 @@ def test_make_dataloader_sequential_repeat():
         assert "data" in batch
 
 
-def test_make_dataloader_sequential_sharding():
-    """make_dataloader_sequential correctly shards files across processes."""
+def test_make_shuffled_dataloader_sharding():
+    """make_shuffled_dataloader correctly shards files across processes."""
     cfg = birdjepa.data.XenoCanto(subset="XCM")
     ds = birdjepa.data.ShuffledXenoCantoDataset(cfg)
 

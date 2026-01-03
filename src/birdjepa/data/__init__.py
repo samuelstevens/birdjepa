@@ -76,28 +76,6 @@ class Dataset(tp.Protocol):
     def __getitem__(self, idx: int) -> dict: ...
 
 
-class ShardedSource(grain.RandomAccessDataSource):
-    """Wrapper that shards a dataset across multiple processes."""
-
-    def __init__(
-        self, source: grain.RandomAccessDataSource, shard_index: int, shard_count: int
-    ):
-        self.source = source
-        self.shard_index = shard_index
-        self.shard_count = shard_count
-        # Compute indices for this shard (every shard_count-th element starting at shard_index)
-        self._indices = list(range(shard_index, len(source), shard_count))
-        # Pass through n_classes if source has it
-        if hasattr(source, "n_classes"):
-            self.n_classes = source.n_classes
-
-    def __len__(self) -> int:
-        return len(self._indices)
-
-    def __getitem__(self, idx: int) -> dict:
-        return self.source[self._indices[idx]]
-
-
 class IndexedXenoCantoDataset(grain.RandomAccessDataSource):
     """XenoCanto dataset using random access (slow on NFS).
 
@@ -280,7 +258,7 @@ class ShuffledXenoCantoDataset:
     def __getitem__(self, idx: int) -> dict:
         raise NotImplementedError(
             "ShuffledXenoCantoDataset doesn't support random access. "
-            "Use make_dataloader_sequential() for iteration."
+            "Use make_shuffled_dataloader() for iteration."
         )
 
     def make_shard_iter(self, arrow_fpath: str) -> grain.IterDataset:
@@ -506,9 +484,10 @@ def make_dataloader(
     Returns:
         Grain IterDataset for iteration.
     """
-    if shard_count > 1:
-        source = ShardedSource(source, shard_index, shard_count)
     ds = grain.MapDataset.source(source).seed(seed)
+    if shard_count > 1:
+        indices = list(range(shard_index, len(source), shard_count))
+        ds = ds.slice(indices)
     if shuffle:
         ds = ds.shuffle()
     if repeat:
@@ -527,7 +506,7 @@ def make_dataloader(
 
 
 @beartype.beartype
-def make_dataloader_sequential(
+def make_shuffled_dataloader(
     source: ShuffledXenoCantoDataset,
     *,
     seed: int,

@@ -406,7 +406,7 @@ def worker_fn(cfg: Config):
     # Shard data across processes so each GPU loads different samples
     logger.info("Creating train dataloader")
     if isinstance(train_ds, birdjepa.data.ShuffledXenoCantoDataset):
-        train_loader = birdjepa.data.make_dataloader_sequential(
+        train_loader = birdjepa.data.make_shuffled_dataloader(
             train_ds,
             seed=cfg.seed,
             batch_size=cfg.batch_size,
@@ -436,7 +436,7 @@ def worker_fn(cfg: Config):
     if not isinstance(test_ds, birdjepa.data.ShuffledXenoCantoDataset):
         test_ds = objective.wrap_dataset(test_ds)
     if isinstance(test_ds, birdjepa.data.ShuffledXenoCantoDataset):
-        test_loader = birdjepa.data.make_dataloader_sequential(
+        test_loader = birdjepa.data.make_shuffled_dataloader(
             test_ds,
             seed=cfg.seed,
             batch_size=cfg.batch_size,
