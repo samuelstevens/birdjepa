@@ -1,0 +1,20 @@
+[package]
+name = "birdjepa-loader"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.27"
+numpy = "0.27"
+arrow = "54"
+parquet = "54"
+symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav"] }
+realfft = "3"
+rayon = "1.10"
+crossbeam = "0.8"
+rand = "0.8"
+thiserror = "2"
