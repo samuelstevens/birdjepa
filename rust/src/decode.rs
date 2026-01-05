@@ -2,6 +2,7 @@
 //!
 //! Supports MP3, FLAC, OGG, WAV formats.
 
+use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 use std::io::Cursor;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
@@ -49,29 +50,69 @@ impl DecodedAudio {
         mono
     }
 
-    /// Resample to target sample rate using linear interpolation.
-    /// For production, consider using a proper resampler like rubato.
+    /// Resample to target sample rate using sinc interpolation (rubato).
+    /// Uses high-quality anti-aliasing filter to prevent aliasing artifacts.
     pub fn resample(&self, target_rate: u32) -> Vec<f32> {
         if self.sample_rate == target_rate {
             return self.to_mono();
         }
 
         let mono = self.to_mono();
-        let ratio = self.sample_rate as f64 / target_rate as f64;
-        let new_len = (mono.len() as f64 / ratio) as usize;
-        let mut resampled = Vec::with_capacity(new_len);
-
-        for i in 0..new_len {
-            let src_idx = i as f64 * ratio;
-            let idx0 = src_idx.floor() as usize;
-            let idx1 = (idx0 + 1).min(mono.len() - 1);
-            let frac = src_idx - idx0 as f64;
-
-            let sample = mono[idx0] * (1.0 - frac as f32) + mono[idx1] * frac as f32;
-            resampled.push(sample);
+        if mono.is_empty() {
+            return Vec::new();
         }
 
-        resampled
+        let params = SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+
+        let resample_ratio = target_rate as f64 / self.sample_rate as f64;
+        let chunk_size = 1024;
+
+        // max_resample_ratio_relative must cover actual ratio (e.g., 8kHz→32kHz = 4x)
+        let max_ratio = resample_ratio.max(1.0 / resample_ratio) * 1.1;
+
+        let mut resampler = SincFixedIn::<f32>::new(
+            resample_ratio,
+            max_ratio,
+            params,
+            chunk_size,
+            1, // mono
+        )
+        .expect("Failed to create resampler");
+
+        let mut output = Vec::new();
+        let mut pos = 0;
+
+        // Process in chunks
+        while pos < mono.len() {
+            let end = (pos + chunk_size).min(mono.len());
+            let chunk = &mono[pos..end];
+
+            // Pad last chunk if needed
+            let input = if chunk.len() < chunk_size {
+                let mut padded = chunk.to_vec();
+                padded.resize(chunk_size, 0.0);
+                vec![padded]
+            } else {
+                vec![chunk.to_vec()]
+            };
+
+            let resampled = resampler.process(&input, None).expect("Resampling failed");
+            output.extend_from_slice(&resampled[0]);
+
+            pos += chunk_size;
+        }
+
+        // Trim output to expected length
+        let expected_len = (mono.len() as f64 * resample_ratio).round() as usize;
+        output.truncate(expected_len);
+
+        output
     }
 }
 

@@ -163,17 +163,18 @@ def test_loader_partial_batch(arrow_files):
 
 
 def test_spectrogram_transform_short_audio():
-    """SpectrogramTransform handles audio shorter than FFT window."""
+    """SpectrogramTransform handles audio shorter than win_length."""
     from birdjepa._rs import SpectrogramTransform
 
-    transform = SpectrogramTransform(n_fft=1024)
+    transform = SpectrogramTransform(n_fft=1024, win_length=800)
 
-    # Audio shorter than FFT window
+    # Audio shorter than win_length
     short_audio = np.zeros(512, dtype=np.float32)
     spec = transform(short_audio)
 
     # Should produce empty spectrogram without crashing
-    assert spec.shape == (128, 0)  # n_mels x 0 frames
+    # Output is [n_frames, n_mels] = [0, 128]
+    assert spec.shape == (0, 128)
 
 
 def test_spectrogram_transform_deterministic():
@@ -190,55 +191,6 @@ def test_spectrogram_transform_deterministic():
     spec2 = transform(audio)
 
     np.testing.assert_array_equal(spec1, spec2)
-
-
-def test_resampling_removes_above_nyquist():
-    """Resampling should filter out frequencies above target Nyquist.
-
-    When downsampling from 44100 Hz to 16000 Hz:
-    - Target Nyquist = 8000 Hz
-    - A 14000 Hz tone is above Nyquist and should be filtered out
-    - Without anti-aliasing filter, it aliases to |14000 - 16000| = 2000 Hz
-
-    This test fails with linear interpolation (current Rust implementation).
-    Fix by using a proper resampler like rubato.
-    """
-    source_rate = 44100
-    target_rate = 16000
-    duration = 1.0
-
-    # Create a pure 14000 Hz tone (above target Nyquist of 8000 Hz)
-    t = np.linspace(0, duration, int(source_rate * duration), dtype=np.float32)
-    high_freq_tone = np.sin(2 * np.pi * 14000 * t).astype(np.float32)
-
-    # Linear interpolation resampling (what Rust currently does)
-    def linear_resample(audio, source_rate, target_rate):
-        ratio = source_rate / target_rate
-        new_len = int(len(audio) / ratio)
-        result = np.zeros(new_len, dtype=np.float32)
-        for i in range(new_len):
-            src_idx = i * ratio
-            idx0 = int(src_idx)
-            idx1 = min(idx0 + 1, len(audio) - 1)
-            frac = src_idx - idx0
-            result[i] = audio[idx0] * (1 - frac) + audio[idx1] * frac
-        return result
-
-    resampled = linear_resample(high_freq_tone, source_rate, target_rate)
-
-    # Check for aliasing using FFT
-    fft = np.abs(np.fft.rfft(resampled))
-    freqs = np.fft.rfftfreq(len(resampled), 1 / target_rate)
-    peak_idx = np.argmax(fft[1:]) + 1  # Skip DC
-    peak_freq = freqs[peak_idx]
-    peak_amplitude = fft[peak_idx]
-
-    # The 14000 Hz tone should be filtered out, leaving only noise
-    # With proper resampling, peak amplitude should be < 10 (essentially noise)
-    # Linear interpolation produces ~4800 amplitude at 2000 Hz (aliased)
-    assert peak_amplitude < 10, (
-        f"Aliasing detected: {peak_freq:.0f} Hz with amplitude {peak_amplitude:.0f}. Expected frequencies above Nyquist to be filtered out."
-    )
 
 
 def test_loader_returns_indices(arrow_files):

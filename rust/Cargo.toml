@@ -1,7 +1,7 @@
 [package]
 name = "birdjepa-loader"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 name = "_rs"
@@ -14,6 +14,7 @@ arrow = "54"
 parquet = "54"
 symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav"] }
 realfft = "3"
+rubato = "0.16"
 rayon = "1.10"
 crossbeam = "0.8"
 rand = "0.8"

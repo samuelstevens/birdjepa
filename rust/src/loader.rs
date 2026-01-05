@@ -69,6 +69,9 @@ impl Loader {
         n_mels = 128,
         n_fft = 1024,
         hop_length = 320,
+        win_length = 800,
+        f_min = 20.0,
+        preemphasis = 0.97,
         n_workers = 8,
         raw_channel_size = 256,
         infinite = true,
@@ -86,6 +89,9 @@ impl Loader {
         n_mels: usize,
         n_fft: usize,
         hop_length: usize,
+        win_length: usize,
+        f_min: f32,
+        preemphasis: f32,
         n_workers: usize,
         raw_channel_size: usize,
         infinite: bool,
@@ -142,8 +148,10 @@ impl Loader {
             n_fft,
             hop_length,
             n_mels,
-            0.0,
+            f_min,
             f_max,
+            win_length,
+            preemphasis,
         ));
 
         let shuffle_buffer = Arc::new(ConcurrentShuffleBuffer::new(
