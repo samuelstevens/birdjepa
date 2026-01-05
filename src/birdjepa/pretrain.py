@@ -5,22 +5,13 @@ Based on https://github.com/rbalestr-lab/lejepa/blob/main/MINIMAL.md
 """
 
 import dataclasses
-import faulthandler
 import logging
 import os
 import pathlib
-import sys
 import time
 import typing as tp
 
-# Enable faulthandler to print stack traces on crash (SIGSEGV, SIGFPE, etc.)
-faulthandler.enable(file=sys.stderr, all_threads=True)
-
-# Enable NCCL debug logging for JAX distributed debugging
-os.environ.setdefault("NCCL_DEBUG", "WARN")
-os.environ.setdefault("JAX_LOG_COMPILES", "1")
-
-import beartype  # noqa: E402
+import beartype
 import equinox as eqx
 import jax
 import jax.random as jr
