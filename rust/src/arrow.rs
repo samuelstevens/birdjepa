@@ -1,6 +1,6 @@
 //! Arrow IPC reading (HuggingFace datasets use Arrow IPC streaming format).
 
-use arrow::array::{Array, BinaryArray, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, BinaryArray, Int64Array, RecordBatch};
 use arrow::ipc::reader::StreamReader;
 use std::fs::File;
 use std::io::BufReader;
@@ -142,24 +142,17 @@ fn extract_sample(
 
     let audio_bytes = bytes_array.value(row).to_vec();
 
-    // Label column
+    // Label column - must be Int64 (ClassLabel feature type in HuggingFace datasets)
     let label_col = batch.column(label_col);
-    let label = if let Some(arr) = label_col.as_any().downcast_ref::<Int64Array>() {
-        arr.value(row)
-    } else if let Some(arr) = label_col.as_any().downcast_ref::<StringArray>() {
-        // If it's a string, we'll need to map it to an index later
-        // For now, hash it to get a consistent i64
-        let s = arr.value(row);
-        let mut hash: i64 = 0;
-        for b in s.bytes() {
-            hash = hash.wrapping_mul(31).wrapping_add(b as i64);
-        }
-        hash
-    } else {
-        return Err(ArrowError::InvalidColumnType(
-            "ebird_code (expected int64 or string)".to_string(),
-        ));
-    };
+    let label = label_col
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            ArrowError::InvalidColumnType(
+                "ebird_code (expected int64, got string - dataset must use ClassLabel feature)".to_string(),
+            )
+        })?
+        .value(row);
 
     Ok(Sample {
         audio_bytes,
