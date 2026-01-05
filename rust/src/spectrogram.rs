@@ -3,7 +3,7 @@
 //! Matches the Python implementation in bird_mae.transform().
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
-use pyo3::{pyclass, pymethods, Bound, PyResult, Python};
+use pyo3::{Bound, PyResult, Python, pyclass, pymethods};
 use realfft::{RealFftPlanner, RealToComplex};
 use std::f32::consts::PI;
 use std::sync::Arc;

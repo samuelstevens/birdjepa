@@ -213,7 +213,7 @@ fn io_thread_main(
     loop {
         // Shuffle file order for this pass
         let mut file_order: Vec<usize> = (0..arrow_files.len()).collect();
-        StdRng::seed_from_u64(epoch_seed).shuffle(&mut file_order);
+        file_order.shuffle(&mut StdRng::seed_from_u64(epoch_seed));
 
         for &file_idx in &file_order {
             if shutdown.load(Ordering::Relaxed) {
@@ -398,25 +398,15 @@ fn splitmix64(x: u64) -> u64 {
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use crossbeam::channel::bounded;
 
 #[pyclass]
 pub struct Loader {
-    // Config
-    arrow_files: Vec<String>,
-    file_offsets: Vec<i64>,
+    // Config (kept for batch assembly)
     batch_size: usize,
-    sample_rate: u32,
     clip_samples: usize,
     spectrogram: Arc<SpectrogramTransform>,
-    n_workers: usize,
-    raw_channel_size: usize,
-    shuffle_capacity: usize,
-    shuffle_min_size: usize,
-    infinite: bool,
-    augment: bool,
 
-    // Pipeline (always running after construction)
+    // Pipeline state (always running after construction)
     shuffle_buffer: Arc<ConcurrentShuffleBuffer<ProcessedSample>>,
     shutdown: Arc<AtomicBool>,
     io_handle: Option<JoinHandle<()>>,
@@ -425,23 +415,25 @@ pub struct Loader {
 }
 
 impl Loader {
-    fn start_pipeline(&mut self, seed: u64) {
-        let (raw_tx, raw_rx) = bounded(self.raw_channel_size);
+    fn start_pipeline(
+        &mut self,
+        arrow_files: Vec<String>,
+        file_offsets: Vec<i64>,
+        seed: u64,
+        sample_rate: u32,
+        n_workers: usize,
+        raw_channel_size: usize,
+        infinite: bool,
+        augment: bool,
+    ) {
+        let (raw_tx, raw_rx) = bounded(raw_channel_size);
 
-        self.shuffle_buffer = Arc::new(ConcurrentShuffleBuffer::new(
-            self.shuffle_capacity,
-            self.shuffle_min_size,
-            seed,
-        ));
-        self.shutdown = Arc::new(AtomicBool::new(false));
+        // Worker completion counter for monitor thread
+        let workers_alive = Arc::new(AtomicUsize::new(n_workers));
 
         // Spawn I/O thread
         self.io_handle = Some({
-            let arrow_files = self.arrow_files.clone();
-            let file_offsets = self.file_offsets.clone();
             let shutdown = Arc::clone(&self.shutdown);
-            let infinite = self.infinite;
-            let augment = self.augment;
             thread::spawn(move || {
                 io_thread_main(
                     arrow_files,
@@ -455,20 +447,15 @@ impl Loader {
             })
         });
 
-        // Worker completion counter for monitor thread
-        let workers_alive = Arc::new(AtomicUsize::new(self.n_workers));
-
         // Spawn workers
-        self.worker_handles = (0..self.n_workers)
+        self.worker_handles = (0..n_workers)
             .map(|_| {
                 let raw_rx = raw_rx.clone();
                 let shuffle_buffer = Arc::clone(&self.shuffle_buffer);
                 let spectrogram = Arc::clone(&self.spectrogram);
                 let shutdown = Arc::clone(&self.shutdown);
                 let workers_alive = Arc::clone(&workers_alive);
-                let sample_rate = self.sample_rate;
                 let clip_samples = self.clip_samples;
-                let augment = self.augment;
 
                 thread::spawn(move || {
                     worker_thread_main(
@@ -486,10 +473,6 @@ impl Loader {
             .collect();
 
         // Spawn monitor thread: waits for workers to finish, then closes buffer
-
-        // Update workers to decrement counter on exit (shown in worker_thread_main)
-        // Each worker does: workers_alive.fetch_sub(1, Ordering::SeqCst) at end
-
         self.monitor_handle = Some({
             let shuffle_buffer = Arc::clone(&self.shuffle_buffer);
             let shutdown = Arc::clone(&self.shutdown);

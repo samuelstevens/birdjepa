@@ -15,7 +15,7 @@ pub mod spectrogram;
 
 use numpy::PyArray1;
 use pyo3::types::{PyModule, PyModuleMethods};
-use pyo3::{pyfunction, pymodule, wrap_pyfunction, Bound, PyResult, Python};
+use pyo3::{Bound, PyResult, Python, pyfunction, pymodule, wrap_pyfunction};
 
 /// Decode audio bytes to waveform (for benchmarking).
 #[pyfunction]

@@ -8,19 +8,19 @@
 //! - Shuffle buffer provides randomness with configurable minimum fill
 //! - Main thread assembles batches and returns to Python
 
-use crate::arrow::{count_samples, ArrowReader, Sample};
+use crate::arrow::{ArrowReader, Sample, count_samples};
 use crate::decode::decode_audio;
 use crate::shuffle::ConcurrentShuffleBuffer;
 use crate::spectrogram::SpectrogramTransform;
 
-use crossbeam::channel::{bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender};
+use crossbeam::channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::types::{PyDict, PyDictMethods};
-use pyo3::{pyclass, pymethods, Bound, PyResult, Python};
+use pyo3::{Bound, PyResult, Python, pyclass, pymethods};
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -106,6 +106,16 @@ impl Loader {
                 "raw_channel_size must be > 0",
             ));
         }
+        if batch_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "batch_size must be > 0",
+            ));
+        }
+        if n_workers == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "n_workers must be > 0",
+            ));
+        }
 
         let clip_samples = (clip_seconds * sample_rate as f32) as usize;
         let n_files = arrow_files.len();
@@ -128,7 +138,12 @@ impl Loader {
         }
 
         let spectrogram = Arc::new(SpectrogramTransform::new(
-            sample_rate, n_fft, hop_length, n_mels, 0.0, f_max,
+            sample_rate,
+            n_fft,
+            hop_length,
+            n_mels,
+            0.0,
+            f_max,
         ));
 
         let shuffle_buffer = Arc::new(ConcurrentShuffleBuffer::new(
@@ -172,9 +187,7 @@ impl Loader {
 
         while samples.len() < self.batch_size {
             // Release GIL for blocking operation
-            let sample = py.detach(|| {
-                self.shuffle_buffer.try_pop(Duration::from_millis(100))
-            });
+            let sample = py.detach(|| self.shuffle_buffer.try_pop(Duration::from_millis(100)));
 
             match sample {
                 Some(s) => samples.push(s),

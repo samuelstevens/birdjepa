@@ -4,7 +4,7 @@
 
 use std::io::Cursor;
 use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
@@ -84,7 +84,8 @@ pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, DecodeError> {
     let format_opts = FormatOptions::default();
     let metadata_opts = MetadataOptions::default();
 
-    let probed = symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts)?;
+    let probed =
+        symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts)?;
     let mut format = probed.format;
 
     // Find the first audio track
@@ -101,11 +102,7 @@ pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, DecodeError> {
         .codec_params
         .sample_rate
         .ok_or(DecodeError::UnsupportedCodec)?;
-    let channels = track
-        .codec_params
-        .channels
-        .map(|c| c.count())
-        .unwrap_or(1);
+    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
 
     let track_id = track.id;
     let mut samples = Vec::new();

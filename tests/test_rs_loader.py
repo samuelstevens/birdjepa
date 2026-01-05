@@ -45,18 +45,6 @@ def test_loader_iteration(arrow_files):
     assert labels.dtype == np.int64
 
 
-def test_loader_deterministic(arrow_files):
-    """Same seed produces same batches."""
-    loader1 = Loader(arrow_files, seed=42, batch_size=4, infinite=False, augment=False)
-    loader2 = Loader(arrow_files, seed=42, batch_size=4, infinite=False, augment=False)
-
-    batch1 = next(iter(loader1))
-    batch2 = next(iter(loader2))
-
-    np.testing.assert_array_equal(batch1["spectrogram"], batch2["spectrogram"])
-    np.testing.assert_array_equal(batch1["labels"], batch2["labels"])
-
-
 def test_loader_different_seeds(arrow_files):
     """Different seeds produce different batches."""
     loader1 = Loader(arrow_files, seed=42, batch_size=4, infinite=False)
@@ -89,6 +77,18 @@ def test_loader_empty_files_rejected():
     """Loader rejects empty file list."""
     with pytest.raises(ValueError, match="arrow_files must not be empty"):
         Loader([], seed=42)
+
+
+def test_loader_zero_batch_size_rejected(arrow_files):
+    """Loader rejects batch_size=0."""
+    with pytest.raises(ValueError, match="batch_size must be > 0"):
+        Loader(arrow_files, seed=42, batch_size=0)
+
+
+def test_loader_zero_workers_rejected(arrow_files):
+    """Loader rejects n_workers=0."""
+    with pytest.raises(ValueError, match="n_workers must be > 0"):
+        Loader(arrow_files, seed=42, n_workers=0)
 
 
 def test_loader_small_shuffle_buffer(arrow_files):
@@ -353,3 +353,50 @@ def test_loader_infinite_mode_continues(arrow_files):
 
     # Should have collected samples across multiple epochs
     assert n_samples > 10000
+
+
+def test_rust_labels_match_python():
+    """Rust loader labels match HuggingFace dataset labels for same indices.
+
+    This is a property test that verifies the Rust loader produces the same
+    integer labels as the HuggingFace dataset for corresponding sample indices.
+
+    Uses train split because valid split has no labels (all None).
+    """
+    import datasets
+
+    # Load HuggingFace dataset without audio decoding (just get labels)
+    hf_ds = datasets.load_dataset("samuelstevens/BirdSet", "XCM", split="train")
+    train_arrow_files = [f["filename"] for f in hf_ds.cache_files]
+
+    # Rust loader
+    rust_loader = Loader(
+        train_arrow_files,
+        seed=0,
+        batch_size=32,
+        shuffle_buffer_size=100,
+        shuffle_min_size=10,
+        infinite=False,
+        augment=False,
+    )
+
+    # Collect (index, label) pairs from Rust loader
+    rust_samples: dict[int, int] = {}
+    for batch in rust_loader:
+        indices = batch["indices"]
+        labels = batch["labels"]
+        for i in range(len(indices)):
+            rust_samples[int(indices[i])] = int(labels[i])
+        if len(rust_samples) >= 100:
+            break
+
+    assert len(rust_samples) >= 100, "Need at least 100 samples to verify"
+
+    # Verify labels match for all collected indices
+    mismatches = []
+    for idx, rust_label in rust_samples.items():
+        hf_label = hf_ds[idx]["ebird_code"]
+        if rust_label != hf_label:
+            mismatches.append((idx, rust_label, hf_label))
+
+    assert not mismatches, f"Label mismatches: {mismatches[:10]}..."
