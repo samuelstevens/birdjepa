@@ -5,15 +5,23 @@ Based on https://github.com/rbalestr-lab/lejepa/blob/main/MINIMAL.md
 """
 
 import dataclasses
+import faulthandler
 import logging
 import os
 import pathlib
+import sys
 import time
 import typing as tp
 
-import beartype
+# Enable faulthandler to print stack traces on crash (SIGSEGV, SIGFPE, etc.)
+faulthandler.enable(file=sys.stderr, all_threads=True)
+
+# Enable NCCL debug logging for JAX distributed debugging
+os.environ.setdefault("NCCL_DEBUG", "WARN")
+os.environ.setdefault("JAX_LOG_COMPILES", "1")
+
+import beartype  # noqa: E402
 import equinox as eqx
-import grain.python as grain
 import jax
 import jax.random as jr
 import jax.numpy as jnp
@@ -21,15 +29,12 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import wandb
-import wandb.util as wandb_util
+import wandb.util
 
 import birdjepa.data
 import birdjepa.helpers
 import birdjepa.nn.objectives
 import birdjepa.nn.transformer
-
-# Enable grain debug mode (only useful with n_workers=0)
-grain.config.update("py_debug_mode", True)
 
 log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 logger = logging.getLogger("birdjepa.pretrain")
@@ -38,7 +43,7 @@ logger = logging.getLogger("birdjepa.pretrain")
 def _is_numeric_array(x: object) -> bool:
     """Check if x is a numeric array that can be converted to JAX."""
     if not isinstance(x, (jax.Array, np.ndarray)):
-        return False
+        return True
     dt = getattr(x, "dtype", None)
     if dt is None:
         return False
@@ -47,6 +52,17 @@ def _is_numeric_array(x: object) -> bool:
         or np.issubdtype(dt, np.integer)
         or np.issubdtype(dt, np.floating)
     )
+
+
+def compute_tgt_entropy(targets: np.ndarray) -> float:
+    """Compute entropy of target labels in a batch (measures shuffle quality).
+
+    High entropy = diverse classes in batch = good shuffle.
+    Low entropy = clustered classes = poor shuffle (reading from few shards).
+    """
+    _, counts = np.unique(targets, return_counts=True)
+    probs = counts / counts.sum()
+    return float(-np.sum(probs * np.log(probs + 1e-10)))
 
 
 def _batch_to_jax(batch: dict) -> dict:
@@ -81,7 +97,7 @@ class Config:
     """Number of dataloader workers."""
     n_steps: int = 10000
     """Total number of training steps."""
-    log_every: int = 50
+    log_every: int = 1
     """Log training metrics every N steps."""
     eval_every: int = 1000
     """Evaluate on test set every N steps."""
@@ -127,11 +143,9 @@ class Config:
     """Path to sweep file with make_cfgs() function."""
     run_id: str = ""
     """Optional W&B run id for deterministic runs and checkpoint paths."""
-    # Sequential dataloader settings (for ShuffledXenoCantoDataset)
-    window_size: int = 8000
-    """Shuffle buffer size for sequential loading (samples)."""
-    cycle_length: int = 4
-    """Number of Arrow shards to interleave concurrently."""
+    # Rust dataloader settings
+    window_size: int = 10000
+    """Shuffle buffer size for Rust loader (samples)."""
 
 
 @beartype.beartype
@@ -338,12 +352,16 @@ def worker_fn(cfg: Config):
     # Initialize multi-process JAX distributed runtime for multi-GPU SLURM jobs
     # Each SLURM task is one process; this coordinates across them
     # Skip for single-GPU to avoid heartbeat timeout issues during long JIT
-    # Also skip in grain worker processes (they inherit this code but shouldn't init JAX)
     import multiprocessing
 
     n_tasks = int(os.environ.get("SLURM_NTASKS", "1"))
     if n_tasks > 1 and multiprocessing.parent_process() is None:
-        jax.distributed.initialize()
+        # Increase timeouts to handle slow XLA compilation on first step
+        # See: https://github.com/jax-ml/jax/issues/33852
+        jax.distributed.initialize(
+            initialization_timeout=600,
+            heartbeat_timeout_seconds=300,
+        )
         logger.info("Initialized JAX distributed: %d processes", jax.process_count())
     elif n_tasks == 1:
         logger.info("Single-GPU mode, skipping JAX distributed initialization")
@@ -399,37 +417,29 @@ def worker_fn(cfg: Config):
     )
     logger.info("Created objective: %s", type(objective).__name__)
 
-    # Wrap dataset for objective (e.g., multi-view for LeJEPA)
+    # Create dataloaders using Rust loader
     # Shard data across processes so each GPU loads different samples
     logger.info("Creating train dataloader")
-    assert isinstance(train_ds, birdjepa.data.ShuffledXenoCantoDataset)
-    train_loader = birdjepa.data.make_shuffled_dataloader(
-        train_ds,
-        seed=cfg.seed,
+    assert isinstance(cfg.train_data, birdjepa.data.XenoCanto)
+    train_loader = birdjepa.data.RustXenoCantoLoader(
+        cfg.train_data,
+        seed=cfg.seed + jax.process_index(),  # Unique seed per process
         batch_size=cfg.batch_size,
         n_workers=cfg.n_workers,
-        shuffle=True,
-        drop_last=True,
-        repeat=True,
-        shard_index=jax.process_index(),
-        shard_count=jax.process_count(),
-        window_size=cfg.window_size,
-        cycle_length=cfg.cycle_length,
+        shuffle_buffer_size=cfg.window_size,
+        shuffle_min_size=cfg.window_size // 2,
+        infinite=True,
     )
-    logger.info("Creating test dataloader")
-    assert isinstance(test_ds, birdjepa.data.ShuffledXenoCantoDataset)
-    test_loader = birdjepa.data.make_shuffled_dataloader(
-        test_ds,
-        seed=cfg.seed,
+    logger.info("Creating test dataloader (Rust)")
+    assert isinstance(cfg.test_data, birdjepa.data.XenoCanto)
+    test_loader = birdjepa.data.RustXenoCantoLoader(
+        cfg.test_data,
+        seed=cfg.seed,  # Fixed seed for deterministic eval
         batch_size=cfg.batch_size,
         n_workers=cfg.n_workers,
-        shuffle=False,
-        drop_last=False,
-        repeat=False,
-        shard_index=jax.process_index(),
-        shard_count=jax.process_count(),
-        window_size=0,  # No shuffle buffer for eval
-        cycle_length=cfg.cycle_length,
+        shuffle_buffer_size=1000,  # Small buffer for eval
+        shuffle_min_size=0,  # Allow draining
+        infinite=False,
     )
     logger.info("Dataloaders created")
 
@@ -495,27 +505,17 @@ def worker_fn(cfg: Config):
             max_to_keep=5,
             enable_async_checkpointing=True,
         ),
-        item_names=("state", "metadata", "train_iter"),
+        item_names=("state", "metadata"),
     )
     logger.info("Checkpoint manager created (save_interval=500, max_to_keep=5)")
-
-    # Create train iterator (used for checkpointing dataloader state)
-    logger.info("Creating train iterator for checkpointing")
-    train_iter = iter(train_loader)
 
     # Resume from checkpoint (auto-resume if checkpoint exists)
     start_step = 0
     restored = load_checkpoint(ckpt_mngr, encoder, objective, probe, opt_state, key)
     if restored is not None:
         encoder, objective, probe, opt_state, key, start_step = restored
-        # Restore dataloader iterator state to resume from correct position
-        ckpt_mngr.restore(
-            start_step,
-            args=ocp.args.Composite(
-                train_iter=grain.PyGrainCheckpointRestore(train_iter)
-            ),
-        )
-        logger.info("Restored dataloader iterator state")
+        # Note: Rust loader state is not checkpointed - resume continues from shuffled order
+        logger.info("Resumed from checkpoint (dataloader restarts from beginning)")
 
     # Create train_step with sharding
     logger.info("Creating train_step function")
@@ -530,9 +530,16 @@ def worker_fn(cfg: Config):
     models = eqx.filter_shard(models, model_sharding)
     opt_state = eqx.filter_shard(opt_state, model_sharding)
 
-    for batch in birdjepa.helpers.progress(train_iter, every=cfg.log_every):
+    # TODO: total is wrong when resuming (should be cfg.n_steps - step)
+    last_step_time = time.time()
+    for batch in birdjepa.helpers.progress(
+        train_loader, every=cfg.log_every, total=cfg.n_steps
+    ):
         if step >= cfg.n_steps:
             break
+
+        # Compute target entropy before converting to JAX (measures shuffle quality)
+        tgt_entropy = compute_tgt_entropy(batch["target"])
 
         batch = _batch_to_jax(batch)
         batch = eqx.filter_shard(batch, data_sharding)
@@ -542,16 +549,14 @@ def worker_fn(cfg: Config):
 
         step += 1
 
-        # Checkpoint model and dataloader state (orbax decides whether to actually save based on interval)
+        # Checkpoint model state (orbax decides whether to actually save based on interval)
         # NOTE: All processes must call save() - orbax handles primary host logic internally
         # NOTE: Don't save JAX PRNG key - it's host-local and can't be serialized in distributed mode
-        # Key can be regenerated from seed + step on restore
         ckpt_mngr.save(
             step,
             args=ocp.args.Composite(
                 state=ocp.args.StandardSave(models | {"opt_state": opt_state}),
                 metadata=ocp.args.JsonSave({"step": step}),
-                train_iter=grain.PyGrainCheckpointSave(train_iter),
             ),
         )
 
@@ -567,16 +572,29 @@ def worker_fn(cfg: Config):
         metrics = jax.tree.map(lambda x: float(jnp.mean(x)), metrics)
 
         if step % cfg.log_every == 0:
+            now = time.time()
+            sec_per_step = now - last_step_time
+            last_step_time = now
+
             lr = float(schedule(step))
             metric_strs = " ".join(
                 f"{k}={float(v):.4g}" for k, v in sorted(metrics.items())
             )
-            logger.info("step=%d lr=%.2e %s", step, lr, metric_strs)
+            logger.info(
+                "step=%d lr=%.2e tgt_entropy=%.2f sec/step=%.1f %s",
+                step,
+                lr,
+                tgt_entropy,
+                sec_per_step,
+                metric_strs,
+            )
             if is_main:
                 log_dict = {
                     "step": step,
                     "lr": lr,
                     "train/probe": float(metrics["probe_loss"]),
+                    "train/tgt_entropy": tgt_entropy,
+                    "train/sec_per_step": sec_per_step,
                 }
                 for k, v in metrics.items():
                     if k not in ("loss", "probe_loss"):
@@ -613,7 +631,7 @@ def worker_fn(cfg: Config):
                 loss = sum(losses.values())
                 test_loss += float(jnp.mean(loss))
                 n_test_batches += 1
-            acc = correct / total
+            acc = correct / max(1, total)
             test_loss /= max(1, n_test_batches)
             logger.info("step=%d test_acc=%.4f test_loss=%.4f", step, acc, test_loss)
             if is_main:
@@ -626,9 +644,8 @@ def worker_fn(cfg: Config):
         args=ocp.args.Composite(
             state=ocp.args.StandardSave(models | {"opt_state": opt_state}),
             metadata=ocp.args.JsonSave({"step": step}),
-            train_iter=grain.PyGrainCheckpointSave(train_iter),
         ),
-        force=True,  # Force save at end
+        force=True,
     )
     ckpt_mngr.wait_until_finished()
     if is_main:
@@ -658,7 +675,7 @@ def cli(cfg: Config):
     cfgs_with_ids: list[Config] = []
     for c in cfgs:
         if not c.run_id:
-            run_id = wandb_util.generate_id()
+            run_id = wandb.util.generate_id()
             c = dataclasses.replace(c, run_id=run_id)
             logger.info("Assigned wandb run id: %s", run_id)
         cfgs_with_ids.append(c)
@@ -686,9 +703,10 @@ def cli(cfg: Config):
 
     executor = submitit.SlurmExecutor(folder=base.log_to)
     # OSC allocates ~10GB RAM per CPU, so request enough CPUs for desired memory
-    n_cpus = base.n_workers
-    if base.mem_gb > 0 and base.mem_gb // 10 > n_cpus:
-        n_cpus = base.mem_gb // 10
+    n_cpus = (
+        max(base.mem_gb // 10, base.n_workers) if base.mem_gb > 0 else base.n_workers
+    )
+    if n_cpus > base.n_workers:
         logger.info("Requesting %d CPUs to get %dGB RAM", n_cpus, base.mem_gb)
     executor.update_parameters(
         time=int(base.n_hours * 60),
