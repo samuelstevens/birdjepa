@@ -75,11 +75,6 @@ impl ArrowReader {
             label_col_idx,
         })
     }
-
-    /// Returns the next sample index (for tracking cumulative count across files).
-    pub fn next_index(&self) -> i64 {
-        self.sample_idx
-    }
 }
 
 impl Iterator for ArrowReader {
@@ -141,11 +136,11 @@ fn extract_sample(
     let bytes_array = bytes_idx
         .as_any()
         .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| ArrowError::InvalidColumnType("audio.bytes (expected binary)".to_string()))?;
+        .ok_or_else(|| {
+            ArrowError::InvalidColumnType("audio.bytes (expected binary)".to_string())
+        })?;
 
-    let audio_bytes = bytes_array
-        .value(row)
-        .to_vec();
+    let audio_bytes = bytes_array.value(row).to_vec();
 
     // Label column
     let label_col = batch.column(label_col);
@@ -171,15 +166,4 @@ fn extract_sample(
         label,
         index,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_arrow_reader() {
-        // This test requires actual Arrow files
-        // Skip if not available
-    }
 }

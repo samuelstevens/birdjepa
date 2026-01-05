@@ -8,37 +8,18 @@ use realfft::{RealFftPlanner, RealToComplex};
 use std::f32::consts::PI;
 use std::sync::Arc;
 
-/// Spectrogram configuration.
-#[derive(Clone)]
-pub struct SpectrogramConfig {
-    pub sample_rate: u32,
-    pub n_fft: usize,
-    pub hop_length: usize,
-    pub n_mels: usize,
-    pub f_min: f32,
-    pub f_max: f32,
-}
-
-impl Default for SpectrogramConfig {
-    fn default() -> Self {
-        Self {
-            sample_rate: 32000,
-            n_fft: 1024,
-            hop_length: 320, // 10ms at 32kHz
-            n_mels: 128,
-            f_min: 0.0,
-            f_max: 16000.0, // Nyquist for 32kHz
-        }
-    }
-}
+/// Sparse mel filter: (bin_index, weight) pairs for non-zero weights.
+type SparseMelFilter = Vec<(usize, f32)>;
 
 /// Precomputed spectrogram transform.
 #[pyclass]
 pub struct SpectrogramTransform {
-    config: SpectrogramConfig,
+    n_fft: usize,
+    hop_length: usize,
+    n_mels: usize,
     fft: Arc<dyn RealToComplex<f32>>,
     window: Vec<f32>,
-    mel_filterbank: Vec<Vec<f32>>, // [n_mels, n_fft/2 + 1]
+    mel_filterbank: Vec<SparseMelFilter>,
 }
 
 #[pymethods]
@@ -53,15 +34,7 @@ impl SpectrogramTransform {
         f_min: f32,
         f_max: f32,
     ) -> Self {
-        let config = SpectrogramConfig {
-            sample_rate,
-            n_fft,
-            hop_length,
-            n_mels,
-            f_min,
-            f_max,
-        };
-        Self::new(config)
+        Self::new(sample_rate, n_fft, hop_length, n_mels, f_min, f_max)
     }
 
     /// Compute log-mel spectrogram from waveform.
@@ -83,26 +56,29 @@ impl SpectrogramTransform {
 }
 
 impl SpectrogramTransform {
-    pub fn new(config: SpectrogramConfig) -> Self {
+    pub fn new(
+        sample_rate: u32,
+        n_fft: usize,
+        hop_length: usize,
+        n_mels: usize,
+        f_min: f32,
+        f_max: f32,
+    ) -> Self {
         let mut planner = RealFftPlanner::new();
-        let fft = planner.plan_fft_forward(config.n_fft);
+        let fft = planner.plan_fft_forward(n_fft);
 
         // Hann window
-        let window: Vec<f32> = (0..config.n_fft)
-            .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / config.n_fft as f32).cos()))
+        let window: Vec<f32> = (0..n_fft)
+            .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / n_fft as f32).cos()))
             .collect();
 
         // Mel filterbank
-        let mel_filterbank = create_mel_filterbank(
-            config.sample_rate,
-            config.n_fft,
-            config.n_mels,
-            config.f_min,
-            config.f_max,
-        );
+        let mel_filterbank = create_mel_filterbank(sample_rate, n_fft, n_mels, f_min, f_max);
 
         Self {
-            config,
+            n_fft,
+            hop_length,
+            n_mels,
             fft,
             window,
             mel_filterbank,
@@ -110,36 +86,30 @@ impl SpectrogramTransform {
     }
 
     /// Compute log-mel spectrogram from waveform.
-    /// Input: mono audio samples at config.sample_rate
-    /// Output: [n_mels, n_frames] log-mel spectrogram
     pub fn transform(&self, samples: &[f32]) -> Vec<f32> {
-        let n_fft = self.config.n_fft;
-        let hop = self.config.hop_length;
-        let n_mels = self.config.n_mels;
-
-        // Number of frames
-        let n_frames = if samples.len() >= n_fft {
-            (samples.len() - n_fft) / hop + 1
+        let n_frames = if samples.len() >= self.n_fft {
+            (samples.len() - self.n_fft) / self.hop_length + 1
         } else {
             0
         };
 
         if n_frames == 0 {
-            return Vec::new(); // Empty vec reshapes to [n_mels, 0]
+            return Vec::new();
         }
 
-        let n_bins = n_fft / 2 + 1;
-        let mut spectrogram = vec![0.0f32; n_mels * n_frames];
+        let n_bins = self.n_fft / 2 + 1;
+        let mut spectrogram = vec![0.0f32; self.n_mels * n_frames];
 
-        // Scratch buffers
-        let mut input = vec![0.0f32; n_fft];
+        // Pre-allocated scratch buffers (reused across frames)
+        let mut input = vec![0.0f32; self.n_fft];
         let mut spectrum = self.fft.make_output_vec();
+        let mut power = vec![0.0f32; n_bins];
 
         for frame in 0..n_frames {
-            let start = frame * hop;
+            let start = frame * self.hop_length;
 
             // Apply window
-            for i in 0..n_fft {
+            for i in 0..self.n_fft {
                 input[i] = if start + i < samples.len() {
                     samples[start + i] * self.window[i]
                 } else {
@@ -152,16 +122,17 @@ impl SpectrogramTransform {
                 .process(&mut input, &mut spectrum)
                 .expect("FFT failed");
 
-            // Power spectrum
-            let power: Vec<f32> = spectrum.iter().map(|c| c.norm_sqr()).collect();
+            // Power spectrum (reuse buffer)
+            for (i, c) in spectrum.iter().enumerate() {
+                power[i] = c.norm_sqr();
+            }
 
-            // Apply mel filterbank
+            // Apply sparse mel filterbank
             for (mel_idx, mel_filter) in self.mel_filterbank.iter().enumerate() {
                 let mut mel_energy = 0.0f32;
-                for (bin, &weight) in mel_filter.iter().enumerate().take(n_bins) {
+                for &(bin, weight) in mel_filter {
                     mel_energy += power[bin] * weight;
                 }
-                // Log with floor to avoid -inf
                 spectrogram[mel_idx * n_frames + frame] = (mel_energy.max(1e-10)).ln();
             }
         }
@@ -171,23 +142,23 @@ impl SpectrogramTransform {
 
     /// Get output shape for a given input length.
     pub fn output_shape(&self, n_samples: usize) -> (usize, usize) {
-        let n_frames = if n_samples >= self.config.n_fft {
-            (n_samples - self.config.n_fft) / self.config.hop_length + 1
+        let n_frames = if n_samples >= self.n_fft {
+            (n_samples - self.n_fft) / self.hop_length + 1
         } else {
             0
         };
-        (self.config.n_mels, n_frames)
+        (self.n_mels, n_frames)
     }
 }
 
-/// Create mel filterbank matrix.
+/// Create sparse mel filterbank (only store non-zero weights).
 fn create_mel_filterbank(
     sample_rate: u32,
     n_fft: usize,
     n_mels: usize,
     f_min: f32,
     f_max: f32,
-) -> Vec<Vec<f32>> {
+) -> Vec<SparseMelFilter> {
     let n_bins = n_fft / 2 + 1;
 
     // Convert Hz to Mel
@@ -211,27 +182,37 @@ fn create_mel_filterbank(
         .map(|&hz| ((n_fft as f32 * hz / sample_rate as f32).round() as usize).min(n_bins - 1))
         .collect();
 
-    // Create filterbank
-    let mut filterbank = vec![vec![0.0f32; n_bins]; n_mels];
+    // Create sparse filterbank
+    let mut filterbank = Vec::with_capacity(n_mels);
 
     for m in 0..n_mels {
         let left = bin_points[m];
         let center = bin_points[m + 1];
         let right = bin_points[m + 2];
 
+        let mut filter = Vec::with_capacity(right - left + 1);
+
         // Rising edge
         for k in left..center {
             if center > left {
-                filterbank[m][k] = (k - left) as f32 / (center - left) as f32;
+                let weight = (k - left) as f32 / (center - left) as f32;
+                if weight > 0.0 {
+                    filter.push((k, weight));
+                }
             }
         }
 
         // Falling edge
         for k in center..=right {
             if right > center {
-                filterbank[m][k] = (right - k) as f32 / (right - center) as f32;
+                let weight = (right - k) as f32 / (right - center) as f32;
+                if weight > 0.0 {
+                    filter.push((k, weight));
+                }
             }
         }
+
+        filterbank.push(filter);
     }
 
     filterbank
@@ -243,15 +224,7 @@ mod tests {
 
     #[test]
     fn test_spectrogram_output_shape() {
-        let config = SpectrogramConfig {
-            sample_rate: 32000,
-            n_fft: 1024,
-            hop_length: 320,
-            n_mels: 128,
-            f_min: 0.0,
-            f_max: 16000.0,
-        };
-        let transform = SpectrogramTransform::new(config);
+        let transform = SpectrogramTransform::new(32000, 1024, 320, 128, 0.0, 16000.0);
 
         // 5 seconds at 32kHz = 160000 samples
         let (n_mels, n_frames) = transform.output_shape(160000);
@@ -262,8 +235,7 @@ mod tests {
 
     #[test]
     fn test_spectrogram_basic() {
-        let config = SpectrogramConfig::default();
-        let transform = SpectrogramTransform::new(config);
+        let transform = SpectrogramTransform::new(32000, 1024, 320, 128, 0.0, 16000.0);
 
         // Generate a simple sine wave
         let samples: Vec<f32> = (0..32000)

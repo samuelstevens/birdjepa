@@ -1,169 +1,225 @@
-//! Shuffle buffer for streaming data with bounded memory.
+//! Concurrent shuffle buffer for the pipelined loader.
 //!
-//! Implements reservoir-style shuffling: fill buffer, then randomly replace
-//! elements as new samples arrive.
+//! Thread-safe buffer with configurable minimum fill level for entropy.
+//! Workers push, main thread pops random samples.
 
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use std::collections::VecDeque;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
-/// A shuffle buffer that maintains bounded memory while providing randomness.
-///
-/// Algorithm:
-/// 1. Fill buffer to capacity
-/// 2. For each new sample, randomly swap it with an existing sample and yield the evicted one
-/// 3. When input exhausted, shuffle remaining buffer and drain
-pub struct ShuffleBuffer<T> {
-    buffer: Vec<T>,
+/// Thread-safe shuffle buffer with blocking push/pop and minimum fill level.
+pub struct ConcurrentShuffleBuffer<T> {
+    inner: Mutex<ShuffleInner<T>>,
     capacity: usize,
+    min_size: usize,
+    not_full: Condvar,
+    ready: Condvar,
+}
+
+struct ShuffleInner<T> {
+    buffer: Vec<T>,
     rng: StdRng,
-    pending_output: VecDeque<T>,
+    closed: bool,
 }
 
-impl<T> ShuffleBuffer<T> {
-    pub fn new(capacity: usize, seed: u64) -> Self {
+impl<T> ConcurrentShuffleBuffer<T> {
+    /// Create a new shuffle buffer.
+    ///
+    /// - `capacity`: Maximum buffer size. Push blocks when full.
+    /// - `min_size`: Minimum samples before pop returns. Use 0 for no minimum.
+    /// - `seed`: RNG seed for deterministic shuffling.
+    pub fn new(capacity: usize, min_size: usize, seed: u64) -> Self {
+        assert!(capacity > 0, "capacity must be > 0");
+        assert!(min_size <= capacity, "min_size must be <= capacity");
         Self {
-            buffer: Vec::with_capacity(capacity),
+            inner: Mutex::new(ShuffleInner {
+                buffer: Vec::with_capacity(capacity),
+                rng: StdRng::seed_from_u64(seed),
+                closed: false,
+            }),
             capacity,
-            rng: StdRng::seed_from_u64(seed),
-            pending_output: VecDeque::new(),
+            min_size,
+            not_full: Condvar::new(),
+            ready: Condvar::new(),
         }
     }
 
-    /// Reset the buffer for a new epoch with a new seed.
-    pub fn reset(&mut self, seed: u64) {
-        self.buffer.clear();
-        self.rng = StdRng::seed_from_u64(seed);
-        self.pending_output.clear();
-    }
-
-    /// Push a sample into the buffer.
-    /// Returns a sample if one was evicted (buffer was full).
-    pub fn push(&mut self, sample: T) -> Option<T> {
-        if self.buffer.len() < self.capacity {
-            self.buffer.push(sample);
-            None
-        } else {
-            // Buffer full, randomly swap
-            let idx = self.rng.gen_range(0..self.capacity);
-            let evicted = std::mem::replace(&mut self.buffer[idx], sample);
-            Some(evicted)
+    /// Push a sample. Blocks if buffer is at capacity.
+    /// Returns false if buffer is closed (shutdown).
+    pub fn push(&self, sample: T) -> bool {
+        let mut guard = self.inner.lock().unwrap();
+        loop {
+            if guard.closed {
+                return false;
+            }
+            if guard.buffer.len() < self.capacity {
+                guard.buffer.push(sample);
+                // Notify if we have enough samples (or min_size is 0)
+                if self.min_size == 0 || guard.buffer.len() >= self.min_size {
+                    self.ready.notify_one();
+                }
+                return true;
+            }
+            let (new_guard, _) = self
+                .not_full
+                .wait_timeout(guard, Duration::from_millis(100))
+                .unwrap();
+            guard = new_guard;
         }
     }
 
-    /// Signal that input is exhausted. Shuffle remaining buffer.
-    pub fn finish(&mut self) {
-        self.buffer.shuffle(&mut self.rng);
-        self.pending_output.extend(self.buffer.drain(..));
-    }
+    /// Try to pop a random sample with timeout.
+    /// Returns Some(sample) if available, None if timed out or closed+empty.
+    /// Use is_closed() to distinguish timeout vs closed.
+    pub fn try_pop(&self, timeout: Duration) -> Option<T> {
+        let mut guard = self.inner.lock().unwrap();
 
-    /// Get the next output sample (from pending_output after finish).
-    pub fn pop(&mut self) -> Option<T> {
-        self.pending_output.pop_front()
-    }
-
-    /// Check if there are pending outputs.
-    pub fn has_pending(&self) -> bool {
-        !self.pending_output.is_empty()
-    }
-
-    /// Current number of samples in buffer.
-    pub fn len(&self) -> usize {
-        self.buffer.len() + self.pending_output.len()
-    }
-
-    /// Is the buffer empty?
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty() && self.pending_output.is_empty()
-    }
-}
-
-/// A shuffled iterator that wraps an input iterator with a shuffle buffer.
-pub struct ShuffledIter<I, T>
-where
-    I: Iterator<Item = T>,
-{
-    input: I,
-    buffer: ShuffleBuffer<T>,
-    input_exhausted: bool,
-}
-
-impl<I, T> ShuffledIter<I, T>
-where
-    I: Iterator<Item = T>,
-{
-    pub fn new(input: I, buffer_size: usize, seed: u64) -> Self {
-        Self {
-            input,
-            buffer: ShuffleBuffer::new(buffer_size, seed),
-            input_exhausted: false,
-        }
-    }
-}
-
-impl<I, T> Iterator for ShuffledIter<I, T>
-where
-    I: Iterator<Item = T>,
-{
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // First, try to get from pending output
-        if let Some(sample) = self.buffer.pop() {
+        // First try without waiting
+        if let Some(sample) = self.try_pop_inner(&mut guard) {
             return Some(sample);
         }
 
-        // If input exhausted and buffer drained, we're done
-        if self.input_exhausted {
+        if guard.closed {
             return None;
         }
 
-        // Try to push from input until we get an eviction
-        loop {
-            match self.input.next() {
-                Some(sample) => {
-                    if let Some(evicted) = self.buffer.push(sample) {
-                        return Some(evicted);
-                    }
-                    // Keep filling buffer
-                }
-                None => {
-                    // Input exhausted, drain buffer
-                    self.input_exhausted = true;
-                    self.buffer.finish();
-                    return self.buffer.pop();
-                }
-            }
+        // Wait once with timeout
+        let (mut new_guard, _) = self.ready.wait_timeout(guard, timeout).unwrap();
+
+        // Try again after wait
+        self.try_pop_inner(&mut new_guard)
+    }
+
+    /// Internal helper: try to pop if conditions are met.
+    fn try_pop_inner(&self, guard: &mut std::sync::MutexGuard<ShuffleInner<T>>) -> Option<T> {
+        let len = guard.buffer.len();
+
+        // Can pop if: min_size is 0 and we have data, OR we have >= min_size
+        let can_pop = len > 0 && (self.min_size == 0 || len >= self.min_size);
+        if can_pop {
+            let idx = guard.rng.gen_range(0..len);
+            let sample = guard.buffer.swap_remove(idx);
+            self.not_full.notify_one();
+            return Some(sample);
         }
+
+        // Shutdown: drain remaining regardless of min_size
+        if guard.closed && len > 0 {
+            let idx = guard.rng.gen_range(0..len);
+            let sample = guard.buffer.swap_remove(idx);
+            self.not_full.notify_one();
+            return Some(sample);
+        }
+
+        None
+    }
+
+    /// Check if buffer is closed.
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap().closed
+    }
+
+    /// Close the buffer. Wakes all waiters, causes push() to return false.
+    pub fn close(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.closed = true;
+        self.not_full.notify_all();
+        self.ready.notify_all();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
-    fn test_shuffle_buffer_basic() {
-        let input: Vec<i32> = (0..100).collect();
-        let shuffled: Vec<i32> = ShuffledIter::new(input.into_iter(), 10, 42).collect();
+    fn test_basic_push_pop() {
+        let buffer = ConcurrentShuffleBuffer::new(10, 0, 42);
 
-        assert_eq!(shuffled.len(), 100);
-        // Should contain all elements
-        let mut sorted = shuffled.clone();
-        sorted.sort();
-        assert_eq!(sorted, (0..100).collect::<Vec<_>>());
-        // Should be shuffled (very unlikely to be in order)
-        assert_ne!(shuffled, (0..100).collect::<Vec<_>>());
+        assert!(buffer.push(1));
+        assert!(buffer.push(2));
+        assert!(buffer.push(3));
+
+        let mut popped = vec![];
+        while let Some(v) = buffer.try_pop(Duration::from_millis(10)) {
+            popped.push(v);
+        }
+
+        popped.sort();
+        assert_eq!(popped, vec![1, 2, 3]);
     }
 
     #[test]
-    fn test_shuffle_deterministic() {
-        let input1: Vec<i32> = (0..100).collect();
-        let input2: Vec<i32> = (0..100).collect();
+    fn test_min_size() {
+        let buffer = ConcurrentShuffleBuffer::new(10, 5, 42);
 
-        let shuffled1: Vec<i32> = ShuffledIter::new(input1.into_iter(), 10, 42).collect();
-        let shuffled2: Vec<i32> = ShuffledIter::new(input2.into_iter(), 10, 42).collect();
+        // Push 3 samples (below min_size)
+        for i in 0..3 {
+            buffer.push(i);
+        }
 
-        assert_eq!(shuffled1, shuffled2);
+        // Should timeout (not enough samples)
+        assert!(buffer.try_pop(Duration::from_millis(10)).is_none());
+
+        // Push 2 more (now at min_size)
+        buffer.push(3);
+        buffer.push(4);
+
+        // Should succeed
+        assert!(buffer.try_pop(Duration::from_millis(10)).is_some());
+    }
+
+    #[test]
+    fn test_close() {
+        let buffer = Arc::new(ConcurrentShuffleBuffer::new(10, 5, 42));
+
+        // Push some samples
+        for i in 0..3 {
+            buffer.push(i);
+        }
+
+        // Close buffer
+        buffer.close();
+
+        // Should drain remaining (ignoring min_size)
+        let mut count = 0;
+        while buffer.try_pop(Duration::from_millis(10)).is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+
+        // Push should return false
+        assert!(!buffer.push(99));
+    }
+
+    #[test]
+    fn test_concurrent() {
+        // Use min_size=0 since we just test concurrent push/pop, not min_size behavior
+        let buffer = Arc::new(ConcurrentShuffleBuffer::new(100, 0, 42));
+        let buffer2 = Arc::clone(&buffer);
+
+        // Producer thread
+        let producer = thread::spawn(move || {
+            for i in 0..50 {
+                buffer2.push(i);
+            }
+        });
+
+        // Consumer: wait for samples
+        thread::sleep(Duration::from_millis(50));
+        let mut popped = vec![];
+        while popped.len() < 50 {
+            if let Some(v) = buffer.try_pop(Duration::from_millis(100)) {
+                popped.push(v);
+            }
+        }
+
+        producer.join().unwrap();
+
+        popped.sort();
+        assert_eq!(popped, (0..50).collect::<Vec<_>>());
     }
 }

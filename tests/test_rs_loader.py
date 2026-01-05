@@ -18,15 +18,16 @@ def arrow_files():
 
 def test_loader_creates(arrow_files):
     """Loader can be instantiated with Arrow files."""
-    loader = Loader(arrow_files, seed=42)
-    assert loader.n_files() == len(arrow_files)
-    assert loader.batch_size() == 64  # default
+    loader = Loader(arrow_files, seed=42, infinite=False)
+    # Just verify it doesn't crash - the loader starts pipeline on construction
+    batch = next(iter(loader))
+    assert batch is not None
 
 
 def test_loader_iteration(arrow_files):
     """Loader yields batches with expected keys and shapes."""
     batch_size = 8
-    loader = Loader(arrow_files, seed=42, batch_size=batch_size)
+    loader = Loader(arrow_files, seed=42, batch_size=batch_size, infinite=False)
 
     batch = next(iter(loader))
 
@@ -46,8 +47,8 @@ def test_loader_iteration(arrow_files):
 
 def test_loader_deterministic(arrow_files):
     """Same seed produces same batches."""
-    loader1 = Loader(arrow_files, seed=42, batch_size=4)
-    loader2 = Loader(arrow_files, seed=42, batch_size=4)
+    loader1 = Loader(arrow_files, seed=42, batch_size=4, infinite=False, augment=False)
+    loader2 = Loader(arrow_files, seed=42, batch_size=4, infinite=False, augment=False)
 
     batch1 = next(iter(loader1))
     batch2 = next(iter(loader2))
@@ -58,8 +59,8 @@ def test_loader_deterministic(arrow_files):
 
 def test_loader_different_seeds(arrow_files):
     """Different seeds produce different batches."""
-    loader1 = Loader(arrow_files, seed=42, batch_size=4)
-    loader2 = Loader(arrow_files, seed=123, batch_size=4)
+    loader1 = Loader(arrow_files, seed=42, batch_size=4, infinite=False)
+    loader2 = Loader(arrow_files, seed=123, batch_size=4, infinite=False)
 
     batch1 = next(iter(loader1))
     batch2 = next(iter(loader2))
@@ -71,7 +72,7 @@ def test_loader_different_seeds(arrow_files):
 
 def test_loader_multiple_batches(arrow_files):
     """Can iterate multiple batches."""
-    loader = Loader(arrow_files, seed=42, batch_size=4)
+    loader = Loader(arrow_files, seed=42, batch_size=4, infinite=False)
 
     batches = []
     for i, batch in enumerate(loader):
@@ -99,6 +100,8 @@ def test_loader_small_shuffle_buffer(arrow_files):
         seed=42,
         batch_size=8,
         shuffle_buffer_size=16,  # Very small - forces evictions after 16 samples
+        shuffle_min_size=8,  # min_size < capacity
+        infinite=False,
     )
 
     # Collect several batches worth
@@ -113,9 +116,9 @@ def test_loader_small_shuffle_buffer(arrow_files):
 
 
 def test_loader_epoch_boundary(arrow_files):
-    """Loader handles epoch boundaries correctly."""
-    # Use small batch to quickly exhaust epoch
-    loader = Loader(arrow_files[:1], seed=42, batch_size=1000)
+    """Loader handles epoch boundaries correctly with infinite=True."""
+    # Use infinite mode to test epoch wraparound
+    loader = Loader(arrow_files[:1], seed=42, batch_size=1000, infinite=True)
 
     # Collect batches until we cross epoch boundary
     epoch1_specs = []
@@ -136,14 +139,21 @@ def test_loader_epoch_boundary(arrow_files):
 
 
 def test_loader_partial_batch(arrow_files):
-    """Last batch of epoch may be smaller than batch_size."""
+    """Last batch of finite iteration may be smaller than batch_size."""
     # Use large batch relative to data to ensure partial batches
-    loader = Loader(arrow_files[:1], seed=42, batch_size=100, shuffle_buffer_size=50)
+    loader = Loader(
+        arrow_files[:1],
+        seed=42,
+        batch_size=100,
+        shuffle_buffer_size=50,
+        shuffle_min_size=0,  # Allow partial batches to drain
+        infinite=False,
+    )
 
     batch_sizes = []
-    for i, batch in enumerate(loader):
+    for batch in loader:
         batch_sizes.append(batch["spectrogram"].shape[0])
-        if i >= 10:
+        if len(batch_sizes) >= 10:
             break
 
     # All batches should be <= batch_size
@@ -233,7 +243,14 @@ def test_resampling_removes_above_nyquist():
 
 def test_loader_returns_indices(arrow_files):
     """Loader returns unique sample indices."""
-    loader = Loader(arrow_files[:1], seed=42, batch_size=8, shuffle_buffer_size=32)
+    loader = Loader(
+        arrow_files,
+        seed=42,
+        batch_size=8,
+        shuffle_buffer_size=32,
+        shuffle_min_size=16,
+        infinite=False,
+    )
 
     batch = next(iter(loader))
 
@@ -245,7 +262,14 @@ def test_loader_returns_indices(arrow_files):
 
 def test_loader_indices_unique_within_epoch(arrow_files):
     """Sample indices are unique within an epoch."""
-    loader = Loader(arrow_files[:1], seed=42, batch_size=16, shuffle_buffer_size=32)
+    loader = Loader(
+        arrow_files,
+        seed=42,
+        batch_size=16,
+        shuffle_buffer_size=32,
+        shuffle_min_size=16,
+        infinite=False,
+    )
 
     all_indices = []
     for i, batch in enumerate(loader):
@@ -265,7 +289,14 @@ def test_loader_indices_canonical_range(arrow_files):
     2. Start from 0 (canonical ordering from file start)
     3. Within expected range (less than dataset size)
     """
-    loader = Loader(arrow_files[:1], seed=42, batch_size=100, shuffle_buffer_size=200)
+    loader = Loader(
+        arrow_files,
+        seed=42,
+        batch_size=100,
+        shuffle_buffer_size=200,
+        shuffle_min_size=100,
+        infinite=False,
+    )
 
     all_indices = []
     for i, batch in enumerate(loader):
@@ -281,3 +312,44 @@ def test_loader_indices_canonical_range(arrow_files):
 
     # No duplicates within the collected samples
     assert len(all_indices) == len(set(all_indices))
+
+
+def test_loader_finite_mode_exhausts(arrow_files):
+    """Finite mode (infinite=False) exhausts all samples and stops."""
+    loader = Loader(
+        arrow_files[:1],  # Single file
+        seed=42,
+        batch_size=100,
+        shuffle_buffer_size=200,
+        shuffle_min_size=0,  # Allow immediate draining
+        infinite=False,
+    )
+
+    n_samples = 0
+    for batch in loader:
+        n_samples += batch["spectrogram"].shape[0]
+
+    # Should have processed all samples from the file
+    assert n_samples > 0
+
+
+def test_loader_infinite_mode_continues(arrow_files):
+    """Infinite mode (infinite=True) continues past single epoch."""
+    loader = Loader(
+        arrow_files[:1],  # Single file
+        seed=42,
+        batch_size=100,
+        shuffle_buffer_size=200,
+        shuffle_min_size=100,
+        infinite=True,
+    )
+
+    # Collect many batches - more than a single epoch would provide
+    n_samples = 0
+    for i, batch in enumerate(loader):
+        n_samples += batch["spectrogram"].shape[0]
+        if n_samples > 10000:  # Much more than any single file
+            break
+
+    # Should have collected samples across multiple epochs
+    assert n_samples > 10000

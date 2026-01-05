@@ -1,91 +1,117 @@
-//! Main data loader that ties everything together.
+//! Pipelined data loader.
 //!
-//! Provides the Python-facing Loader class that:
-//! 1. Reads Arrow files sequentially
-//! 2. Shuffles samples in a bounded buffer
-//! 3. Decodes audio in parallel (Rayon)
-//! 4. Computes spectrograms in parallel
-//! 5. Assembles batches and returns owned NumPy arrays
+//! Architecture:
+//! I/O Thread -> Raw Channel -> Worker Threads -> Shuffle Buffer -> Main Thread
+//!
+//! - I/O thread reads Arrow files sequentially from GPFS
+//! - Workers decode audio, compute spectrograms in parallel
+//! - Shuffle buffer provides randomness with configurable minimum fill
+//! - Main thread assembles batches and returns to Python
 
-use crate::arrow::{count_samples, ArrowError, ArrowReader, Sample};
-use crate::decode::{decode_audio, DecodeError};
-use crate::shuffle::ShuffleBuffer;
-use crate::spectrogram::{SpectrogramConfig, SpectrogramTransform};
+use crate::arrow::{count_samples, ArrowReader, Sample};
+use crate::decode::decode_audio;
+use crate::shuffle::ConcurrentShuffleBuffer;
+use crate::spectrogram::SpectrogramTransform;
 
+use crossbeam::channel::{bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender};
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::types::{PyDict, PyDictMethods};
 use pyo3::{pyclass, pymethods, Bound, PyResult, Python};
-use rayon::prelude::*;
-use std::sync::Mutex;
-use thiserror::Error;
+use rand::prelude::*;
+use rand::rngs::StdRng;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-#[derive(Error, Debug)]
-pub enum LoaderError {
-    #[error("Arrow error: {0}")]
-    Arrow(#[from] ArrowError),
-    #[error("Decode error: {0}")]
-    Decode(#[from] DecodeError),
-    #[error("Python error: {0}")]
-    Python(#[from] pyo3::PyErr),
-    #[error("epoch exhausted")]
-    Exhausted,
-}
-
-/// Internal state for iteration.
-struct LoaderState {
-    // Current file index
-    file_idx: usize,
-    // Current Arrow reader (if any)
-    reader: Option<ArrowReader>,
-    // Shuffle buffer
-    shuffle_buffer: ShuffleBuffer<Sample>,
-    // Whether we've finished all files
-    files_exhausted: bool,
-    // Epoch seed
+/// Raw sample from Arrow (bytes not yet decoded).
+struct RawSample {
+    audio_bytes: Vec<u8>,
+    label: i64,
+    index: i64,
     seed: u64,
-    // File order for this epoch (shuffled)
-    file_order: Vec<usize>,
 }
 
-/// Python-facing data loader.
+/// Processed sample ready for batching.
+struct ProcessedSample {
+    spectrogram: Vec<f32>,
+    label: i64,
+    index: i64,
+}
+
+/// Python-facing pipelined data loader.
 #[pyclass]
 pub struct Loader {
-    arrow_files: Vec<String>,
-    /// Canonical start index for each file (stable across epochs).
-    file_offsets: Vec<i64>,
+    // Config
     batch_size: usize,
-    sample_rate: u32,
     clip_samples: usize,
-    state: Mutex<LoaderState>,
-    spectrogram: SpectrogramTransform,
+    spectrogram: Arc<SpectrogramTransform>,
+
+    // Pipeline state
+    shuffle_buffer: Arc<ConcurrentShuffleBuffer<ProcessedSample>>,
+    shutdown: Arc<AtomicBool>,
+    io_handle: Option<JoinHandle<()>>,
+    worker_handles: Vec<JoinHandle<()>>,
+    monitor_handle: Option<JoinHandle<()>>,
 }
 
 #[pymethods]
 impl Loader {
     #[new]
-    #[pyo3(signature = (arrow_files, seed=0, batch_size=64, shuffle_buffer_size=10000, sample_rate=32000, clip_seconds=5.0, n_mels=128, n_fft=1024, hop_length=320, n_threads=8))]
+    #[pyo3(signature = (
+        arrow_files,
+        seed = 0,
+        batch_size = 64,
+        shuffle_buffer_size = 10000,
+        shuffle_min_size = 8000,
+        sample_rate = 32000,
+        clip_seconds = 5.0,
+        n_mels = 128,
+        n_fft = 1024,
+        hop_length = 320,
+        n_workers = 8,
+        raw_channel_size = 256,
+        infinite = true,
+        augment = true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         arrow_files: Vec<String>,
         seed: u64,
         batch_size: usize,
         shuffle_buffer_size: usize,
+        shuffle_min_size: usize,
         sample_rate: u32,
         clip_seconds: f32,
         n_mels: usize,
         n_fft: usize,
         hop_length: usize,
-        n_threads: usize,
+        n_workers: usize,
+        raw_channel_size: usize,
+        infinite: bool,
+        augment: bool,
     ) -> PyResult<Self> {
         if arrow_files.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "arrow_files must not be empty",
             ));
         }
+        if shuffle_buffer_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "shuffle_buffer_size must be > 0",
+            ));
+        }
+        if raw_channel_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "raw_channel_size must be > 0",
+            ));
+        }
 
         let clip_samples = (clip_seconds * sample_rate as f32) as usize;
         let n_files = arrow_files.len();
+        let f_max = sample_rate as f32 / 2.0;
 
-        // Pre-compute file offsets for stable cross-epoch indices
+        // Pre-compute file offsets for globally unique indices
         let mut file_offsets = Vec::with_capacity(n_files);
         let mut offset: i64 = 0;
         for path in &arrow_files {
@@ -101,152 +127,178 @@ impl Loader {
             }
         }
 
-        let spec_config = SpectrogramConfig {
-            sample_rate,
-            n_fft,
-            hop_length,
-            n_mels,
-            f_min: 0.0,
-            f_max: sample_rate as f32 / 2.0,
-        };
+        let spectrogram = Arc::new(SpectrogramTransform::new(
+            sample_rate, n_fft, hop_length, n_mels, 0.0, f_max,
+        ));
 
-        // Configure rayon thread pool
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n_threads)
-            .build_global()
-            .ok(); // Ignore error if already initialized
-
-        let state = LoaderState {
-            file_idx: 0,
-            reader: None,
-            shuffle_buffer: ShuffleBuffer::new(shuffle_buffer_size, seed),
-            files_exhausted: false,
+        let shuffle_buffer = Arc::new(ConcurrentShuffleBuffer::new(
+            shuffle_buffer_size,
+            shuffle_min_size,
             seed,
-            file_order: (0..n_files).collect(),
+        ));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let mut loader = Self {
+            batch_size,
+            clip_samples,
+            spectrogram: Arc::clone(&spectrogram),
+            shuffle_buffer: Arc::clone(&shuffle_buffer),
+            shutdown: Arc::clone(&shutdown),
+            io_handle: None,
+            worker_handles: Vec::new(),
+            monitor_handle: None,
         };
 
-        let loader = Self {
+        loader.start_pipeline(
             arrow_files,
             file_offsets,
-            batch_size,
+            seed,
             sample_rate,
-            clip_samples,
-            state: Mutex::new(state),
-            spectrogram: SpectrogramTransform::new(spec_config),
-        };
+            n_workers,
+            raw_channel_size,
+            infinite,
+            augment,
+        );
 
-        loader.reset(seed)?;
         Ok(loader)
-    }
-
-    /// Reset for a new epoch with a new seed.
-    fn reset(&self, seed: u64) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
-
-        // Shuffle file order
-        use rand::prelude::*;
-        use rand::rngs::StdRng;
-        let mut rng = StdRng::seed_from_u64(seed);
-        state.file_order = (0..self.arrow_files.len()).collect();
-        state.file_order.shuffle(&mut rng);
-
-        state.file_idx = 0;
-        state.reader = None;
-        state.shuffle_buffer.reset(seed);
-        state.files_exhausted = false;
-        state.seed = seed;
-
-        Ok(())
-    }
-
-    /// Number of Arrow files.
-    fn n_files(&self) -> usize {
-        self.arrow_files.len()
-    }
-
-    /// Batch size.
-    fn batch_size(&self) -> usize {
-        self.batch_size
     }
 
     fn __iter__(slf: pyo3::PyRef<'_, Self>) -> pyo3::PyRef<'_, Self> {
         slf
     }
 
-    /// Infinite iterator: auto-resets with incremented seed when epoch ends.
-    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        match self.next_batch(py) {
-            Ok(batch) => Ok(batch),
-            Err(LoaderError::Exhausted) => {
-                // Epoch done, auto-reset with next seed
-                let new_seed = {
-                    let state = self.state.lock().unwrap();
-                    state.seed.wrapping_add(1)
-                };
-                self.reset(new_seed)?;
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let mut samples = Vec::with_capacity(self.batch_size);
 
-                // Try once more - if still exhausted, data is broken
-                self.next_batch(py).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "error after reset: {e}"
-                    ))
-                })
+        while samples.len() < self.batch_size {
+            // Release GIL for blocking operation
+            let sample = py.detach(|| {
+                self.shuffle_buffer.try_pop(Duration::from_millis(100))
+            });
+
+            match sample {
+                Some(s) => samples.push(s),
+                None => {
+                    if self.shuffle_buffer.is_closed() {
+                        break; // Buffer closed and empty
+                    }
+                    // Timeout - check for Python signals (Ctrl-C)
+                    py.check_signals()?;
+                }
             }
-            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e}"))),
         }
+
+        if samples.is_empty() {
+            return Ok(None); // StopIteration
+        }
+
+        Ok(Some(self.assemble_batch(py, samples)?))
     }
 }
 
 impl Loader {
-    /// Get the next batch. Returns Exhausted when epoch is complete.
-    fn next_batch<'py>(&self, py: Python<'py>) -> Result<Bound<'py, PyDict>, LoaderError> {
-        // Retry loop - if all samples in a batch fail to decode, try again
-        // Limit retries to prevent infinite loop if data is corrupt
-        const MAX_RETRIES: usize = 10;
+    #[allow(clippy::too_many_arguments)]
+    fn start_pipeline(
+        &mut self,
+        arrow_files: Vec<String>,
+        file_offsets: Vec<i64>,
+        seed: u64,
+        sample_rate: u32,
+        n_workers: usize,
+        raw_channel_size: usize,
+        infinite: bool,
+        augment: bool,
+    ) {
+        let (raw_tx, raw_rx) = bounded(raw_channel_size);
 
-        for attempt in 0..MAX_RETRIES {
-            let samples = self.collect_batch_samples();
+        // Worker completion counter for monitor thread
+        let workers_alive = Arc::new(AtomicUsize::new(n_workers));
 
-            if samples.is_empty() {
-                return Err(LoaderError::Exhausted);
-            }
+        // Spawn I/O thread
+        self.io_handle = Some({
+            let shutdown = Arc::clone(&self.shutdown);
+            thread::spawn(move || {
+                io_thread_main(
+                    arrow_files,
+                    file_offsets,
+                    seed,
+                    raw_tx,
+                    shutdown,
+                    infinite,
+                    augment,
+                );
+            })
+        });
 
-            // Process samples in parallel
-            let processed: Vec<ProcessedSample> = samples
-                .par_iter()
-                .filter_map(|sample| self.process_sample(sample).ok())
-                .collect();
+        // Spawn workers
+        self.worker_handles = (0..n_workers)
+            .map(|_| {
+                let raw_rx = raw_rx.clone();
+                let shuffle_buffer = Arc::clone(&self.shuffle_buffer);
+                let spectrogram = Arc::clone(&self.spectrogram);
+                let shutdown = Arc::clone(&self.shutdown);
+                let workers_alive = Arc::clone(&workers_alive);
+                let clip_samples = self.clip_samples;
 
-            if !processed.is_empty() {
-                return self.assemble_batch(py, processed);
-            }
+                thread::spawn(move || {
+                    worker_thread_main(
+                        raw_rx,
+                        shuffle_buffer,
+                        spectrogram,
+                        sample_rate,
+                        clip_samples,
+                        shutdown,
+                        augment,
+                        workers_alive,
+                    );
+                })
+            })
+            .collect();
 
-            eprintln!(
-                "loader.rs: all {} samples in batch failed to decode (attempt {}/{})",
-                samples.len(),
-                attempt + 1,
-                MAX_RETRIES
-            );
-        }
+        // Spawn monitor thread: waits for workers to finish, then closes buffer
+        self.monitor_handle = Some({
+            let shuffle_buffer = Arc::clone(&self.shuffle_buffer);
+            let shutdown = Arc::clone(&self.shutdown);
 
-        panic!(
-            "Failed to decode any samples after {} attempts - data may be corrupt",
-            MAX_RETRIES
-        );
+            thread::spawn(move || {
+                // Wait for all workers to finish
+                while workers_alive.load(Ordering::SeqCst) > 0 {
+                    thread::sleep(Duration::from_millis(50));
+                    if shutdown.load(Ordering::Relaxed) {
+                        return; // Shutdown in progress, stop_pipeline will close buffer
+                    }
+                }
+
+                // All workers done - close buffer so main thread knows we're finished
+                shuffle_buffer.close();
+            })
+        });
     }
 
-    /// Assemble processed samples into a Python dict batch.
+    fn stop_pipeline(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.shuffle_buffer.close();
+
+        if let Some(h) = self.io_handle.take() {
+            let _ = h.join();
+        }
+        for h in self.worker_handles.drain(..) {
+            let _ = h.join();
+        }
+        if let Some(h) = self.monitor_handle.take() {
+            let _ = h.join();
+        }
+    }
+
     fn assemble_batch<'py>(
         &self,
         py: Python<'py>,
         processed: Vec<ProcessedSample>,
-    ) -> Result<Bound<'py, PyDict>, LoaderError> {
-        // Assemble into batch arrays
+    ) -> PyResult<Bound<'py, PyDict>> {
         let batch_size = processed.len();
         let (n_mels, n_frames) = self.spectrogram.output_shape(self.clip_samples);
         let spec_len = n_mels * n_frames;
 
-        // Build flat vectors
         let mut spec_data = vec![0.0f32; batch_size * spec_len];
         let mut label_data = Vec::with_capacity(batch_size);
         let mut index_data = Vec::with_capacity(batch_size);
@@ -259,14 +311,12 @@ impl Loader {
             index_data.push(sample.index);
         }
 
-        // Create numpy arrays from owned vecs
         let spectrogram = PyArray1::from_vec(py, spec_data)
             .reshape([batch_size, spec_len])
             .expect("reshape failed");
         let labels = PyArray1::from_vec(py, label_data);
         let indices = PyArray1::from_vec(py, index_data);
 
-        // Return as dict
         let dict = PyDict::new(py);
         dict.set_item("spectrogram", spectrogram)?;
         dict.set_item("labels", labels)?;
@@ -276,113 +326,210 @@ impl Loader {
 
         Ok(dict)
     }
+}
 
-    /// Collect enough samples for a batch from the shuffle buffer.
-    fn collect_batch_samples(&self) -> Vec<Sample> {
-        let mut state = self.state.lock().unwrap();
-        let mut samples = Vec::with_capacity(self.batch_size);
-
-        while samples.len() < self.batch_size {
-            // Try to get from shuffle buffer (draining phase after finish())
-            if let Some(sample) = state.shuffle_buffer.pop() {
-                samples.push(sample);
-                continue;
-            }
-
-            // Feed shuffle buffer and get evicted sample (filling/eviction phase)
-            match self.feed_shuffle_buffer(&mut state) {
-                Some(sample) => samples.push(sample),
-                None => {
-                    // Input exhausted - finish() was called, try pop() once more
-                    if let Some(sample) = state.shuffle_buffer.pop() {
-                        samples.push(sample);
-                        continue;
-                    }
-                    break; // Truly exhausted
-                }
-            }
-        }
-
-        samples
-    }
-
-    /// Feed one sample into the shuffle buffer.
-    /// Returns Some(evicted) when buffer is full, None when input exhausted.
-    fn feed_shuffle_buffer(&self, state: &mut LoaderState) -> Option<Sample> {
-        loop {
-            if let Some(ref mut reader) = state.reader {
-                match reader.next() {
-                    Some(Ok(sample)) => {
-                        if let Some(evicted) = state.shuffle_buffer.push(sample) {
-                            // Buffer full - return evicted sample
-                            return Some(evicted);
-                        }
-                        // Buffer not full yet, keep feeding
-                        continue;
-                    }
-                    Some(Err(e)) => {
-                        eprintln!("loader.rs: error reading Arrow file: {}", e);
-                        state.reader = None;
-                    }
-                    None => {
-                        // File exhausted
-                        state.reader = None;
-                    }
-                }
-            }
-
-            // Need to open next file
-            if state.file_idx >= self.arrow_files.len() {
-                // All files exhausted - drain remaining buffer
-                if !state.files_exhausted {
-                    state.files_exhausted = true;
-                    state.shuffle_buffer.finish();
-                }
-                return None; // pop() will drain pending_output
-            }
-
-            let file_idx = state.file_order[state.file_idx];
-            let path = &self.arrow_files[file_idx];
-            let start_index = self.file_offsets[file_idx];
-            state.file_idx += 1;
-
-            match ArrowReader::open(path, start_index) {
-                Ok(reader) => state.reader = Some(reader),
-                Err(e) => eprintln!("loader.rs: error opening {}: {}", path, e),
-            }
-        }
-    }
-
-    /// Process a single sample: decode + resample + truncate/pad + spectrogram.
-    fn process_sample(&self, sample: &Sample) -> Result<ProcessedSample, LoaderError> {
-        // Decode audio
-        let audio = decode_audio(&sample.audio_bytes)?;
-
-        // Resample to target rate
-        let mut waveform = audio.resample(self.sample_rate);
-
-        // Truncate or pad to clip_samples
-        if waveform.len() > self.clip_samples {
-            // Truncate from start (could randomize later)
-            waveform.truncate(self.clip_samples);
-        } else if waveform.len() < self.clip_samples {
-            // Pad with zeros
-            waveform.resize(self.clip_samples, 0.0);
-        }
-
-        // Compute spectrogram
-        let spectrogram = self.spectrogram.transform(&waveform);
-
-        Ok(ProcessedSample {
-            spectrogram,
-            label: sample.label,
-            index: sample.index,
-        })
+impl Drop for Loader {
+    fn drop(&mut self) {
+        self.stop_pipeline();
     }
 }
 
-struct ProcessedSample {
-    spectrogram: Vec<f32>,
-    label: i64,
-    index: i64,
+// --- I/O Thread ---
+
+fn io_thread_main(
+    arrow_files: Vec<String>,
+    file_offsets: Vec<i64>,
+    initial_seed: u64,
+    raw_tx: Sender<RawSample>,
+    shutdown: Arc<AtomicBool>,
+    infinite: bool,
+    augment: bool,
+) {
+    let mut epoch_seed = initial_seed;
+
+    loop {
+        // Shuffle file order for this pass
+        let mut file_order: Vec<usize> = (0..arrow_files.len()).collect();
+        file_order.shuffle(&mut StdRng::seed_from_u64(epoch_seed));
+
+        for &file_idx in &file_order {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let path = &arrow_files[file_idx];
+            let start_index = file_offsets[file_idx];
+
+            let reader = match ArrowReader::open(path, start_index) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("io_thread: error opening {}: {}", path, e);
+                    continue;
+                }
+            };
+
+            for sample_result in reader {
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                match sample_result {
+                    Ok(sample) => {
+                        if !send_sample(&raw_tx, &shutdown, sample, epoch_seed, augment) {
+                            return;
+                        }
+                    }
+                    Err(e) => eprintln!("io_thread: error reading sample: {}", e),
+                }
+            }
+        }
+
+        if !infinite {
+            return; // Single pass for eval
+        }
+
+        epoch_seed = epoch_seed.wrapping_add(1);
+    }
+}
+
+/// Send sample with retry on timeout, checking shutdown between attempts.
+fn send_sample(
+    raw_tx: &Sender<RawSample>,
+    shutdown: &Arc<AtomicBool>,
+    sample: Sample,
+    epoch_seed: u64,
+    augment: bool,
+) -> bool {
+    let mut raw = RawSample {
+        audio_bytes: sample.audio_bytes,
+        label: sample.label,
+        index: sample.index,
+        seed: if augment {
+            epoch_seed.wrapping_add(sample.index as u64)
+        } else {
+            0
+        },
+    };
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        match raw_tx.send_timeout(raw, Duration::from_millis(100)) {
+            Ok(()) => return true,
+            Err(SendTimeoutError::Timeout(returned)) => {
+                raw = returned; // Retry with same sample
+            }
+            Err(SendTimeoutError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+// --- Worker Thread ---
+
+fn worker_thread_main(
+    raw_rx: Receiver<RawSample>,
+    shuffle_buffer: Arc<ConcurrentShuffleBuffer<ProcessedSample>>,
+    spectrogram: Arc<SpectrogramTransform>,
+    sample_rate: u32,
+    clip_samples: usize,
+    shutdown: Arc<AtomicBool>,
+    augment: bool,
+    workers_alive: Arc<AtomicUsize>,
+) {
+    // Ensure counter is decremented even on panic
+    struct CounterGuard(Arc<AtomicUsize>);
+    impl Drop for CounterGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let _guard = CounterGuard(workers_alive);
+
+    loop {
+        let raw = match raw_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+
+        // Decode audio
+        let audio = match decode_audio(&raw.audio_bytes) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("worker: decode error for index {}: {}", raw.index, e);
+                continue;
+            }
+        };
+
+        // Resample
+        let mut waveform = audio.resample(sample_rate);
+
+        // Crop/pad: random for training, center for eval
+        waveform = if augment {
+            random_crop_or_pad(waveform, clip_samples, raw.seed, raw.index)
+        } else {
+            center_crop_or_pad(waveform, clip_samples)
+        };
+
+        let spec = spectrogram.transform(&waveform);
+
+        let processed = ProcessedSample {
+            spectrogram: spec,
+            label: raw.label,
+            index: raw.index,
+        };
+
+        if !shuffle_buffer.push(processed) {
+            return;
+        }
+    }
+}
+
+// --- Cropping utilities ---
+
+/// Center crop (if too long) or zero-pad (if too short). Deterministic.
+fn center_crop_or_pad(waveform: Vec<f32>, clip_len: usize) -> Vec<f32> {
+    let len = waveform.len();
+    if len < clip_len {
+        // Pad equally on both sides
+        let pad_total = clip_len - len;
+        let pad_left = pad_total / 2;
+        let mut padded = vec![0.0; clip_len];
+        padded[pad_left..pad_left + len].copy_from_slice(&waveform);
+        padded
+    } else if len == clip_len {
+        waveform
+    } else {
+        // Center crop
+        let start = (len - clip_len) / 2;
+        waveform[start..start + clip_len].to_vec()
+    }
+}
+
+/// Random crop (if too long) or zero-pad (if too short). Deterministic per seed+index.
+fn random_crop_or_pad(mut waveform: Vec<f32>, clip_len: usize, seed: u64, index: i64) -> Vec<f32> {
+    if waveform.len() < clip_len {
+        waveform.resize(clip_len, 0.0);
+        return waveform;
+    }
+    if waveform.len() == clip_len {
+        return waveform;
+    }
+    let max_start = waveform.len() - clip_len;
+    let r = splitmix64(seed ^ (index as u64).wrapping_mul(0xD6E8FEB86659FD93));
+    let start = (r as usize) % (max_start + 1);
+    waveform[start..start + clip_len].to_vec()
+}
+
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
 }
