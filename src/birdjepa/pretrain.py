@@ -347,11 +347,11 @@ def worker_fn(cfg: Config):
 
     n_tasks = int(os.environ.get("SLURM_NTASKS", "1"))
     if n_tasks > 1 and multiprocessing.parent_process() is None:
-        # Increase timeouts to handle slow XLA compilation on first step
+        # Increase timeouts significantly - something blocks heartbeat thread
         # See: https://github.com/jax-ml/jax/issues/33852
         jax.distributed.initialize(
-            initialization_timeout=600,
-            heartbeat_timeout_seconds=300,
+            initialization_timeout=1200,
+            heartbeat_timeout_seconds=1800,  # 30 min - essentially disable
         )
         logger.info("Initialized JAX distributed: %d processes", jax.process_count())
     elif n_tasks == 1:
