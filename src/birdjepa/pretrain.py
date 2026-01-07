@@ -347,13 +347,60 @@ def worker_fn(cfg: Config):
 
     n_tasks = int(os.environ.get("SLURM_NTASKS", "1"))
     if n_tasks > 1 and multiprocessing.parent_process() is None:
-        # Increase timeouts significantly - something blocks heartbeat thread
-        # See: https://github.com/jax-ml/jax/issues/33852
-        jax.distributed.initialize(
-            initialization_timeout=1200,
-            heartbeat_timeout_seconds=1800,  # 30 min - essentially disable
+        # Use submitit to get distributed environment, then pass explicitly to JAX
+        # This avoids relying on JAX's Slurm auto-detection
+        import socket
+        import time
+
+        import submitit.helpers
+
+        # Debug logging for heartbeat failures
+        hostname = socket.gethostname()
+        slurm_job_id = os.environ.get("SLURM_JOB_ID", "unknown")
+        slurm_nodelist = os.environ.get("SLURM_NODELIST", "unknown")
+        slurm_procid = os.environ.get("SLURM_PROCID", "unknown")
+        logger.info(
+            "Node debug: hostname=%s, job=%s, nodelist=%s, procid=%s",
+            hostname,
+            slurm_job_id,
+            slurm_nodelist,
+            slurm_procid,
         )
-        logger.info("Initialized JAX distributed: %d processes", jax.process_count())
+
+        dist_env = submitit.helpers.TorchDistributedEnvironment()
+        coordinator_address = f"{dist_env.master_addr}:{dist_env.master_port}"
+        logger.info(
+            "Distributed env: coordinator=%s, rank=%d/%d, local_rank=%d/%d",
+            coordinator_address,
+            dist_env.rank,
+            dist_env.world_size,
+            dist_env.local_rank,
+            dist_env.local_world_size,
+        )
+
+        # Try to resolve coordinator address to check reachability
+        try:
+            coord_ip = socket.gethostbyname(dist_env.master_addr)
+            logger.info("Coordinator resolves to IP: %s", coord_ip)
+        except socket.gaierror as e:
+            logger.warning(
+                "Failed to resolve coordinator %s: %s", dist_env.master_addr, e
+            )
+
+        init_start = time.perf_counter()
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=dist_env.world_size,
+            process_id=dist_env.rank,
+            initialization_timeout=300,
+            heartbeat_timeout_seconds=120,  # Short for fast failure detection
+        )
+        init_elapsed = time.perf_counter() - init_start
+        logger.info(
+            "Initialized JAX distributed: %d processes (took %.1fs)",
+            jax.process_count(),
+            init_elapsed,
+        )
     elif n_tasks == 1:
         logger.info("Single-GPU mode, skipping JAX distributed initialization")
 
@@ -421,18 +468,19 @@ def worker_fn(cfg: Config):
         shuffle_min_size=cfg.window_size // 2,
         infinite=True,
     )
-    logger.info("Creating test dataloader (Rust)")
+    # Test loader with infinite=True so we can reuse across evals
     assert isinstance(cfg.test_data, birdjepa.data.XenoCanto)
     test_loader = birdjepa.data.RustXenoCantoLoader(
         cfg.test_data,
-        seed=cfg.seed,  # Fixed seed for deterministic eval
+        seed=cfg.seed,
         batch_size=cfg.batch_size,
         n_workers=cfg.n_workers,
-        shuffle_buffer_size=1000,  # Small buffer for eval
-        shuffle_min_size=0,  # Allow draining
-        infinite=False,
+        shuffle_buffer_size=1000,
+        shuffle_min_size=0,
+        infinite=True,  # Keeps cycling - we break manually
     )
-    logger.info("Dataloaders created")
+    n_eval_batches = len(test_ds) // cfg.batch_size
+    logger.info("Dataloaders created (eval: %d batches)", n_eval_batches)
 
     # Online linear probe
     logger.info("Creating linear probe")
@@ -600,10 +648,13 @@ def worker_fn(cfg: Config):
             correct = 0
             total = 0
             test_loss = 0.0
-            n_test_batches = 0
 
             eval_key = jr.key(0)  # Fixed key for deterministic eval
+            n_test_batches = 0
             for test_batch in test_loader:
+                if n_test_batches >= n_eval_batches:
+                    break
+                n_test_batches += 1
                 data = jnp.asarray(test_batch["data"])
                 targets = jnp.asarray(test_batch["target"])
                 x_bnk, grid = birdjepa.nn.transformer.patchify(data, cfg.model)
@@ -621,7 +672,6 @@ def worker_fn(cfg: Config):
                 losses, _, _ = objective(batch_jax, encoder, key=obj_key)
                 loss = sum(losses.values())
                 test_loss += float(jnp.mean(loss))
-                n_test_batches += 1
             acc = correct / max(1, total)
             test_loss /= max(1, n_test_batches)
             logger.info("step=%d test_acc=%.4f test_loss=%.4f", step, acc, test_loss)

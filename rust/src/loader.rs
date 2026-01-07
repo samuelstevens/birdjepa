@@ -79,6 +79,7 @@ impl Loader {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         arrow_files: Vec<String>,
         seed: u64,
         batch_size: usize,
@@ -128,20 +129,28 @@ impl Loader {
         let f_max = sample_rate as f32 / 2.0;
 
         // Pre-compute file offsets for globally unique indices
-        let mut file_offsets = Vec::with_capacity(n_files);
-        let mut offset: i64 = 0;
-        for path in &arrow_files {
-            file_offsets.push(offset);
-            match count_samples(path) {
-                Ok(count) => offset += count,
-                Err(e) => {
-                    return Err(pyo3::exceptions::PyIOError::new_err(format!(
-                        "Failed to count samples in {}: {}",
-                        path, e
-                    )));
+        // Release GIL during file I/O to allow Python threads (like JAX heartbeat) to run
+        let file_offsets = py.detach(|| {
+            let mut offsets = Vec::with_capacity(n_files);
+            let mut offset: i64 = 0;
+            for path in &arrow_files {
+                offsets.push(offset);
+                match count_samples(path) {
+                    Ok(count) => offset += count,
+                    Err(e) => return Err(e),
                 }
             }
-        }
+            Ok(offsets)
+        });
+        let file_offsets = match file_offsets {
+            Ok(offsets) => offsets,
+            Err(e) => {
+                return Err(pyo3::exceptions::PyIOError::new_err(format!(
+                    "Failed to count samples: {}",
+                    e
+                )));
+            }
+        };
 
         let spectrogram = Arc::new(SpectrogramTransform::new(
             sample_rate,

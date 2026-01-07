@@ -199,20 +199,6 @@ class IndexedXenoCantoDataset(grain.RandomAccessDataSource):
         return {"data": spec, "label": label, "target": target, "index": idx}
 
 
-class ArrowTableSource:
-    """Lazy accessor for Arrow table rows - avoids copying all data upfront."""
-
-    def __init__(self, table):
-        self._table = table
-        self._cols = table.column_names
-
-    def __len__(self) -> int:
-        return len(self._table)
-
-    def __getitem__(self, idx: int) -> dict:
-        return {col: self._table[col][idx].as_py() for col in self._cols}
-
-
 class ShuffledXenoCantoDataset:
     """XenoCanto dataset using sequential Arrow file reading (NFS-friendly).
 
@@ -250,6 +236,9 @@ class ShuffledXenoCantoDataset:
         # Store dataset size for __len__ (needed for logging)
         self._n_samples = len(ds)
 
+        # RSS logging interval (set by make_shuffled_dataloader)
+        self._rss_log_interval = 500
+
     def __len__(self) -> int:
         return self._n_samples
 
@@ -263,29 +252,36 @@ class ShuffledXenoCantoDataset:
         """Load one Arrow shard as IterDataset (sequential read)."""
         import pyarrow as pa
 
-        # Read Arrow file sequentially (NFS-friendly)
-        # HuggingFace uses IPC stream format, not file format
-        mmap = pa.memory_map(arrow_fpath, "r")
-        reader = pa.ipc.open_stream(mmap)
-        table = reader.read_all()
+        with pa.OSFile(arrow_fpath, "rb") as f:
+            reader = pa.ipc.open_stream(f)
+            table = reader.read_all()
+        rows = table.to_pylist()
 
-        # Wrap table in a lazy accessor that converts rows on demand
-        # (to_pylist() is slow because it copies all audio bytes upfront)
-        source = ArrowTableSource(table)
-
-        # Wrap as MapDataset then convert to lazy IterDataset
-        return grain.MapDataset.source(source).to_iter_dataset()
+        return grain.MapDataset.source(rows).to_iter_dataset()
 
     def decode_and_transform(self, row: dict) -> dict | None:
         """Decode audio bytes and compute spectrogram."""
         import io
+        import os
 
+        import psutil
         import soundfile as sf
 
         # Filter bad indices
         idx = row.get("__index_level_0__", -1)
         if idx in self._bad_indices:
             return None
+
+        # Log RSS memory periodically
+        self._decode_count = getattr(self, "_decode_count", 0) + 1
+        if (
+            self._rss_log_interval > 0
+            and self._decode_count % self._rss_log_interval == 0
+        ):
+            rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024**2
+            logger.info(
+                "Worker RSS after %d samples: %.1f MB", self._decode_count, rss_mb
+            )
 
         # Decode audio using soundfile (more reliable than torchcodec)
         try:
@@ -470,6 +466,119 @@ class Cifar100Dataset(grain.RandomAccessDataSource):
         return {"data": img, "label": label, "target": target, "index": idx}
 
 
+class RustXenoCantoLoader:
+    """XenoCanto loader using Rust for high-throughput data loading.
+
+    Wraps birdjepa._rs.Loader and post-processes output to match Python interface:
+    - Reshapes spectrogram from flat to [batch, n_frames, n_mels]
+    - Pads frames to 512 (Bird-MAE target)
+    - Normalizes with Bird-MAE mean/std
+    - Renames keys to match Python dataset convention
+    """
+
+    def __init__(
+        self,
+        cfg: XenoCanto,
+        *,
+        seed: int,
+        batch_size: int,
+        n_workers: int = 8,
+        shuffle_buffer_size: int = 10000,
+        shuffle_min_size: int = 8000,
+        infinite: bool = True,
+    ):
+        import datasets
+
+        from birdjepa._rs import Loader
+
+        # Load dataset to get Arrow file paths
+        ds = datasets.load_dataset("samuelstevens/BirdSet", cfg.subset, split=cfg.split)
+        arrow_fpaths = [f["filename"] for f in ds.cache_files]
+        assert arrow_fpaths, f"No Arrow files found for {cfg.subset}/{cfg.split}"
+
+        # Get class labels for int2str conversion
+        self._class_labels = ds.features["ebird_code"]
+        self.n_classes = self._class_labels.num_classes
+
+        # Store dataset size
+        self._n_samples = len(ds)
+
+        # Create Rust loader
+        augment = cfg.truncate == "random"
+        self._loader = Loader(
+            arrow_fpaths,
+            seed=seed,
+            batch_size=batch_size,
+            shuffle_buffer_size=shuffle_buffer_size,
+            shuffle_min_size=shuffle_min_size,
+            sample_rate=bird_mae.BIRDMAE_SR_HZ,
+            clip_seconds=cfg.clip_sec,
+            n_mels=bird_mae.BIRDMAE_N_MELS,
+            n_fft=bird_mae.BIRDMAE_STFT_N_FFT,
+            hop_length=bird_mae.BIRDMAE_STFT_HOP_LENGTH,
+            win_length=bird_mae.BIRDMAE_STFT_WIN_LENGTH,
+            f_min=bird_mae.BIRDMAE_STFT_LOW_FREQ_HZ,
+            preemphasis=0.97,
+            n_workers=n_workers,
+            infinite=infinite,
+            augment=augment,
+        )
+
+        self._cfg = cfg
+
+    def __len__(self) -> int:
+        return self._n_samples
+
+    def __iter__(self):
+        iter(self._loader)  # Reset the underlying Rust loader
+        return self
+
+    def __next__(self) -> dict:
+        batch = next(self._loader)
+        return self._postprocess(batch)
+
+    def _postprocess(self, batch: dict) -> dict:
+        """Transform Rust loader output to match Python interface."""
+        spec_flat = batch["spectrogram"]  # [B, n_mels * n_frames]
+        labels = batch["labels"]  # [B]
+        indices = batch["indices"]  # [B]
+        n_mels = batch["n_mels"]  # 128
+        n_frames = batch["n_frames"]  # 498 for 5s audio
+
+        b = spec_flat.shape[0]
+
+        # Reshape to [B, n_frames, n_mels]
+        spec = spec_flat.reshape(b, n_mels, n_frames).transpose(0, 2, 1)
+
+        # Pad frames to 512 (Bird-MAE target) with min value
+        target_frames = bird_mae.BIRDMAE_TARGET_T
+        if n_frames < target_frames:
+            pad_frames = target_frames - n_frames
+            # Compute min value per sample for padding
+            min_vals = spec.min(axis=(1, 2), keepdims=True)
+            padding = np.broadcast_to(min_vals, (b, pad_frames, n_mels))
+            spec = np.concatenate([spec, padding], axis=1)
+        elif n_frames > target_frames:
+            spec = spec[:, :target_frames, :]
+
+        # Normalize with Bird-MAE constants
+        spec = (spec - bird_mae.BIRDMAE_MEAN) / (bird_mae.BIRDMAE_STD * 2.0)
+
+        # Apply augmentations if configured
+        if self._cfg.augmentations:
+            augmented = []
+            for i in range(b):
+                aug_spec = birdjepa.augment.apply(spec[i], self._cfg.augmentations)
+                augmented.append(aug_spec)
+            spec = np.stack(augmented)
+
+        return {
+            "data": spec.astype(np.float32),
+            "target": labels,
+            "index": indices,
+        }
+
+
 @beartype.beartype
 def make_shuffled_dataloader(
     source: ShuffledXenoCantoDataset,
@@ -484,6 +593,7 @@ def make_shuffled_dataloader(
     shard_count: int = 1,
     window_size: int = 8000,
     cycle_length: int = 4,
+    rss_log_interval: int = 500,
 ):
     """Create dataloader with sequential Arrow file reading.
 
@@ -504,10 +614,14 @@ def make_shuffled_dataloader(
         shard_count: Total number of shards. Use jax.process_count().
         window_size: Shuffle buffer size for local randomness (default 8000).
         cycle_length: Number of shards to interleave concurrently (default 4).
+        rss_log_interval: Log worker RSS memory every N samples (default 500, 0 to disable).
 
     Returns:
         Grain IterDataset for iteration.
     """
+    # Set RSS logging interval on source
+    source._rss_log_interval = rss_log_interval
+
     # Shard the file list across processes
     arrow_fpaths = source.arrow_fpaths
     if shard_count > 1:
@@ -520,14 +634,14 @@ def make_shuffled_dataloader(
     if repeat:
         ds = ds.repeat()
 
-    # Map to IterDatasets (lazy loading per shard)
+    # Map to IterDatasets (shard loading happens when InterleaveIterDataset needs it)
     ds = ds.map(source.make_shard_iter)
 
-    # Interleave shards for mixing (read from multiple shards concurrently)
+    # Interleave shards for mixing
     ds = grain.experimental.InterleaveIterDataset(
         ds,
         cycle_length=cycle_length,
-        iter_buffer_size=2,
+        iter_buffer_size=256,
     )
 
     # Window shuffle for local randomness (after interleaving)
@@ -542,15 +656,16 @@ def make_shuffled_dataloader(
     ds = ds.map(source.decode_and_transform)
     ds = ds.filter(lambda x: x is not None)
 
-    # Batch
-    ds = ds.batch(batch_size=batch_size, drop_remainder=drop_last)
-
-    # Multiprocess prefetch
+    # Multiprocess prefetch - workers produce individual samples in parallel
+    # This allows decode to happen across all workers concurrently
     if n_workers > 0:
         ds = ds.mp_prefetch(
             grain.MultiprocessingOptions(
-                num_workers=n_workers, per_worker_buffer_size=2
+                num_workers=n_workers, per_worker_buffer_size=512
             )
         )
+
+    # Batch after prefetch so workers produce samples, not batches
+    ds = ds.batch(batch_size=batch_size, drop_remainder=drop_last)
 
     return ds
