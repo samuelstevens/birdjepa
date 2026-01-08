@@ -23,7 +23,7 @@ pub enum ArrowError {
 #[derive(Clone)]
 pub struct Sample {
     pub audio_bytes: Vec<u8>,
-    pub label: i64,
+    pub label: Option<i64>,
     pub index: i64,
 }
 
@@ -143,16 +143,21 @@ fn extract_sample(
     let audio_bytes = bytes_array.value(row).to_vec();
 
     // Label column - must be Int64 (ClassLabel feature type in HuggingFace datasets)
+    // Returns None if label is null (e.g., XCL valid split has no labels)
     let label_col = batch.column(label_col);
-    let label = label_col
+    let label_array = label_col
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| {
             ArrowError::InvalidColumnType(
                 "ebird_code (expected int64, got string - dataset must use ClassLabel feature)".to_string(),
             )
-        })?
-        .value(row);
+        })?;
+    let label = if label_array.is_null(row) {
+        None
+    } else {
+        Some(label_array.value(row))
+    };
 
     Ok(Sample {
         audio_bytes,

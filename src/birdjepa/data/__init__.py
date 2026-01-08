@@ -572,9 +572,16 @@ class RustXenoCantoLoader:
                 augmented.append(aug_spec)
             spec = np.stack(augmented)
 
+        # Convert integer labels to strings (None stays None)
+        str_labels = [
+            self._class_labels.int2str(lbl) if lbl is not None else None
+            for lbl in labels
+        ]
+
         return {
             "data": spec.astype(np.float32),
-            "target": labels,
+            "target": np.asarray(labels),  # Converts list to numpy; None values stay as object dtype
+            "label": str_labels,
             "index": indices,
         }
 

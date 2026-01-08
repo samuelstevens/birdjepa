@@ -15,7 +15,7 @@ use crate::spectrogram::SpectrogramTransform;
 
 use crossbeam::channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
 use numpy::{PyArray1, PyArrayMethods};
-use pyo3::types::{PyDict, PyDictMethods};
+use pyo3::types::{PyDict, PyDictMethods, PyList, PyListMethods};
 use pyo3::{Bound, PyResult, Python, pyclass, pymethods};
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -27,7 +27,7 @@ use std::time::Duration;
 /// Raw sample from Arrow (bytes not yet decoded).
 struct RawSample {
     audio_bytes: Vec<u8>,
-    label: i64,
+    label: Option<i64>,
     index: i64,
     seed: u64,
 }
@@ -35,7 +35,7 @@ struct RawSample {
 /// Processed sample ready for batching.
 struct ProcessedSample {
     spectrogram: Vec<f32>,
-    label: i64,
+    label: Option<i64>,
     index: i64,
 }
 
@@ -330,21 +330,21 @@ impl Loader {
         let spec_len = n_mels * n_frames;
 
         let mut spec_data = vec![0.0f32; batch_size * spec_len];
-        let mut label_data = Vec::with_capacity(batch_size);
         let mut index_data = Vec::with_capacity(batch_size);
 
+        // Build labels as Python list to support None values
+        let labels = PyList::empty(py);
         for (i, sample) in processed.iter().enumerate() {
             let src_len = sample.spectrogram.len().min(spec_len);
             spec_data[i * spec_len..i * spec_len + src_len]
                 .copy_from_slice(&sample.spectrogram[..src_len]);
-            label_data.push(sample.label);
+            labels.append(sample.label)?;
             index_data.push(sample.index);
         }
 
         let spectrogram = PyArray1::from_vec(py, spec_data)
             .reshape([batch_size, spec_len])
             .expect("reshape failed");
-        let labels = PyArray1::from_vec(py, label_data);
         let indices = PyArray1::from_vec(py, index_data);
 
         let dict = PyDict::new(py);
