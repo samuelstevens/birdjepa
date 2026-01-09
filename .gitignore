@@ -15,6 +15,11 @@ vendored/
 .claude/
 .coverage/
 .hypothesis/
+
 /results/
 /checkpoints/
 /data/
+
+# Rust stuff
+*.so
+/rust/target/

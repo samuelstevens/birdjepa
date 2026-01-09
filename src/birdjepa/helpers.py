@@ -92,18 +92,31 @@ class progress:
                 duration_s = now - start
                 per_min = (i + 1) / (duration_s / 60)
 
+                # Use it/h when rate < 1 it/m for more precision
+                if per_min < 1:
+                    rate_str = f"{per_min * 60:.1f} it/h"
+                else:
+                    rate_str = f"{per_min:.1f} it/m"
+
                 if total is not None:
                     pred_min = (total - (i + 1)) / per_min
+                    # Scale time units: >120m use hours, >48h use days
+                    if pred_min > 120 * 48:  # > 48 hours
+                        time_str = f"{pred_min / 60 / 24:.1f}d"
+                    elif pred_min > 120:  # > 2 hours
+                        time_str = f"{pred_min / 60:.1f}h"
+                    else:
+                        time_str = f"{pred_min:.1f}m"
                     self.logger.info(
-                        "%d/%d (%.1f%%) | %.1f it/m (expected finish in %.1fm)",
+                        "%d/%d (%.1f%%) | %s (expected finish in %s)",
                         i + 1,
                         total,
                         (i + 1) / total * 100,
-                        per_min,
-                        pred_min,
+                        rate_str,
+                        time_str,
                     )
                 else:
-                    self.logger.info("%d/? | %.1f it/m", i + 1, per_min)
+                    self.logger.info("%d/? | %s", i + 1, rate_str)
 
     def __len__(self) -> int:
         if self.total > 0:

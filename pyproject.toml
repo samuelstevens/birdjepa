@@ -20,6 +20,7 @@ dependencies = [
     "librosa>=0.11.0",
     "marimo>=0.18.4",
     "matplotlib>=3.10.8",
+    "maturin[patchelf]>=1.10.2",
     "optax>=0.2.6",
     "orbax-checkpoint>=0.11.31",
     "polars>=1.36.1",
@@ -37,8 +38,18 @@ dependencies = [
 ]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.10,<2.0"]
+build-backend = "maturin"
+
+[tool.uv]
+cache-keys = [{file = "pyproject.toml"}, {file = "rust/Cargo.toml"}, {file = "**/*.rs"}]
+# https://github.com/PyO3/maturin/issues/2314
+# config-settings = { build-args = '--profile=dev' }
+
+[tool.maturin]
+manifest-path = "rust/Cargo.toml"
+module-name = "birdjepa._rs"
+python-source = "src"
 
 [tool.ruff.lint]
 ignore = ["F722"]  # jaxtyping string annotations
@@ -48,10 +59,12 @@ dev = [
     "hypothesis>=6.148.7",
     "pytest>=9.0.2",
     "pytest-cov>=6.0.0",
+    "pytest-timeout>=2.4.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+timeout = 240  # 4 min default timeout per test
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
