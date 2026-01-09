@@ -13,14 +13,14 @@ import pathlib
 
 import beartype
 import datasets
-import jaxtyping
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import jax.random as jr
 import numpy as np
+import optax
 import sklearn.metrics
-import torch
-import torch.nn
-import torch.utils.data
-from jaxtyping import Float
-from torch import Tensor
+from jaxtyping import Array, Float, jaxtyped
 
 from . import registry, reporting
 from .. import helpers
@@ -28,139 +28,59 @@ from .. import helpers
 logger = logging.getLogger("benchmark")
 
 
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
-class AsymmetricLoss(torch.nn.Module):
-    """Asymmetric loss for multi-label classification.
-
-    From "Asymmetric Loss For Multi-Label Classification" (Ben-Baruch et al.).
-    Designed for imbalanced multi-label problems where negatives >> positives.
-    """
-
-    def __init__(
-        self,
-        gamma_neg: float = 4.0,
-        gamma_pos: float = 1.0,
-        clip: float = 0.05,
-        eps: float = 1e-8,
-    ):
-        super().__init__()
-        self.gamma_neg = gamma_neg
-        self.gamma_pos = gamma_pos
-        self.clip = clip
-        self.eps = eps
-
-    def forward(
-        self, logits: Float[Tensor, "b c"], targets: Float[Tensor, "b c"]
-    ) -> Float[Tensor, ""]:
-        probs = torch.sigmoid(logits)
-        probs_pos = probs
-        probs_neg = 1 - probs
-
-        # Asymmetric clipping: reduce contribution of very easy negatives
-        if self.clip > 0:
-            probs_neg = (probs_neg + self.clip).clamp(max=1)
-
-        # Basic cross-entropy terms
-        loss_pos = targets * torch.log(probs_pos.clamp(min=self.eps))
-        loss_neg = (1 - targets) * torch.log(probs_neg.clamp(min=self.eps))
-        loss = loss_pos + loss_neg
-
-        # Asymmetric focusing (focal loss style)
-        if self.gamma_neg > 0 or self.gamma_pos > 0:
-            pt = probs_pos * targets + probs_neg * (1 - targets)
-            gamma = self.gamma_pos * targets + self.gamma_neg * (1 - targets)
-            loss *= torch.pow(1 - pt, gamma)
-
-        return -loss.mean()
-
-
 # BirdSet uses this column name for multi-label class indices
 BIRDSET_LABEL_COL = "ebird_code_multilabel"
 
 
-@beartype.beartype
-def sample_per_class(
-    dataset: datasets.Dataset,
-    n_per_class: int,
-    label_col: str = BIRDSET_LABEL_COL,
-    seed: int = 42,
-) -> datasets.Dataset:
-    """Sample up to n_per_class examples for each class, return their union.
+def get_audio_array(audio: dict) -> np.ndarray:
+    """Get audio array from HuggingFace audio dict (handles streaming and non-streaming)."""
+    if "array" in audio:
+        # Non-streaming: already decoded
+        data = audio["array"]
+    elif "bytes" in audio:
+        # Streaming: decode from bytes
+        import io
+        import soundfile as sf
 
-    For multi-label data, a sample can belong to multiple classes. We iterate through each class, find all samples containing that class, and randomly select up to n_per_class of them. The final dataset is the union of all selected indices.
+        data, _ = sf.read(io.BytesIO(audio["bytes"]))
+    else:
+        raise ValueError(f"Unknown audio format: {list(audio.keys())}")
 
-    Args:
-        dataset: HuggingFace dataset with a multi-label column.
-        n_per_class: Max samples to select per class.
-        label_col: Column containing list of class indices per example.
-        seed: Random seed for reproducibility.
-    """
-    assert label_col in dataset.features, (
-        f"'{label_col}' not in {list(dataset.features)}"
-    )
-
-    rng = np.random.default_rng(seed)
-    n_classes = len(dataset.features[label_col].feature.names)
-    selected: set[int] = set()
-
-    # Build index: for each class, which samples contain it?
-    labels = dataset[label_col]
-    class_to_samples: dict[int, list[int]] = {c: [] for c in range(n_classes)}
-    for i, label in enumerate(labels):
-        for c in label:
-            class_to_samples[c].append(i)
-
-    # Sample from each class
-    for c in range(n_classes):
-        samples = class_to_samples[c]
-        if len(samples) <= n_per_class:
-            selected.update(samples)
-        else:
-            selected.update(rng.choice(samples, size=n_per_class, replace=False))
-
-    indices = sorted(selected)
-    logger.info(
-        "Sampled %d examples (%d per class, %d classes)",
-        len(indices),
-        n_per_class,
-        n_classes,
-    )
-    return dataset.select(indices)
+    # Convert stereo to mono if needed
+    if data.ndim == 2:
+        data = data.mean(axis=1)
+    return data
 
 
 @beartype.beartype
-def sample_per_class_list(
-    examples: list[dict], n_per_class: int, n_classes: int, seed: int = 42
-) -> list[dict]:
-    """Sample up to n_per_class examples for each class from a list of dicts.
-
-    For streaming datasets that have been collected to a list.
-    """
+def sample_indices_per_class(
+    labels: list[list[int]], n_per_class: int, n_classes: int, seed: int = 42
+) -> set[int]:
+    """Sample up to n_per_class example indices for each class."""
     rng = np.random.default_rng(seed)
     selected: set[int] = set()
 
-    # Build index: for each class, which examples contain it?
     class_to_examples: dict[int, list[int]] = {c: [] for c in range(n_classes)}
-    for i, ex in enumerate(examples):
-        for c in ex[BIRDSET_LABEL_COL]:
+    for i, ex_labels in enumerate(labels):
+        for c in ex_labels:
             class_to_examples[c].append(i)
 
-    # Sample from each class
     for c in range(n_classes):
         samples = class_to_examples[c]
         if len(samples) <= n_per_class:
             selected.update(samples)
         else:
-            selected.update(rng.choice(samples, size=n_per_class, replace=False))
+            selected.update(
+                int(i) for i in rng.choice(samples, size=n_per_class, replace=False)
+            )
 
-    indices = sorted(selected)
     logger.info(
         "Sampled %d examples (%d per class, %d classes)",
-        len(indices),
+        len(selected),
         n_per_class,
         n_classes,
     )
-    return [examples[i] for i in indices]
+    return selected
 
 
 @beartype.beartype
@@ -174,6 +94,8 @@ class Config:
     """Model organization."""
     model_ckpt: str = "Bird-MAE-Base"
     """Model checkpoint."""
+    ckpt_path: str = ""
+    """Path to local JAX checkpoint. If set, model_org/model_ckpt are ignored."""
     classifier: str = "linear"
     """Classifier: linear, mlp, centroid."""
     n_train: int = -1
@@ -191,8 +113,6 @@ class Config:
     """Gradient clipping max norm."""
     log_every: int = 5
     """Log training progress every N epochs."""
-    device: str = "cuda"
-    """Device."""
     # Paths
     report_to: pathlib.Path = pathlib.Path("./results")
     """Directory for results database."""
@@ -214,10 +134,16 @@ class Config:
 @beartype.beartype
 def make_exp_key(cfg: Config) -> reporting.ExpKey:
     """Create an ExpKey from a Config."""
+    if cfg.ckpt_path:
+        model_org = "birdjepa"
+        model_ckpt = pathlib.Path(cfg.ckpt_path).name
+    else:
+        model_org = cfg.model_org
+        model_ckpt = cfg.model_ckpt
     return reporting.ExpKey(
         task_name=cfg.task,
-        model_org=cfg.model_org,
-        model_ckpt=cfg.model_ckpt,
+        model_org=model_org,
+        model_ckpt=model_ckpt,
         clf=cfg.classifier,
         n_train=cfg.n_train,
     )
@@ -242,10 +168,8 @@ def worker_fn(cfg: Config) -> None:
     key = make_exp_key(cfg)
     logger.info("Benchmarking %s", key)
 
-    # 1. Load backbone
+    # 1. Load backbone (JAX model)
     backbone = registry.load(cfg.model_org, cfg.model_ckpt)
-    backbone = backbone.to(cfg.device)
-    backbone.eval()
     transform = backbone.make_audio_transform()
 
     # 2. Get n_classes from dataset builder (before streaming)
@@ -258,44 +182,56 @@ def worker_fn(cfg: Config) -> None:
         "samuelstevens/BirdSet", cfg.task.upper(), streaming=True
     )
 
-    # Collect train examples (small enough to fit in memory)
-    logger.info("Collecting train examples...")
-    train_examples = list(ds["train"])
+    # 4. Extract train features
     if cfg.n_train > 0:
-        train_examples = sample_per_class_list(train_examples, cfg.n_train, n_classes)
+        # Sample n_train per class: stream twice to avoid OOM
+        logger.info("First pass: collecting labels for sampling...")
+        all_labels = [ex[BIRDSET_LABEL_COL] for ex in ds["train"]]
+        selected_i = sample_indices_per_class(all_labels, cfg.n_train, n_classes)
 
-    logger.info(
-        "Task %s: %d train, %d classes (test streaming)",
-        cfg.task,
-        len(train_examples),
-        n_classes,
-    )
+        logger.info("Second pass: collecting %d selected examples...", len(selected_i))
+        ds = datasets.load_dataset(
+            "samuelstevens/BirdSet", cfg.task.upper(), streaming=True
+        )
+        train_examples = [ex for i, ex in enumerate(ds["train"]) if i in selected_i]
 
-    # 4. Extract features
-    logger.info("Extracting train features...")
-    train = extract_features_from_list(
-        backbone, transform, train_examples, cfg.device, cfg.batch_size, n_classes
-    )
+        logger.info(
+            "Task %s: %d train, %d classes", cfg.task, len(train_examples), n_classes
+        )
+        logger.info("Extracting train features...")
+        train = extract_features_from_list(
+            backbone, transform, train_examples, cfg.batch_size, n_classes
+        )
+    else:
+        # Use all samples: stream feature extraction to avoid OOM
+        logger.info("Task %s: all train, %d classes (streaming)", cfg.task, n_classes)
+        logger.info("Extracting train features (streaming)...")
+        train = extract_features_streaming(
+            backbone, transform, ds["train"], cfg.batch_size, n_classes
+        )
 
     logger.info("Extracting test features (streaming)...")
     test = extract_features_streaming(
-        backbone, transform, ds["test_5s"], cfg.device, cfg.batch_size, n_classes
+        backbone, transform, ds["test_5s"], cfg.batch_size, n_classes
     )
 
-    # 5. Train classifier
+    # 5. Train classifier (JAX/optax)
     logger.info("Training %s probe...", cfg.classifier)
+    rng_key = jr.key(42)
     if cfg.classifier == "linear":
-        probe = train_linear_probe(train.features, train.labels, n_classes, cfg)
+        probe = train_linear_probe(
+            train.features, train.labels, n_classes, cfg, rng_key
+        )
     elif cfg.classifier == "mlp":
-        probe = train_mlp_probe(train.features, train.labels, n_classes, cfg)
+        probe = train_mlp_probe(train.features, train.labels, n_classes, cfg, rng_key)
     elif cfg.classifier == "centroid":
-        probe = train_centroid_probe(train.features, train.labels, n_classes, cfg)
+        probe = train_centroid_probe(train.features, train.labels, n_classes)
     else:
         raise NotImplementedError(f"Classifier '{cfg.classifier}' not implemented")
 
     # 6. Evaluate
     logger.info("Evaluating...")
-    cmap, n_classes_eval, predictions = evaluate(probe, test, cfg.device)
+    cmap, n_classes_eval, predictions = evaluate(probe, test)
     logger.info("Results: cmAP=%.4f", cmap)
 
     # 7. Build and write report
@@ -338,13 +274,11 @@ def print_results_table(report_to: pathlib.Path, cfgs: list[Config]):
     """Print a table of results for the given configs."""
     import duckdb
 
-    # Get dimensions from configs
     tasks = sorted({c.task for c in cfgs})
     clfs = sorted({c.classifier for c in cfgs})
     n_trains = sorted({c.n_train for c in cfgs})
     models = sorted({c.model_ckpt for c in cfgs})
 
-    # Query results from parquet files
     raw_dir = report_to / "raw"
     results: dict[tuple[str, str, str, int], float] = {}
     if raw_dir.exists():
@@ -357,16 +291,13 @@ def print_results_table(report_to: pathlib.Path, cfgs: list[Config]):
             for task_name, model_ckpt, clf, n_train, cmap in rows:
                 results[(task_name, model_ckpt, clf, n_train)] = cmap
         except duckdb.IOException:
-            pass  # No parquet files yet
+            pass
 
-    # Print table for each model
     for model in models:
         print(f"\n=== {model} ===")
-        # Header
         header = ["clf", "n"] + tasks
         print(" | ".join(f"{h:>10}" for h in header))
         print("-" * (12 * len(header)))
-        # Rows: clf × n_train
         for clf in clfs:
             for n_train in n_trains:
                 n_str = "all" if n_train == -1 else str(n_train)
@@ -386,7 +317,6 @@ def cli(cfg: Config):
     log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
     logging.basicConfig(level=logging.INFO, format=log_format)
 
-    # Collect all configs to run
     if cfg.sweep:
         sweep_cfgs = load_sweep_cfgs(cfg.sweep)
         logger.info("Loaded %d configs from %s", len(sweep_cfgs), cfg.sweep)
@@ -394,7 +324,6 @@ def cli(cfg: Config):
     else:
         cfgs = [cfg]
 
-    # Dry run: show table and what would run
     if cfg.dry_run:
         print_results_table(cfg.report_to, cfgs)
         print("\nWould run:")
@@ -409,7 +338,6 @@ def cli(cfg: Config):
                 print(f"  [pending] {key}")
         return
 
-    # Filter to configs that should actually run
     to_run: list[Config] = []
     for c in cfgs:
         key = make_exp_key(c)
@@ -439,25 +367,28 @@ def cli(cfg: Config):
             setup=["module load ffmpeg/6.1.1"],
         )
 
-        # Batch submit all jobs (workers write to parquet themselves)
         with executor.batch():
             jobs = [executor.submit(worker_fn, c) for c in to_run]
 
         for job, c in zip(jobs, to_run):
             logger.info("Submitted job %s for %s", job.job_id, make_exp_key(c))
     else:
-        # Run locally (sequentially)
         for c in to_run:
             worker_fn(c)
 
 
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
+# =============================================================================
+# Feature Extraction (JAX)
+# =============================================================================
+
+
+@jaxtyped(typechecker=beartype.beartype)
 @dataclasses.dataclass
 class ExtractedFeatures:
-    """Features extracted from a dataset."""
+    """Features extracted from a dataset (JAX arrays)."""
 
-    features: Float[Tensor, "n d"]
-    labels: Float[Tensor, "n c"]
+    features: Float[Array, "n d"]
+    labels: Float[Array, "n c"]
     ids: list[str]
 
     def __post_init__(self):
@@ -466,56 +397,11 @@ class ExtractedFeatures:
         )
 
 
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
-@torch.inference_mode()
-def extract_features(
-    backbone, transform, dataset, device: str, batch_size: int, n_classes: int
-) -> ExtractedFeatures:
-    """Extract features from a dataset using the backbone."""
-    all_features = []
-    all_labels = []
-    all_ids = []
-
-    batches = range(0, len(dataset), batch_size)
-    for i in helpers.progress(batches, every=10, desc="extract"):
-        batch = dataset[i : i + batch_size]
-
-        specs = []
-        for audio in batch["audio"]:
-            spec = transform(audio["array"])
-            specs.append(spec)
-
-        specs = torch.stack(specs).to(device)
-        encoded = backbone.audio_encode(specs)
-        all_features.append(encoded.features.cpu())
-
-        batch_labels = batch[BIRDSET_LABEL_COL]
-        labels = torch.zeros(len(batch_labels), n_classes, dtype=torch.float32)
-        for j, class_indices in enumerate(batch_labels):
-            for c in class_indices:
-                labels[j, c] = 1.0
-        all_labels.append(labels)
-
-        all_ids.extend(batch["filepath"])
-
-    return ExtractedFeatures(
-        features=torch.cat(all_features, dim=0),
-        labels=torch.cat(all_labels, dim=0),
-        ids=all_ids,
-    )
-
-
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
-@torch.inference_mode()
+@beartype.beartype
 def extract_features_from_list(
-    backbone,
-    transform,
-    examples: list[dict],
-    device: str,
-    batch_size: int,
-    n_classes: int,
+    backbone, transform, examples: list[dict], batch_size: int, n_classes: int
 ) -> ExtractedFeatures:
-    """Extract features from a list of example dicts (for collected train data)."""
+    """Extract features from a list of example dicts (JAX)."""
     all_features = []
     all_labels = []
     all_ids = []
@@ -526,35 +412,34 @@ def extract_features_from_list(
 
         specs = []
         for ex in batch:
-            audio = ex["audio"]
-            spec = transform(audio["array"])
+            audio_array = get_audio_array(ex["audio"])
+            spec = transform(audio_array)
             specs.append(spec)
 
-        specs = torch.stack(specs).to(device)
-        encoded = backbone.audio_encode(specs)
-        all_features.append(encoded.features.cpu())
+        specs_jax = jnp.array(np.stack(specs), dtype=jnp.float32)
+        encoded = backbone.encode(specs_jax)
+        all_features.append(encoded)
 
-        labels = torch.zeros(len(batch), n_classes, dtype=torch.float32)
+        labels = jnp.zeros((len(batch), n_classes), dtype=jnp.float32)
         for j, ex in enumerate(batch):
             for c in ex[BIRDSET_LABEL_COL]:
-                labels[j, c] = 1.0
+                labels = labels.at[j, c].set(1.0)
         all_labels.append(labels)
 
         all_ids.extend(ex["filepath"] for ex in batch)
 
     return ExtractedFeatures(
-        features=torch.cat(all_features, dim=0),
-        labels=torch.cat(all_labels, dim=0),
+        features=jnp.concatenate(all_features, axis=0),
+        labels=jnp.concatenate(all_labels, axis=0),
         ids=all_ids,
     )
 
 
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
-@torch.inference_mode()
+@beartype.beartype
 def extract_features_streaming(
-    backbone, transform, dataset, device: str, batch_size: int, n_classes: int
+    backbone, transform, dataset, batch_size: int, n_classes: int
 ) -> ExtractedFeatures:
-    """Extract features from a streaming dataset (for large test sets)."""
+    """Extract features from a streaming dataset (JAX)."""
     all_features = []
     all_labels = []
     all_ids = []
@@ -565,229 +450,317 @@ def extract_features_streaming(
         batch.append(ex)
         if len(batch) >= batch_size:
             _process_batch(
-                backbone,
-                transform,
-                batch,
-                n_classes,
-                device,
-                all_features,
-                all_labels,
-                all_ids,
+                backbone, transform, batch, n_classes, all_features, all_labels, all_ids
             )
             batch = []
             n_batches += 1
             if n_batches % 10 == 0:
                 logger.info("Processed %d batches", n_batches)
 
-    # Process remaining examples
     if batch:
         _process_batch(
-            backbone,
-            transform,
-            batch,
-            n_classes,
-            device,
-            all_features,
-            all_labels,
-            all_ids,
+            backbone, transform, batch, n_classes, all_features, all_labels, all_ids
         )
 
     return ExtractedFeatures(
-        features=torch.cat(all_features, dim=0),
-        labels=torch.cat(all_labels, dim=0),
+        features=jnp.concatenate(all_features, axis=0),
+        labels=jnp.concatenate(all_labels, axis=0),
         ids=all_ids,
     )
 
 
 def _process_batch(
-    backbone, transform, batch, n_classes, device, all_features, all_labels, all_ids
+    backbone, transform, batch, n_classes, all_features, all_labels, all_ids
 ):
-    """Helper to process a batch of examples."""
+    """Helper to process a batch of examples (JAX)."""
     specs = []
     for ex in batch:
-        audio = ex["audio"]
-        spec = transform(audio["array"])
+        audio_array = get_audio_array(ex["audio"])
+        spec = transform(audio_array)
         specs.append(spec)
 
-    specs = torch.stack(specs).to(device)
-    encoded = backbone.audio_encode(specs)
-    all_features.append(encoded.features.cpu())
+    specs_jax = jnp.array(np.stack(specs), dtype=jnp.float32)
+    encoded = backbone.encode(specs_jax)
+    all_features.append(encoded)
 
-    labels = torch.zeros(len(batch), n_classes, dtype=torch.float32)
+    labels = jnp.zeros((len(batch), n_classes), dtype=jnp.float32)
     for j, ex in enumerate(batch):
         for c in ex[BIRDSET_LABEL_COL]:
-            labels[j, c] = 1.0
+            labels = labels.at[j, c].set(1.0)
     all_labels.append(labels)
 
     all_ids.extend(ex["filepath"] for ex in batch)
 
 
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
-def train_linear_probe(
-    features: Float[Tensor, "n d"],
-    labels: Float[Tensor, "n c"],
-    n_classes: int,
-    cfg: Config,
-):
-    """Train a linear probe with asymmetric loss using AdamW + cosine scheduler.
-
-    Follows Bird-MAE's linear probing setup: mini-batch training with asymmetric loss designed for imbalanced multi-label classification.
-    """
-    dim = features.shape[1]
-    probe = torch.nn.Sequential(
-        torch.nn.LayerNorm(dim), torch.nn.Linear(dim, n_classes)
-    )
-    probe = probe.to(cfg.device)
-
-    # Mini-batch training with DataLoader
-    dataset = torch.utils.data.TensorDataset(features, labels)
-    batch_size = min(cfg.batch_size, len(features))
-    loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, drop_last=False
-    )
-
-    optimizer = torch.optim.AdamW(
-        probe.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
-    criterion = AsymmetricLoss()
-
-    for epoch in helpers.progress(range(cfg.epochs), every=cfg.log_every, desc="train"):
-        probe.train()
-        total_loss = 0.0
-        for x, y in loader:
-            x, y = x.to(cfg.device), y.to(cfg.device)
-            logits = probe(x)
-            loss = criterion(logits, y)
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(probe.parameters(), max_norm=cfg.grad_clip)
-            optimizer.step()
-            total_loss += loss.item()
-        scheduler.step()
-        if (epoch + 1) % cfg.log_every == 0:
-            avg_loss = total_loss / len(loader)
-            logger.info("loss=%.4f lr=%.2e", avg_loss, scheduler.get_last_lr()[0])
-
-    return probe
+# ===============#
+# Probe Training #
+# ===============#
 
 
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
-def train_mlp_probe(
-    features: Float[Tensor, "n d"],
-    labels: Float[Tensor, "n c"],
-    n_classes: int,
-    cfg: Config,
-):
-    """Train a 2-layer MLP probe (like DINOv3 task heads).
+@jaxtyped(typechecker=beartype.beartype)
+def asymmetric_loss(
+    logits: Float[Array, "b c"],
+    targets: Float[Array, "b c"],
+    gamma_neg: float = 4.0,
+    gamma_pos: float = 1.0,
+    clip: float = 0.05,
+    eps: float = 1e-8,
+) -> Float[Array, ""]:
+    """Asymmetric loss for multi-label classification (JAX version)."""
+    probs = jax.nn.sigmoid(logits)
+    probs_pos = probs
+    probs_neg = 1 - probs
 
-    Architecture: LayerNorm -> Linear -> GELU -> Dropout -> Linear
-    """
-    dim = features.shape[1]
-    hidden_dim = dim * 2
-    probe = torch.nn.Sequential(
-        torch.nn.LayerNorm(dim),
-        torch.nn.Linear(dim, hidden_dim),
-        torch.nn.GELU(),
-        torch.nn.Dropout(0.1),
-        torch.nn.Linear(hidden_dim, n_classes),
-    )
-    probe = probe.to(cfg.device)
+    if clip > 0:
+        probs_neg = jnp.clip(probs_neg + clip, max=1)
 
-    dataset = torch.utils.data.TensorDataset(features, labels)
-    batch_size = min(cfg.batch_size, len(features))
-    loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, drop_last=False
-    )
+    loss_pos = targets * jnp.log(jnp.clip(probs_pos, min=eps))
+    loss_neg = (1 - targets) * jnp.log(jnp.clip(probs_neg, min=eps))
+    loss = loss_pos + loss_neg
 
-    optimizer = torch.optim.AdamW(
-        probe.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
-    criterion = AsymmetricLoss()
+    if gamma_neg > 0 or gamma_pos > 0:
+        pt = probs_pos * targets + probs_neg * (1 - targets)
+        gamma = gamma_pos * targets + gamma_neg * (1 - targets)
+        loss = loss * jnp.power(1 - pt, gamma)
 
-    for epoch in helpers.progress(range(cfg.epochs), every=cfg.log_every, desc="train"):
-        probe.train()
-        total_loss = 0.0
-        for x, y in loader:
-            x, y = x.to(cfg.device), y.to(cfg.device)
-            logits = probe(x)
-            loss = criterion(logits, y)
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(probe.parameters(), max_norm=cfg.grad_clip)
-            optimizer.step()
-            total_loss += loss.item()
-        scheduler.step()
-        if (epoch + 1) % cfg.log_every == 0:
-            avg_loss = total_loss / len(loader)
-            logger.info("loss=%.4f lr=%.2e", avg_loss, scheduler.get_last_lr()[0])
-
-    return probe
+    return -loss.mean()
 
 
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
-class CentroidClassifier(torch.nn.Module):
-    """Multi-label nearest-centroid classifier using cosine similarity.
+@jaxtyped(typechecker=beartype.beartype)
+class LinearProbe(eqx.Module):
+    """Linear probe: LayerNorm + Linear."""
 
-    Like SimpleShot but adapted for multi-label: computes per-class centroids and classifies by cosine similarity independently for each class.
-    """
+    norm_weight: Float[Array, " dim"]
+    norm_bias: Float[Array, " dim"]
+    linear_weight: Float[Array, "n_classes dim"]
+    linear_bias: Float[Array, " n_classes"]
+    eps: float = eqx.field(static=True)
 
-    def __init__(self, centroids: Float[Tensor, "c d"]):
-        super().__init__()
-        self.register_buffer("centroids", centroids)
+    def __init__(self, dim: int, n_classes: int, *, key):
+        self.norm_weight = jnp.ones(dim)
+        self.norm_bias = jnp.zeros(dim)
+        self.linear_weight = jr.normal(key, (n_classes, dim)) * 0.02
+        self.linear_bias = jnp.zeros(n_classes)
+        self.eps = 1e-6
 
-    def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b c"]:
-        # L2 normalize
-        x_norm = x / x.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        c_norm = self.centroids / self.centroids.norm(dim=1, keepdim=True).clamp(
-            min=1e-8
+    def __call__(self, x: Float[Array, "batch dim"]) -> Float[Array, "batch n_classes"]:
+        # LayerNorm
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True)
+        x = (x - mean) / jnp.sqrt(var + self.eps) * self.norm_weight + self.norm_bias
+        # Linear
+        return x @ self.linear_weight.T + self.linear_bias
+
+
+@jaxtyped(typechecker=beartype.beartype)
+class MLPProbe(eqx.Module):
+    """MLP probe: LayerNorm + Linear + GELU + Linear."""
+
+    norm_weight: Float[Array, " dim"]
+    norm_bias: Float[Array, " dim"]
+    fc1_weight: Float[Array, "hidden dim"]
+    fc1_bias: Float[Array, " hidden"]
+    fc2_weight: Float[Array, "n_classes hidden"]
+    fc2_bias: Float[Array, " n_classes"]
+    eps: float = eqx.field(static=True)
+
+    def __init__(self, dim: int, n_classes: int, *, key):
+        k1, k2 = jr.split(key)
+        hidden = dim * 2
+        self.norm_weight = jnp.ones(dim)
+        self.norm_bias = jnp.zeros(dim)
+        self.fc1_weight = jr.normal(k1, (hidden, dim)) * 0.02
+        self.fc1_bias = jnp.zeros(hidden)
+        self.fc2_weight = jr.normal(k2, (n_classes, hidden)) * 0.02
+        self.fc2_bias = jnp.zeros(n_classes)
+        self.eps = 1e-6
+
+    def __call__(self, x: Float[Array, "batch dim"]) -> Float[Array, "batch n_classes"]:
+        # LayerNorm
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True)
+        x = (x - mean) / jnp.sqrt(var + self.eps) * self.norm_weight + self.norm_bias
+        # MLP
+        x = x @ self.fc1_weight.T + self.fc1_bias
+        x = jax.nn.gelu(x)
+        return x @ self.fc2_weight.T + self.fc2_bias
+
+
+@jaxtyped(typechecker=beartype.beartype)
+class CentroidClassifier(eqx.Module):
+    """Multi-label nearest-centroid classifier using cosine similarity."""
+
+    centroids: Float[Array, "n_classes dim"]
+
+    def __call__(self, x: Float[Array, "batch dim"]) -> Float[Array, "batch n_classes"]:
+        x_norm = x / jnp.clip(jnp.linalg.norm(x, axis=1, keepdims=True), min=1e-8)
+        c_norm = self.centroids / jnp.clip(
+            jnp.linalg.norm(self.centroids, axis=1, keepdims=True), min=1e-8
         )
-        # Cosine similarity as logits (scale by temperature)
-        return x_norm @ c_norm.T * 10.0  # temperature=0.1 -> scale by 10
+        return x_norm @ c_norm.T * 10.0  # temperature=0.1
 
 
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
-def train_centroid_probe(
-    features: Float[Tensor, "n d"],
-    labels: Float[Tensor, "n c"],
+@jaxtyped(typechecker=beartype.beartype)
+def train_linear_probe(
+    features: Float[Array, "n d"],
+    labels: Float[Array, "n c"],
     n_classes: int,
     cfg: Config,
-) -> CentroidClassifier:
-    """Build a centroid classifier by computing per-class means.
-
-    For multi-label, each class centroid is the mean of all examples containing that class.
-    """
+    key: jax.Array,
+) -> LinearProbe:
+    """Train a linear probe with asymmetric loss."""
     dim = features.shape[1]
-    centroids = torch.zeros(n_classes, dim)
+    probe = LinearProbe(dim, n_classes, key=key)
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(cfg.grad_clip),
+        optax.adamw(cfg.lr, weight_decay=cfg.weight_decay, b1=0.9, b2=0.95),
+    )
+    opt_state = optimizer.init(eqx.filter(probe, eqx.is_inexact_array))
+
+    @eqx.filter_jit
+    def step(probe, opt_state, x, y):
+        def loss_fn(p):
+            logits = jax.vmap(p)(x)
+            return asymmetric_loss(logits, y)
+
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(probe)
+        updates, opt_state_new = optimizer.update(
+            grads, opt_state, eqx.filter(probe, eqx.is_inexact_array)
+        )
+        probe_new = eqx.apply_updates(probe, updates)
+        return probe_new, opt_state_new, loss
+
+    n_samples = len(features)
+    batch_size = min(cfg.batch_size, n_samples)
+    rng = np.random.default_rng(42)
+
+    for epoch in helpers.progress(range(cfg.epochs), every=cfg.log_every, desc="train"):
+        indices = rng.permutation(n_samples)
+        total_loss = 0.0
+        n_batches = 0
+
+        for i in range(0, n_samples, batch_size):
+            batch_i = indices[i : i + batch_size]
+            x = features[batch_i]
+            y = labels[batch_i]
+            probe, opt_state, loss = step(probe, opt_state, x, y)
+            total_loss += float(loss)
+            n_batches += 1
+
+        if (epoch + 1) % cfg.log_every == 0:
+            avg_loss = total_loss / n_batches
+            logger.info("epoch %d: loss=%.4f", epoch + 1, avg_loss)
+
+    return probe
+
+
+@jaxtyped(typechecker=beartype.beartype)
+def train_mlp_probe(
+    features: Float[Array, "n d"],
+    labels: Float[Array, "n c"],
+    n_classes: int,
+    cfg: Config,
+    key: jax.Array,
+) -> MLPProbe:
+    """Train a 2-layer MLP probe."""
+    dim = features.shape[1]
+    probe = MLPProbe(dim, n_classes, key=key)
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(cfg.grad_clip),
+        optax.adamw(cfg.lr, weight_decay=cfg.weight_decay, b1=0.9, b2=0.95),
+    )
+    opt_state = optimizer.init(eqx.filter(probe, eqx.is_inexact_array))
+
+    @eqx.filter_jit
+    def step(probe, opt_state, x, y):
+        def loss_fn(p):
+            logits = jax.vmap(p)(x)
+            return asymmetric_loss(logits, y)
+
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(probe)
+        updates, opt_state_new = optimizer.update(
+            grads, opt_state, eqx.filter(probe, eqx.is_inexact_array)
+        )
+        probe_new = eqx.apply_updates(probe, updates)
+        return probe_new, opt_state_new, loss
+
+    n_samples = len(features)
+    batch_size = min(cfg.batch_size, n_samples)
+    rng = np.random.default_rng(42)
+
+    for epoch in helpers.progress(range(cfg.epochs), every=cfg.log_every, desc="train"):
+        indices = rng.permutation(n_samples)
+        total_loss = 0.0
+        n_batches = 0
+
+        for i in range(0, n_samples, batch_size):
+            batch_i = indices[i : i + batch_size]
+            x = features[batch_i]
+            y = labels[batch_i]
+            probe, opt_state, loss = step(probe, opt_state, x, y)
+            total_loss += float(loss)
+            n_batches += 1
+
+        if (epoch + 1) % cfg.log_every == 0:
+            avg_loss = total_loss / n_batches
+            logger.info("epoch %d: loss=%.4f", epoch + 1, avg_loss)
+
+    return probe
+
+
+@jaxtyped(typechecker=beartype.beartype)
+def train_centroid_probe(
+    features: Float[Array, "n d"], labels: Float[Array, "n c"], n_classes: int
+) -> CentroidClassifier:
+    """Build a centroid classifier by computing per-class means."""
+    dim = features.shape[1]
+    centroids = jnp.zeros((n_classes, dim), dtype=jnp.float32)
 
     for c in range(n_classes):
         mask = labels[:, c] > 0
         if mask.sum() > 0:
-            centroids[c] = features[mask].mean(dim=0)
+            centroids = centroids.at[c].set(features[mask].mean(axis=0))
         else:
             logger.warning("Class %d has no positive examples, using zero centroid.", c)
 
-    return CentroidClassifier(centroids).to(cfg.device)
+    return CentroidClassifier(centroids=centroids)
 
 
-@jaxtyping.jaxtyped(typechecker=beartype.beartype)
-@torch.inference_mode()
+# ==========-#
+# Evaluation #
+# ===========#
+
+
+@beartype.beartype
 def evaluate(
-    probe, test: ExtractedFeatures, device: str
+    probe, test: ExtractedFeatures
 ) -> tuple[float, int, list[reporting.Prediction]]:
     """Evaluate and return cmAP along with per-example predictions."""
-    probe.eval()
-    features = test.features.to(device)
-    logits = probe(features)
-    probs = torch.sigmoid(logits).cpu().numpy()
-    labels = test.labels.numpy()
+    features = test.features
 
-    # cmAP: average AP across classes
+    # Run inference in batches to avoid OOM
+    batch_size = 256
+    all_probs = []
+    for i in range(0, len(features), batch_size):
+        batch = features[i : i + batch_size]
+        logits = jax.vmap(probe)(batch)
+        probs = jax.nn.sigmoid(logits)
+        all_probs.append(probs)
+
+    probs = jnp.concatenate(all_probs, axis=0)
+    labels = test.labels
+
+    # cmAP: average AP across classes (need numpy for sklearn)
+    probs_np = np.array(probs)
+    labels_np = np.array(labels)
     aps = []
-    for c in range(labels.shape[1]):
-        if labels[:, c].sum() > 0:
-            ap = sklearn.metrics.average_precision_score(labels[:, c], probs[:, c])
+    for c in range(labels_np.shape[1]):
+        if labels_np[:, c].sum() > 0:
+            ap = sklearn.metrics.average_precision_score(
+                labels_np[:, c], probs_np[:, c]
+            )
             aps.append(ap)
 
     cmap = float(np.mean(aps)) if aps else 0.0
@@ -795,9 +768,9 @@ def evaluate(
     # Build predictions list
     predictions = []
     for i, example_id in enumerate(test.ids):
-        y_true = [int(c) for c in range(labels.shape[1]) if labels[i, c] > 0]
-        y_pred = [int(c) for c in range(probs.shape[1]) if probs[i, c] > 0.5]
-        y_score = [float(probs[i, c]) for c in range(probs.shape[1])]
+        y_true = [int(c) for c in range(labels_np.shape[1]) if labels_np[i, c] > 0]
+        y_pred = [int(c) for c in range(probs_np.shape[1]) if probs_np[i, c] > 0.5]
+        y_score = [float(probs_np[i, c]) for c in range(probs_np.shape[1])]
         predictions.append(reporting.Prediction(example_id, y_true, y_pred, y_score))
 
     return cmap, len(aps), predictions
