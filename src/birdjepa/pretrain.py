@@ -34,7 +34,7 @@ logger = logging.getLogger("birdjepa.pretrain")
 def _is_numeric_array(x: object) -> bool:
     """Check if x is a numeric array that can be converted to JAX."""
     if not isinstance(x, (jax.Array, np.ndarray)):
-        return True
+        return False
     dt = getattr(x, "dtype", None)
     if dt is None:
         return False
@@ -544,7 +544,7 @@ def worker_fn(cfg: Config):
             max_to_keep=5,
             enable_async_checkpointing=True,
         ),
-        item_names=("state", "metadata"),
+        item_names=("state", "encoder", "metadata"),
     )
     logger.info("Checkpoint manager created (save_interval=500, max_to_keep=5)")
 
@@ -595,7 +595,11 @@ def worker_fn(cfg: Config):
             step,
             args=ocp.args.Composite(
                 state=ocp.args.StandardSave(models | {"opt_state": opt_state}),
-                metadata=ocp.args.JsonSave({"step": step}),
+                encoder=ocp.args.StandardSave(models["encoder"]),  # For inference
+                metadata=ocp.args.JsonSave({
+                    "step": step,
+                    "encoder_config": dataclasses.asdict(cfg.model),
+                }),
             ),
         )
 
@@ -684,7 +688,11 @@ def worker_fn(cfg: Config):
         step,
         args=ocp.args.Composite(
             state=ocp.args.StandardSave(models | {"opt_state": opt_state}),
-            metadata=ocp.args.JsonSave({"step": step}),
+            encoder=ocp.args.StandardSave(models["encoder"]),  # For inference
+            metadata=ocp.args.JsonSave({
+                "step": step,
+                "encoder_config": dataclasses.asdict(cfg.model),
+            }),
         ),
         force=True,
     )
