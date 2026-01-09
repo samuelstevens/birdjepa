@@ -153,21 +153,22 @@ def make_dataset(
 
 
 @beartype.beartype
-def load_checkpoint(
-    mngr: ocp.CheckpointManager, encoder, objective, probe, opt_state, key
-):
-    """Load latest checkpoint. Returns (encoder, objective, probe, opt_state, key, start_step) or None."""
+def load_checkpoint(mngr: ocp.CheckpointManager, encoder, objective, probe, opt_state):
+    """Load latest checkpoint. Returns (encoder, objective, probe, opt_state, start_step) or None.
+
+    Note: JAX PRNG key is not checkpointed (host-local, can't serialize in distributed mode).
+    Caller should continue using existing key after resume.
+    """
     step = mngr.latest_step()
     if step is None:
         return None
 
-    # Create abstract structure for restore
+    # Create abstract structure for restore (key not saved - see note above)
     abstract_state = {
         "encoder": encoder,
         "objective": objective,
         "probe": probe,
         "opt_state": opt_state,
-        "key": key,
     }
     restored = mngr.restore(
         step,
@@ -184,7 +185,6 @@ def load_checkpoint(
         state["objective"],
         state["probe"],
         state["opt_state"],
-        state["key"],
         metadata["step"],
     )
 
@@ -550,10 +550,10 @@ def worker_fn(cfg: Config):
 
     # Resume from checkpoint (auto-resume if checkpoint exists)
     start_step = 0
-    restored = load_checkpoint(ckpt_mngr, encoder, objective, probe, opt_state, key)
+    restored = load_checkpoint(ckpt_mngr, encoder, objective, probe, opt_state)
     if restored is not None:
-        encoder, objective, probe, opt_state, key, start_step = restored
-        # Note: Rust loader state is not checkpointed - resume continues from shuffled order
+        encoder, objective, probe, opt_state, start_step = restored
+        # Note: Rust loader state and PRNG key are not checkpointed
         logger.info("Resumed from checkpoint (dataloader restarts from beginning)")
 
     # Create train_step with sharding
