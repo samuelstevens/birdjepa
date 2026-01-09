@@ -186,7 +186,7 @@ def worker_fn(cfg: Config) -> None:
     if cfg.n_train > 0:
         # Sample n_train per class: stream twice to avoid OOM
         logger.info("First pass: collecting labels for sampling...")
-        all_labels = [ex[BIRDSET_LABEL_COL] for ex in ds["train"]]
+        all_labels = list(ds["train"][BIRDSET_LABEL_COL])
         selected_i = sample_indices_per_class(all_labels, cfg.n_train, n_classes)
 
         logger.info("Second pass: collecting %d selected examples...", len(selected_i))
