@@ -18,10 +18,10 @@ import jax.random as jr
 import jax.numpy as jnp
 import numpy as np
 import optax
-import orbax.checkpoint as ocp
 import wandb
 import wandb.util
 
+import birdjepa.checkpoints
 import birdjepa.data
 import birdjepa.helpers
 import birdjepa.nn.objectives
@@ -150,43 +150,6 @@ def make_dataset(
         return birdjepa.data.Cifar100Dataset(cfg)
     else:
         tp.assert_never(cfg)
-
-
-@beartype.beartype
-def load_checkpoint(mngr: ocp.CheckpointManager, encoder, objective, probe, opt_state):
-    """Load latest checkpoint. Returns (encoder, objective, probe, opt_state, start_step) or None.
-
-    Note: JAX PRNG key is not checkpointed (host-local, can't serialize in distributed mode).
-    Caller should continue using existing key after resume.
-    """
-    step = mngr.latest_step()
-    if step is None:
-        return None
-
-    # Create abstract structure for restore (key not saved - see note above)
-    abstract_state = {
-        "encoder": encoder,
-        "objective": objective,
-        "probe": probe,
-        "opt_state": opt_state,
-    }
-    restored = mngr.restore(
-        step,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(abstract_state),
-            metadata=ocp.args.JsonRestore(),
-        ),
-    )
-    state = restored["state"]
-    metadata = restored["metadata"]
-    logger.info("Loaded checkpoint step=%d", metadata["step"])
-    return (
-        state["encoder"],
-        state["objective"],
-        state["probe"],
-        state["opt_state"],
-        metadata["step"],
-    )
 
 
 def softmax_cross_entropy(logits, labels):
@@ -535,22 +498,15 @@ def worker_fn(cfg: Config):
         logger.info("Checkpoint dir: %s", ckpt_dpath)
 
     # Create checkpoint manager (handles retention, async saves)
-    # save_interval_steps controls how often we save; also saves on preemption
     logger.info("Creating checkpoint manager")
-    ckpt_mngr = ocp.CheckpointManager(
-        ckpt_dpath,
-        options=ocp.CheckpointManagerOptions(
-            save_interval_steps=500,
-            max_to_keep=5,
-            enable_async_checkpointing=True,
-        ),
-        item_names=("state", "encoder", "metadata"),
-    )
+    ckpt_mngr = birdjepa.checkpoints.CheckpointManager(ckpt_dpath)
     logger.info("Checkpoint manager created (save_interval=500, max_to_keep=5)")
 
     # Resume from checkpoint (auto-resume if checkpoint exists)
     start_step = 0
-    restored = load_checkpoint(ckpt_mngr, encoder, objective, probe, opt_state)
+    restored = ckpt_mngr.load_training(
+        encoder, objective, probe, opt_state, encoder_config=cfg.model
+    )
     if restored is not None:
         encoder, objective, probe, opt_state, start_step = restored
         # Note: Rust loader state and PRNG key are not checkpointed
@@ -592,15 +548,12 @@ def worker_fn(cfg: Config):
         # NOTE: All processes must call save() - orbax handles primary host logic internally
         # NOTE: Don't save JAX PRNG key - it's host-local and can't be serialized in distributed mode
         ckpt_mngr.save(
-            step,
-            args=ocp.args.Composite(
-                state=ocp.args.StandardSave(models | {"opt_state": opt_state}),
-                encoder=ocp.args.StandardSave(models["encoder"]),  # For inference
-                metadata=ocp.args.JsonSave({
-                    "step": step,
-                    "encoder_config": dataclasses.asdict(cfg.model),
-                }),
-            ),
+            step=step,
+            encoder=models["encoder"],
+            objective=models["objective"],
+            probe=models["probe"],
+            opt_state=opt_state,
+            encoder_config=cfg.model,
         )
 
         # Log peak memory usage after first step (includes JIT compilation overhead)
@@ -685,15 +638,12 @@ def worker_fn(cfg: Config):
     # Save final checkpoint and wait for async saves to complete
     # NOTE: All processes must call save() - orbax handles primary host logic internally
     ckpt_mngr.save(
-        step,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardSave(models | {"opt_state": opt_state}),
-            encoder=ocp.args.StandardSave(models["encoder"]),  # For inference
-            metadata=ocp.args.JsonSave({
-                "step": step,
-                "encoder_config": dataclasses.asdict(cfg.model),
-            }),
-        ),
+        step=step,
+        encoder=models["encoder"],
+        objective=models["objective"],
+        probe=models["probe"],
+        opt_state=opt_state,
+        encoder_config=cfg.model,
         force=True,
     )
     ckpt_mngr.wait_until_finished()
