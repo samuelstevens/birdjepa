@@ -78,7 +78,7 @@ class PatchEmbed(eqx.Module):
     """Patch embedding using 2D convolution."""
 
     proj_weight: Float[Array, "embed_dim in_chans patch_h patch_w"]
-    proj_bias: Float[Array, "embed_dim"]
+    proj_bias: Float[Array, " embed_dim"]
     patch_size: int = eqx.field(static=True)
 
     def __init__(self, cfg: Config, *, key: PRNGKeyArray):
@@ -203,10 +203,10 @@ class Encoder(eqx.Module):
     cls_token: Float[Array, "1 1 dim"]
     pos_embed: Float[Array, "1 n_tokens dim"]
     blocks: list[Block]
-    norm_weight: Float[Array, "dim"]
-    norm_bias: Float[Array, "dim"]
-    fc_norm_weight: Float[Array, "dim"]
-    fc_norm_bias: Float[Array, "dim"]
+    norm_weight: Float[Array, " dim"]
+    norm_bias: Float[Array, " dim"]
+    fc_norm_weight: Float[Array, " dim"]
+    fc_norm_bias: Float[Array, " dim"]
     eps: float = eqx.field(static=True)
 
     def __init__(self, cfg: Config, *, key: PRNGKeyArray):

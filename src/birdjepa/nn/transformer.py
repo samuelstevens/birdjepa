@@ -425,8 +425,7 @@ class TransformerModel(eqx.Module):
 
     def __init__(self, cfg: Transformer, *, key: PRNGKeyArray):
         keys = jr.split(key, cfg.depth + 4)
-        patch_key, cls_key, reg_key, pos_key = keys[:4]
-        block_keys = keys[4:]
+        patch_key, cls_key, reg_key, pos_key, *block_keys = keys
 
         self.cfg = cfg
         self.patch_embed = PatchEmbed(cfg, key=patch_key)
@@ -459,7 +458,10 @@ class TransformerModel(eqx.Module):
         # Transformer blocks
         if cfg.use_scan:
             # Stacked via filter_vmap for scan optimization
-            self.blocks = eqx.filter_vmap(lambda k: Block(cfg, key=k))(block_keys)
+            # Must stack keys into array - filter_vmap doesn't unpack Python lists
+            self.blocks = eqx.filter_vmap(lambda k: Block(cfg, key=k))(
+                jnp.stack(block_keys)
+            )
         else:
             # Tuple of blocks for explicit loop (debugging)
             self.blocks = tuple(Block(cfg, key=k) for k in block_keys)
