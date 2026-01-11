@@ -41,6 +41,8 @@ class Transformer:
     # "Free wins" from recent papers
     use_rope: bool = False
     """Use rotary positional embeddings instead of absolute."""
+    rope_base: float = 100.0
+    """Base frequency for RoPE. Higher = longer-range position sensitivity."""
     use_qk_norm: bool = False
     """Apply LayerNorm to queries and keys for attention stability."""
     use_swiglu: bool = False
@@ -232,6 +234,99 @@ class PatchEmbed(eqx.Module):
         return jax.vmap(jax.vmap(self.proj))(x_btk)
 
 
+class RopePositionEmbedding(eqx.Module):
+    """2D Rotary Position Embedding for vision.
+
+    Generates sin/cos embeddings for 2D grid positions. Applies separate rotations for H and W axes (axial RoPE).
+    """
+
+    d_head: int = eqx.field(static=True)
+    periods: Float[Array, " d_quarter"]
+
+    def __init__(self, embed_dim: int, n_heads: int, base: float):
+        self.d_head = embed_dim // n_heads
+        assert self.d_head % 4 == 0, (
+            f"head_dim must be divisible by 4, got {self.d_head}"
+        )
+        # Periods for each frequency: base^(2i / (d_head/2)) for i in [0, d_head/4)
+        # d_head/4 because we have 2 axes (H, W) and each gets d_head/2 dims
+        d_quarter = self.d_head // 4
+        self.periods = base ** (2 * jnp.arange(d_quarter) / (self.d_head // 2))
+
+    @jaxtyped(typechecker=beartype.beartype)
+    def __call__(
+        self, grid: Int[Array, "b t 2"]
+    ) -> tuple[Float[Array, "b t d_head"], Float[Array, "b t d_head"]]:
+        """Compute sin/cos embeddings for grid positions.
+
+        Args:
+            grid: Grid coordinates (row, col) for each patch, shape (B, T, 2).
+
+        Returns:
+            (sin, cos) each of shape (B, T, d_head).
+        """
+        b, t, _ = grid.shape
+        # Normalize coords to [-1, +1] range (separate normalization for H and W)
+        # We don't know the actual grid size, so use max coord in batch
+        h_coords = grid[..., 0].astype(jnp.float32)
+        w_coords = grid[..., 1].astype(jnp.float32)
+        h_max = jnp.maximum(h_coords.max(), 1.0)
+        w_max = jnp.maximum(w_coords.max(), 1.0)
+        h_norm = (h_coords + 0.5) / (h_max + 1) * 2 - 1  # [-1, +1]
+        w_norm = (w_coords + 0.5) / (w_max + 1) * 2 - 1  # [-1, +1]
+
+        # Compute angles: 2π × coord / period
+        # Shape: (B, T, d_quarter)
+        angles_h = 2 * jnp.pi * h_norm[..., None] / self.periods[None, None, :]
+        angles_w = 2 * jnp.pi * w_norm[..., None] / self.periods[None, None, :]
+
+        # Interleave H and W angles, then tile to fill d_head
+        # [H angles | W angles] for first half, repeat for second half
+        angles = jnp.concatenate([angles_h, angles_w], axis=-1)  # (B, T, d_head/2)
+        angles = jnp.tile(angles, 2)  # (B, T, d_head)
+
+        return jnp.sin(angles), jnp.cos(angles)
+
+
+@jaxtyped(typechecker=beartype.beartype)
+def _rotate_half(x: Float[Array, "... d"]) -> Float[Array, "... d"]:
+    """Rotate the second half of x to the first, negated."""
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    return jnp.concatenate([-x2, x1], axis=-1)
+
+
+@jaxtyped(typechecker=beartype.beartype)
+def _apply_rope(
+    q: Float[Array, "b n h d"],
+    k: Float[Array, "b n h d"],
+    sin: Float[Array, "b t d"],
+    cos: Float[Array, "b t d"],
+    n_prefix: int,
+) -> tuple[Float[Array, "b n h d"], Float[Array, "b n h d"]]:
+    """Apply rotary embeddings to Q and K, skipping prefix tokens (CLS, etc).
+
+    Args:
+        q, k: Query and key tensors, shape (B, N, n_heads, head_dim).
+        sin, cos: Sin/cos from RopePositionEmbedding, shape (B, T, head_dim).
+        n_prefix: Number of prefix tokens to skip (CLS + register tokens).
+    """
+    # Split prefix and position-encoded parts
+    q_prefix, q_pos = q[:, :n_prefix], q[:, n_prefix:]
+    k_prefix, k_pos = k[:, :n_prefix], k[:, n_prefix:]
+
+    # Apply RoPE: x * cos + rotate_half(x) * sin
+    # sin/cos have shape (B, T, d), need to broadcast over heads
+    sin_expanded = sin[:, :, None, :]  # (B, T, 1, d)
+    cos_expanded = cos[:, :, None, :]  # (B, T, 1, d)
+
+    q_pos = q_pos * cos_expanded + _rotate_half(q_pos) * sin_expanded
+    k_pos = k_pos * cos_expanded + _rotate_half(k_pos) * sin_expanded
+
+    q_out = jnp.concatenate([q_prefix, q_pos], axis=1)
+    k_out = jnp.concatenate([k_prefix, k_pos], axis=1)
+    return q_out, k_out
+
+
 class Attention(eqx.Module):
     """Multi-head self-attention."""
 
@@ -266,7 +361,14 @@ class Attention(eqx.Module):
             self.k_norm = None
 
     @jaxtyped(typechecker=beartype.beartype)
-    def __call__(self, x_bnd: Float[Array, "b n d"]) -> Float[Array, "b n d"]:
+    def __call__(
+        self,
+        x_bnd: Float[Array, "b n d"],
+        *,
+        rope: tuple[Float[Array, "b t d_head"], Float[Array, "b t d_head"]]
+        | None = None,
+        n_prefix: int = 0,
+    ) -> Float[Array, "b n d"]:
         b, n, d = x_bnd.shape
 
         # Compute QKV
@@ -283,7 +385,9 @@ class Attention(eqx.Module):
 
         # RoPE
         if self.use_rope:
-            raise NotImplementedError("RoPE not yet implemented")
+            assert rope is not None, "use_rope=True but rope not provided"
+            sin, cos = rope
+            q, k = _apply_rope(q, k, sin, cos, n_prefix)
 
         # Use JAX's memory-efficient attention (flash attention on GPU)
         out = jax.nn.dot_product_attention(q, k, v, scale=self.scale)
@@ -386,11 +490,17 @@ class Block(eqx.Module):
             self.gamma2 = None
 
     def __call__(
-        self, x_bnd: Float[Array, "b n d"], *, key: PRNGKeyArray | None = None
+        self,
+        x_bnd: Float[Array, "b n d"],
+        *,
+        key: PRNGKeyArray | None = None,
+        rope: tuple[Float[Array, "b t d_head"], Float[Array, "b t d_head"]]
+        | None = None,
+        n_prefix: int = 0,
     ) -> Float[Array, "b n d"]:
         # Attention block (no dropout - uses flash attention)
         normed = jax.vmap(jax.vmap(self.norm1))(x_bnd)
-        attn_out = self.attn(normed)
+        attn_out = self.attn(normed, rope=rope, n_prefix=n_prefix)
         if self.gamma1 is not None:
             attn_out = self.gamma1 * attn_out
         x = x_bnd + attn_out
@@ -420,6 +530,7 @@ class TransformerModel(eqx.Module):
     cls_tokens: Float[Array, "1 n_cls d"]
     reg_tokens: Float[Array, "1 n_reg d"] | None
     pos_embed_hw: Float[Array, "1 nh nw d"] | None
+    rope_embed: RopePositionEmbedding | None
     blocks: Block | tuple[Block, ...]  # Stacked (scan) or tuple (loop)
     norm: eqx.nn.LayerNorm
 
@@ -446,8 +557,12 @@ class TransformerModel(eqx.Module):
 
         # Positional embeddings
         if cfg.use_rope:
-            raise NotImplementedError("RoPE not yet implemented")
+            self.rope_embed = RopePositionEmbedding(
+                cfg.embed_dim, cfg.n_heads, cfg.rope_base
+            )
+            self.pos_embed_hw = None
         else:
+            self.rope_embed = None
             self.pos_embed_hw = (
                 jr.truncated_normal(
                     pos_key, -2, 2, (1, cfg.n_patches_h, cfg.n_patches_w, cfg.embed_dim)
@@ -494,10 +609,13 @@ class TransformerModel(eqx.Module):
         # Patch embedding
         x = self.patch_embed(x_btk)  # (B, T, D)
 
-        # Add positional embeddings based on grid coordinates
+        # Add positional embeddings based on grid coordinates (absolute pos embed)
         if self.pos_embed_hw is not None:
             pos_embed = self.pos_embed_hw[0, grid[..., 0], grid[..., 1]]  # (B, T, D)
             x = x + pos_embed
+
+        # Compute RoPE sin/cos if using rotary embeddings
+        rope = self.rope_embed(grid) if self.rope_embed is not None else None
 
         # Prepend CLS tokens
         cls = jnp.broadcast_to(self.cls_tokens, (b, n_cls, self.cfg.embed_dim))
@@ -522,18 +640,24 @@ class TransformerModel(eqx.Module):
                 arrays_i, key_i = inputs
                 block = eqx.combine(arrays_i, block_static)
                 if self.cfg.grad_ckpt:
-                    return jax.checkpoint(lambda x: block(x, key=key_i))(x), None
-                return block(x, key=key_i), None
+                    return jax.checkpoint(
+                        lambda x: block(x, key=key_i, rope=rope, n_prefix=n_cls)
+                    )(x), None
+                return block(x, key=key_i, rope=rope, n_prefix=n_cls), None
 
             x, _ = jax.lax.scan(scan_fn, x, (block_arrays, block_keys))
         else:
             # Explicit loop (for debugging gradient flow)
             assert isinstance(self.blocks, tuple)
-            for block, key in zip(self.blocks, block_keys):
+            for block, blk_key in zip(self.blocks, block_keys):
                 if self.cfg.grad_ckpt:
-                    x = jax.checkpoint(lambda x, b=block, k=key: b(x, key=k))(x)
+                    x = jax.checkpoint(
+                        lambda x, b=block, k=blk_key: b(
+                            x, key=k, rope=rope, n_prefix=n_cls
+                        )
+                    )(x)
                 else:
-                    x = block(x, key=key)
+                    x = block(x, key=blk_key, rope=rope, n_prefix=n_cls)
 
         # Final norm
         x = jax.vmap(jax.vmap(self.norm))(x)

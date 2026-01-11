@@ -104,6 +104,8 @@ class Config:
     """Loss weight for source prediction."""
     grad_clip: float = 1.0
     """Gradient clipping norm. 0 = disabled."""
+    optimizer: tp.Literal["adamw", "muon"] = "adamw"
+    """Optimizer: 'adamw' or 'muon' (applies muon to 2D params, adamw to others)."""
     # Schedule
     schedule: tp.Literal["cosine", "wsd"] = "cosine"
     """LR schedule: 'cosine' (warmup + cosine decay) or 'wsd' (warmup-stable-decay)."""
@@ -474,7 +476,12 @@ def worker_fn(cfg: Config):
         )
     else:
         tp.assert_never(cfg.model)
-    optim = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
+    if cfg.optimizer == "muon":
+        optim = optax.contrib.muon(learning_rate=schedule)
+    elif cfg.optimizer == "adamw":
+        optim = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
+    else:
+        tp.assert_never(cfg.optimizer)
     if cfg.grad_clip > 0:
         optim = optax.chain(
             optax.clip_by_global_norm(cfg.grad_clip),

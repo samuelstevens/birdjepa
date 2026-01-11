@@ -588,3 +588,44 @@ def test_nested_override_partially_filters_sweep():
     assert all(cfg.model.embed_dim == 512 for cfg in cfgs)
     assert cfgs[0].model.depth == 6
     assert cfgs[1].model.depth == 12
+
+
+# -----------------------------------------------------------------------------
+# Tests for free wins sweep
+# -----------------------------------------------------------------------------
+
+
+def test_free_wins_sweep_loading():
+    """Free wins sweep config loads correctly."""
+    sweep_path = pathlib.Path("sweeps/001_freewins/free_wins_vits_xcl.py")
+    if not sweep_path.exists():
+        pytest.skip("Sweep file not found")
+
+    sweep = birdjepa.configs.load_sweep(sweep_path)
+
+    assert len(sweep) == 4
+    for cfg_dict in sweep:
+        assert cfg_dict["model"]["use_rope"] is True
+        assert cfg_dict["model"]["use_qk_norm"] is True
+        assert cfg_dict["model"]["use_swiglu"] is True
+        assert cfg_dict["model"]["use_layerscale"] is True
+        assert cfg_dict["optimizer"] in ["adamw", "muon"]
+
+
+def test_free_wins_config_instantiation_from_sweep():
+    """Sweep dicts can be converted to Config objects."""
+    sweep_path = pathlib.Path("sweeps/001_freewins/free_wins_vits_xcl.py")
+    if not sweep_path.exists():
+        pytest.skip("Sweep file not found")
+
+    sweep = birdjepa.configs.load_sweep(sweep_path)
+    cfgs, errs = birdjepa.configs.load_cfgs(
+        birdjepa.pretrain.Config(), default=birdjepa.pretrain.Config(), sweep_dcts=sweep
+    )
+
+    assert len(errs) == 0
+    assert len(cfgs) == 4
+
+    for cfg in cfgs:
+        assert cfg.model.use_rope is True
+        assert cfg.optimizer in ["adamw", "muon"]
