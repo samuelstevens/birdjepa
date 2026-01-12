@@ -714,6 +714,7 @@ def cli(cfg: Config):
     )
     if n_cpus > base.n_workers:
         logger.info("Requesting %d CPUs to get %dGB RAM", n_cpus, base.mem_gb)
+    tag = pathlib.Path(base.sweep).stem if base.sweep else "local"
     executor.update_parameters(
         time=int(base.n_hours * 60),
         partition=base.slurm_partition,
@@ -722,6 +723,7 @@ def cli(cfg: Config):
         cpus_per_task=n_cpus,
         stderr_to_stdout=True,
         account=base.slurm_acct,
+        job_name=f"pretrain[{tag}]",
         setup=[
             "module load ffmpeg/6.1.1",
             "export NCCL_IB_DISABLE=1",  # Disable InfiniBand (not available)

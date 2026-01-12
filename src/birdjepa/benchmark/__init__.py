@@ -356,21 +356,21 @@ def cli(cfg: Config):
         import submitit
 
         executor = submitit.SlurmExecutor(folder=cfg.log_to)
-        executor.update_parameters(
-            time=int(cfg.n_hours * 60),
-            partition=cfg.slurm_partition,
-            gpus_per_node=1,
-            ntasks_per_node=1,
-            cpus_per_task=4,
-            stderr_to_stdout=True,
-            account=cfg.slurm_acct,
-            setup=["module load ffmpeg/6.1.1"],
-        )
-
-        with executor.batch():
-            jobs = [executor.submit(worker_fn, c) for c in to_run]
-
-        for job, c in zip(jobs, to_run):
+        jobs = []
+        for c in to_run:
+            executor.update_parameters(
+                time=int(cfg.n_hours * 60),
+                partition=cfg.slurm_partition,
+                gpus_per_node=1,
+                ntasks_per_node=1,
+                cpus_per_task=4,
+                stderr_to_stdout=True,
+                account=cfg.slurm_acct,
+                job_name=f"benchmark[{c.task}]",
+                setup=["module load ffmpeg/6.1.1"],
+            )
+            job = executor.submit(worker_fn, c)
+            jobs.append(job)
             logger.info("Submitted job %s for %s", job.job_id, make_exp_key(c))
     else:
         for c in to_run:
