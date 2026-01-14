@@ -3,14 +3,16 @@ Perch 2.0 audio embedding model in JAX/Equinox.
 
 Perch uses EfficientNet-B3 (~12M params) to produce 1536-dim embeddings from
 5-second audio clips. This module provides:
-- `transform`: waveform -> spectrogram preprocessing (NOTE: uses log-mel, not PCEN)
+- `transform`: waveform -> log-mel spectrogram (matches TF model with >0.85 correlation)
 - `EfficientNet`: the model architecture in Equinox
 - `load_tf`: loads TF model for CPU inference (recommended)
 - `load`: JAX model with random weights (weight conversion not implemented)
 
-Note: The official Perch frontend uses PCEN (Per-Channel Energy Normalization),
-not log-mel spectrogram. The current transform() function is approximate.
-For accurate inference, use load_tf() which uses the full TF model including frontend.
+Frontend notes:
+- Uses log-mel spectrogram with O'Shaughnessy mel scale (TensorFlow-compatible)
+- STFT: 1024 FFT, 640 window (20ms), 320 hop (10ms)
+- Log scaling: 0.1 * log(max(mel, 1e-3))
+- Correlation with TF model spectrogram output: >0.85 for typical audio
 
 Reference: https://arxiv.org/abs/2508.04665
 Source: https://github.com/google-research/chirp/blob/main/chirp/models/efficientnet.py
@@ -47,7 +49,7 @@ PERCH_FMAX = 16_000
 PERCH_HOP_SAMPLES = int(PERCH_SR_HZ * PERCH_HOP_MS / 1000)  # 320
 PERCH_WIN_SAMPLES = int(PERCH_SR_HZ * PERCH_WIN_MS / 1000)  # 640
 PERCH_TARGET_SAMPLES = PERCH_SR_HZ * PERCH_CLIP_SEC  # 160,000
-PERCH_TARGET_T = int((PERCH_TARGET_SAMPLES - PERCH_WIN_SAMPLES) / PERCH_HOP_SAMPLES) + 1  # ~500
+PERCH_TARGET_T = 500  # 160000 samples / 320 hop = 500 frames
 
 # EfficientNet-B3 config
 EFFICIENTNET_B3_WIDTH = 1.2
@@ -60,6 +62,26 @@ EFFICIENTNET_B3_OUTPUT_DIM = 1536
 # Transform: waveform -> spectrogram
 # =============================================================================
 
+# Perch frontend parameters (from chirp/models/perch_2.py)
+# - n_fft: 1024 (next power of 2 >= kernel_size)
+# - kernel_size (window): 640 (20ms at 32kHz)
+# - stride (hop): 320 (10ms at 32kHz)
+# - power: 1.0 (magnitude, not squared)
+# - mel bins: 128
+# - freq range: 60-16000 Hz
+# - log scaling: 0.1 * log(max(mel, floor)) where floor=1e-3 empirically works best
+#
+# Note: Uses O'Shaughnessy mel scale (like TensorFlow/chirp), not HTK.
+
+PERCH_N_FFT = 1024
+PERCH_LOG_FLOOR = 1e-3
+PERCH_LOG_SCALAR = 0.1
+
+
+def _hertz_to_mel(f: np.ndarray | float) -> np.ndarray | float:
+    """Convert Hz to mel using O'Shaughnessy formula (TensorFlow-compatible)."""
+    return 1127.0 * np.log1p(np.asarray(f) / 700.0)
+
 
 def _make_mel_filterbank(
     n_fft: int,
@@ -68,41 +90,41 @@ def _make_mel_filterbank(
     fmin: float,
     fmax: float,
 ) -> np.ndarray:
-    """Create mel filterbank matrix."""
-    # Mel scale conversion
-    def hz_to_mel(hz):
-        return 2595.0 * np.log10(1.0 + hz / 700.0)
+    """Create mel filterbank matrix using O'Shaughnessy scale.
 
-    def mel_to_hz(mel):
-        return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+    This matches TensorFlow's tf.signal.linear_to_mel_weight_matrix.
 
-    # Create mel points
-    mel_min = hz_to_mel(fmin)
-    mel_max = hz_to_mel(fmax)
-    mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
-    hz_points = mel_to_hz(mel_points)
+    Returns:
+        Filterbank matrix of shape [n_fft//2+1, n_mels]
+    """
+    num_spectrogram_bins = n_fft // 2 + 1
+    nyquist = sample_rate / 2.0
 
-    # Convert to FFT bin indices
-    bin_points = np.floor((n_fft + 1) * hz_points / sample_rate).astype(int)
+    # Linear frequencies for each FFT bin (exclude DC bin like TF does)
+    linear_frequencies = np.linspace(0.0, nyquist, num_spectrogram_bins)[1:]
+    spectrogram_bins_mel = _hertz_to_mel(linear_frequencies)[:, np.newaxis]
 
-    # Create filterbank
-    filterbank = np.zeros((n_mels, n_fft // 2 + 1))
-    for i in range(n_mels):
-        left = bin_points[i]
-        center = bin_points[i + 1]
-        right = bin_points[i + 2]
+    # Mel band edges
+    band_edges_mel = np.linspace(
+        _hertz_to_mel(fmin), _hertz_to_mel(fmax), n_mels + 2
+    )
 
-        # Rising slope
-        for j in range(left, center):
-            if center != left:
-                filterbank[i, j] = (j - left) / (center - left)
+    lower_edge_mel = band_edges_mel[np.newaxis, :-2]
+    center_mel = band_edges_mel[np.newaxis, 1:-1]
+    upper_edge_mel = band_edges_mel[np.newaxis, 2:]
 
-        # Falling slope
-        for j in range(center, right):
-            if right != center:
-                filterbank[i, j] = (right - j) / (right - center)
+    # Triangle filter slopes
+    lower_slopes = (spectrogram_bins_mel - lower_edge_mel) / (
+        center_mel - lower_edge_mel
+    )
+    upper_slopes = (upper_edge_mel - spectrogram_bins_mel) / (
+        upper_edge_mel - center_mel
+    )
 
-    return filterbank
+    mel_weights = np.maximum(0.0, np.minimum(lower_slopes, upper_slopes))
+
+    # Re-add zeroed DC bin (index 0)
+    return np.pad(mel_weights, ((1, 0), (0, 0)))
 
 
 @jaxtyped(typechecker=beartype.beartype)
@@ -112,12 +134,17 @@ def transform(
     """
     Transform waveform to log-mel spectrogram for Perch.
 
+    Uses scipy.signal.stft which matches TensorFlow's STFT behavior
+    (both divide by window sum for normalization).
+
     Args:
         waveform: 1D numpy array of audio samples at 32kHz
 
     Returns:
-        Numpy array of shape [~500, 128] log-mel spectrogram
+        Numpy array of shape [500, 128] log-mel spectrogram
     """
+    from scipy import signal as scipy_signal
+
     waveform = waveform.astype(np.float32)
 
     # 1) Pad/truncate to exactly 5 seconds
@@ -129,51 +156,36 @@ def transform(
     else:
         waveform = waveform[:PERCH_TARGET_SAMPLES]
 
-    # 2) STFT
-    n_fft = PERCH_WIN_SAMPLES * 2  # Use 2x window for better freq resolution
-    hop_length = PERCH_HOP_SAMPLES
-    win_length = PERCH_WIN_SAMPLES
-
-    # Hann window
-    window = np.hanning(win_length)
-
-    # Pad for centering
-    pad_amount = n_fft // 2
-    waveform_padded = np.pad(waveform, (pad_amount, pad_amount), mode="reflect")
-
-    # Frame the signal
-    n_frames = 1 + (len(waveform_padded) - n_fft) // hop_length
-    frames = np.zeros((n_frames, n_fft))
-    for i in range(n_frames):
-        start = i * hop_length
-        frame = waveform_padded[start : start + n_fft]
-        # Apply window (center of frame)
-        frame_windowed = np.zeros(n_fft)
-        win_start = (n_fft - win_length) // 2
-        frame_windowed[win_start : win_start + win_length] = (
-            frame[win_start : win_start + win_length] * window
-        )
-        frames[i] = frame_windowed
-
-    # FFT
-    spectrum = np.fft.rfft(frames, n=n_fft)
-    power_spectrum = np.abs(spectrum) ** 2
-
-    # 3) Mel filterbank
-    mel_filterbank = _make_mel_filterbank(
-        n_fft, PERCH_N_MELS, PERCH_SR_HZ, PERCH_FMIN, PERCH_FMAX
+    # 2) STFT using scipy (matches TF's window normalization)
+    _, _, stfts = scipy_signal.stft(
+        waveform,
+        fs=PERCH_SR_HZ,
+        nperseg=PERCH_WIN_SAMPLES,
+        noverlap=PERCH_WIN_SAMPLES - PERCH_HOP_SAMPLES,
+        nfft=PERCH_N_FFT,
+        padded=True,  # Pad to get exactly 500 frames
     )
-    mel_spec = np.dot(power_spectrum, mel_filterbank.T)
 
-    # 4) Log compression
-    mel_spec = np.log(mel_spec + 1e-6)
+    # Transpose to [time, freq] and take magnitude (power=1.0)
+    stfts = stfts.T[:PERCH_TARGET_T]
+    magnitude = np.abs(stfts)
 
-    # 5) Ensure correct shape (truncate/pad to target frames)
-    if mel_spec.shape[0] > PERCH_TARGET_T:
-        mel_spec = mel_spec[:PERCH_TARGET_T]
-    elif mel_spec.shape[0] < PERCH_TARGET_T:
+    # 3) Mel filterbank (O'Shaughnessy scale)
+    mel_filterbank = _make_mel_filterbank(
+        PERCH_N_FFT, PERCH_N_MELS, PERCH_SR_HZ, PERCH_FMIN, PERCH_FMAX
+    )
+    mel_spec = magnitude @ mel_filterbank
+
+    # 4) Log scaling: scalar * log(max(mel, floor))
+    mel_spec = PERCH_LOG_SCALAR * np.log(np.maximum(mel_spec, PERCH_LOG_FLOOR))
+
+    # 5) Ensure correct shape (pad if needed)
+    if mel_spec.shape[0] < PERCH_TARGET_T:
         pad_frames = PERCH_TARGET_T - mel_spec.shape[0]
-        mel_spec = np.pad(mel_spec, ((0, pad_frames), (0, 0)), mode="constant")
+        floor_value = PERCH_LOG_SCALAR * np.log(PERCH_LOG_FLOOR)
+        mel_spec = np.pad(
+            mel_spec, ((0, pad_frames), (0, 0)), constant_values=floor_value
+        )
 
     return mel_spec.astype(np.float32)
 
@@ -232,14 +244,21 @@ class DepthwiseConv2d(eqx.Module):
     stride: int = eqx.field(static=True)
     padding: int = eqx.field(static=True)
 
-    def __init__(self, channels: int, kernel_size: int, stride: int, *, key: PRNGKeyArray):
+    def __init__(
+        self, channels: int, kernel_size: int, stride: int, *, key: PRNGKeyArray
+    ):
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = kernel_size // 2
         # Initialize with truncated normal
-        self.weight = jr.truncated_normal(key, -2, 2, (channels, 1, kernel_size, kernel_size)) * 0.02
+        self.weight = (
+            jr.truncated_normal(key, -2, 2, (channels, 1, kernel_size, kernel_size))
+            * 0.02
+        )
 
-    def __call__(self, x: Float[Array, "batch channels height width"]) -> Float[Array, "batch channels h2 w2"]:
+    def __call__(
+        self, x: Float[Array, "batch channels height width"]
+    ) -> Float[Array, "batch channels h2 w2"]:
         # Depthwise conv: apply each filter to one channel
         return jax.lax.conv_general_dilated(
             x,
@@ -270,11 +289,16 @@ class Conv2d(eqx.Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = kernel_size // 2
-        self.weight = jr.truncated_normal(
-            key, -2, 2, (out_channels, in_channels, kernel_size, kernel_size)
-        ) * 0.02
+        self.weight = (
+            jr.truncated_normal(
+                key, -2, 2, (out_channels, in_channels, kernel_size, kernel_size)
+            )
+            * 0.02
+        )
 
-    def __call__(self, x: Float[Array, "batch in_c height width"]) -> Float[Array, "batch out_c h2 w2"]:
+    def __call__(
+        self, x: Float[Array, "batch in_c height width"]
+    ) -> Float[Array, "batch out_c h2 w2"]:
         return jax.lax.conv_general_dilated(
             x,
             self.weight,
@@ -299,7 +323,9 @@ class BatchNorm(eqx.Module):
         self.running_var = jnp.ones(channels)
         self.eps = 1e-3
 
-    def __call__(self, x: Float[Array, "batch channels height width"]) -> Float[Array, "batch channels height width"]:
+    def __call__(
+        self, x: Float[Array, "batch channels height width"]
+    ) -> Float[Array, "batch channels height width"]:
         # Inference mode: use running stats
         mean = self.running_mean[None, :, None, None]
         var = self.running_var[None, :, None, None]
@@ -323,7 +349,9 @@ class SqueezeExcitation(eqx.Module):
         self.fc2_weight = jr.truncated_normal(k2, -2, 2, (channels, reduced)) * 0.02
         self.fc2_bias = jnp.zeros(channels)
 
-    def __call__(self, x: Float[Array, "batch channels height width"]) -> Float[Array, "batch channels height width"]:
+    def __call__(
+        self, x: Float[Array, "batch channels height width"]
+    ) -> Float[Array, "batch channels height width"]:
         # Global average pooling
         se = x.mean(axis=(2, 3))  # [B, C]
         # FC layers
@@ -378,7 +406,9 @@ class MBConvBlock(eqx.Module):
             self.expand_bn = None
 
         # Depthwise convolution
-        self.depthwise_conv = DepthwiseConv2d(expanded_filters, kernel_size, stride, key=keys[1])
+        self.depthwise_conv = DepthwiseConv2d(
+            expanded_filters, kernel_size, stride, key=keys[1]
+        )
         self.depthwise_bn = BatchNorm(expanded_filters)
 
         # Squeeze-excitation
@@ -389,7 +419,9 @@ class MBConvBlock(eqx.Module):
         self.project_conv = Conv2d(expanded_filters, output_filters, 1, key=keys[3])
         self.project_bn = BatchNorm(output_filters)
 
-    def __call__(self, x: Float[Array, "batch c h w"]) -> Float[Array, "batch c2 h2 w2"]:
+    def __call__(
+        self, x: Float[Array, "batch c h w"]
+    ) -> Float[Array, "batch c2 h2 w2"]:
         residual = x
 
         # Expansion
@@ -444,7 +476,9 @@ class EfficientNet(eqx.Module):
 
         # Stem: 3x3 conv, stride 2
         stem_filters = _round_filters(32, width_coefficient)
-        self.stem_conv = Conv2d(input_channels, stem_filters, 3, stride=2, key=keys[key_idx])
+        self.stem_conv = Conv2d(
+            input_channels, stem_filters, 3, stride=2, key=keys[key_idx]
+        )
         key_idx += 1
         self.stem_bn = BatchNorm(stem_filters)
 
@@ -522,20 +556,20 @@ class PerchTFModel:
         import os
 
         # Suppress TF logging
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
         import tensorflow as tf
 
         # Force TensorFlow to CPU only (don't modify CUDA_VISIBLE_DEVICES
         # since that affects JAX too)
         try:
-            tf.config.set_visible_devices([], 'GPU')
+            tf.config.set_visible_devices([], "GPU")
         except RuntimeError:
             # Already initialized - that's OK
             pass
 
         self.model = tf.saved_model.load(model_path)
-        self.serve = self.model.signatures['serving_default']
+        self.serve = self.model.signatures["serving_default"]
         self._tf = tf
 
     def embed(self, waveform: np.ndarray) -> np.ndarray:
@@ -556,7 +590,7 @@ class PerchTFModel:
         outputs = self.serve(inputs=inputs)
 
         # Return embedding as numpy
-        return outputs['embedding'].numpy()
+        return outputs["embedding"].numpy()
 
 
 @beartype.beartype
@@ -581,7 +615,9 @@ def load_tf(ckpt: str = "perch_v2") -> PerchTFModel:
     }
 
     if ckpt not in slug_map:
-        raise ValueError(f"Unknown checkpoint '{ckpt}'. Available: {list(slug_map.keys())}")
+        raise ValueError(
+            f"Unknown checkpoint '{ckpt}'. Available: {list(slug_map.keys())}"
+        )
 
     # Download model
     model_path = kagglehub.model_download(slug_map[ckpt])
@@ -607,6 +643,8 @@ def load_tf(ckpt: str = "perch_v2") -> PerchTFModel:
 #
 # For now, use load_tf() which wraps the TF model for CPU inference.
 # Reference: https://github.com/google-research/chirp/blob/main/chirp/models/efficientnet.py
+#
+# (sam) https://github.com/google-research/perch/issues/652 and https://github.com/google-research/perch/issues/661 and https://github.com/google-research/perch-hoplite/issues/56 for some more context in the weight loading. given the complexity, I would like to make this a one-time cost and write a script to download the anonymously named tf model, do a forwrd pass, and move it over to equinox. https://github.com/samuelstevens/dinov3/blob/main/test_jax.py is an example of writing a bunch of tests for converting dinov3 to jax/equinox and might be useful.
 
 
 @beartype.beartype
@@ -631,7 +669,6 @@ def load(ckpt: str = "perch_v2", *, key: PRNGKeyArray | None = None) -> Efficien
     model = EfficientNet(key=key)
 
     logger.warning(
-        "JAX weight conversion not yet implemented. "
-        "Use load_tf() for actual inference."
+        "JAX weight conversion not yet implemented. Use load_tf() for actual inference."
     )
     return model

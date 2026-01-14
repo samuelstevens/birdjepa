@@ -3,6 +3,7 @@
 Tests the PerchBackbone inference and transform function.
 """
 
+import os
 import numpy as np
 import pytest
 from birdjepa.nn import perch
@@ -154,3 +155,94 @@ def test_perch_backbone_transform():
     # Exact length
     exact = np.random.randn(160_000).astype(np.float32)
     assert len(transform(exact)) == 160_000
+
+
+# =============================================================================
+# Frontend Parity Tests (TF spectrogram vs numpy implementation)
+# =============================================================================
+
+
+@pytest.mark.slow
+def test_perch_frontend_parity():
+    """Test that numpy spectrogram matches TensorFlow model output.
+
+    This test verifies that our pure numpy/scipy implementation of the
+    Perch frontend produces spectrograms that closely match the TensorFlow
+    model's spectrogram output. This is important for:
+    1. Validating our understanding of Perch's preprocessing
+    2. Enabling future pure-JAX inference without TensorFlow dependency
+
+    Expected correlation: >0.85 for typical audio signals
+    """
+    # Skip if TensorFlow not available
+    pytest.importorskip("tensorflow")
+    pytest.importorskip("kagglehub")
+
+    import tensorflow as tf
+    import kagglehub
+
+    # Load TF model (hide GPUs to use CPU model)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    path = kagglehub.model_download(
+        "google/bird-vocalization-classifier/tensorFlow2/perch_v2_cpu"
+    )
+    model = tf.saved_model.load(path)
+
+    # Test signal: mixed tones + noise
+    np.random.seed(42)
+    sr = 32000
+    n_samples = sr * 5
+    t = np.linspace(0, 5, n_samples, dtype=np.float32)
+    audio = (
+        np.sin(2 * np.pi * 1000 * t) * 0.3
+        + np.sin(2 * np.pi * 3000 * t) * 0.2
+        + np.random.randn(n_samples).astype(np.float32) * 0.1
+    )
+
+    # Get TF spectrogram
+    result = model.signatures["serving_default"](inputs=tf.constant(audio[None, :]))
+    tf_spec = result["spectrogram"].numpy()[0]
+
+    # Get our spectrogram
+    our_spec = perch.transform(audio)
+
+    # Check shape
+    assert our_spec.shape == tf_spec.shape, (
+        f"Shape mismatch: {our_spec.shape} vs {tf_spec.shape}"
+    )
+
+    # Check correlation
+    corr = np.corrcoef(our_spec.flatten(), tf_spec.flatten())[0, 1]
+    assert corr > 0.85, f"Correlation too low: {corr:.4f} (expected >0.85)"
+
+    # Check MAE is reasonable
+    mae = np.mean(np.abs(our_spec - tf_spec))
+    assert mae < 0.1, f"MAE too high: {mae:.4f} (expected <0.1)"
+
+
+@pytest.mark.slow
+def test_perch_frontend_parity_white_noise():
+    """Test frontend parity with white noise input."""
+    pytest.importorskip("tensorflow")
+    pytest.importorskip("kagglehub")
+
+    import tensorflow as tf
+    import kagglehub
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    path = kagglehub.model_download(
+        "google/bird-vocalization-classifier/tensorFlow2/perch_v2_cpu"
+    )
+    model = tf.saved_model.load(path)
+
+    # White noise
+    np.random.seed(123)
+    audio = np.random.randn(160_000).astype(np.float32) * 0.3
+
+    tf_spec = model.signatures["serving_default"](
+        inputs=tf.constant(audio[None, :])
+    )["spectrogram"].numpy()[0]
+    our_spec = perch.transform(audio)
+
+    corr = np.corrcoef(our_spec.flatten(), tf_spec.flatten())[0, 1]
+    assert corr > 0.85, f"White noise correlation too low: {corr:.4f}"
