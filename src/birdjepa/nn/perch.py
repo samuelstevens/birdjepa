@@ -156,15 +156,20 @@ def transform(
     else:
         waveform = waveform[:PERCH_TARGET_SAMPLES]
 
-    # 2) STFT using scipy (matches TF's window normalization)
+    # 2) STFT using scipy (matches chirp's jsp.signal.stft)
     _, _, stfts = scipy_signal.stft(
         waveform,
         fs=PERCH_SR_HZ,
         nperseg=PERCH_WIN_SAMPLES,
         noverlap=PERCH_WIN_SAMPLES - PERCH_HOP_SAMPLES,
         nfft=PERCH_N_FFT,
-        padded=True,  # Pad to get exactly 500 frames
+        padded=False,  # Match chirp's padded=False
+        boundary="zeros",
     )
+
+    # Remove last frame if input divisible by stride (chirp behavior)
+    if len(waveform) % PERCH_HOP_SAMPLES == 0:
+        stfts = stfts[:, :-1]
 
     # Transpose to [time, freq] and take magnitude (power=1.0)
     stfts = stfts.T[:PERCH_TARGET_T]
