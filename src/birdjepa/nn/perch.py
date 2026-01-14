@@ -74,7 +74,7 @@ EFFICIENTNET_B3_OUTPUT_DIM = 1536
 # Note: Uses O'Shaughnessy mel scale (like TensorFlow/chirp), not HTK.
 
 PERCH_N_FFT = 1024
-PERCH_LOG_FLOOR = 1e-3
+PERCH_LOG_FLOOR = 1e-5  # Determined empirically from silent audio test
 PERCH_LOG_SCALAR = 0.1
 
 
