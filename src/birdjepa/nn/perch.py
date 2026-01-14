@@ -3,11 +3,17 @@ Perch 2.0 audio embedding model in JAX/Equinox.
 
 Perch uses EfficientNet-B3 (~12M params) to produce 1536-dim embeddings from
 5-second audio clips. This module provides:
-- `transform`: waveform -> spectrogram preprocessing
+- `transform`: waveform -> spectrogram preprocessing (NOTE: uses log-mel, not PCEN)
 - `EfficientNet`: the model architecture in Equinox
-- `load`: downloads TF weights and converts to JAX on-the-fly
+- `load_tf`: loads TF model for CPU inference (recommended)
+- `load`: JAX model with random weights (weight conversion not implemented)
+
+Note: The official Perch frontend uses PCEN (Per-Channel Energy Normalization),
+not log-mel spectrogram. The current transform() function is approximate.
+For accurate inference, use load_tf() which uses the full TF model including frontend.
 
 Reference: https://arxiv.org/abs/2508.04665
+Source: https://github.com/google-research/chirp/blob/main/chirp/models/efficientnet.py
 """
 
 import dataclasses
@@ -588,21 +594,36 @@ def load_tf(ckpt: str = "perch_v2") -> PerchTFModel:
 # JAX Model Loading (placeholder for future pure-JAX implementation)
 # =============================================================================
 
+# Weight conversion notes:
+# The TF checkpoint was created via jax2tf from Google's chirp Flax model.
+# The variable names are anonymous (_tf_var_leaves/0, /1, etc.) and the
+# pytree structure differs from our Equinox implementation because chirp
+# creates MBConv blocks dynamically in __call__ rather than as attributes.
+#
+# Options for proper weight loading:
+# 1. Request JAX/Flax checkpoint from Google (see chirp repo issues)
+# 2. Port chirp's exact Flax model structure to match their pytree
+# 3. Trace through both models to build explicit variable mapping
+#
+# For now, use load_tf() which wraps the TF model for CPU inference.
+# Reference: https://github.com/google-research/chirp/blob/main/chirp/models/efficientnet.py
+
 
 @beartype.beartype
 def load(ckpt: str = "perch_v2", *, key: PRNGKeyArray | None = None) -> EfficientNet:
     """Load Perch model with pretrained weights (JAX/Equinox).
 
     NOTE: Weight conversion from TensorFlow is not yet implemented.
-    For now, use load_tf() for actual inference, or this function
-    for architecture testing with random weights.
+    The TF checkpoint uses anonymous variable names from jax2tf export,
+    and the chirp Flax model has a different pytree structure than our
+    Equinox implementation. For actual inference, use load_tf() instead.
 
     Args:
         ckpt: Checkpoint name (default: "perch_v2")
         key: PRNG key for model initialization
 
     Returns:
-        EfficientNet model (random weights - conversion TODO)
+        EfficientNet model (random weights - conversion not implemented)
     """
     if key is None:
         key = jr.key(0)
