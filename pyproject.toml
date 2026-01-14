@@ -7,6 +7,12 @@ authors = [
     { name = "Samuel Stevens", email = "samuel.robert.stevens@gmail.com" }
 ]
 requires-python = ">=3.13"
+
+# Note: perch-hoplite has dependency conflicts with our JAX stack (absl-py version).
+# For weight loading, we use kagglehub to download the TF model directly.
+# [project.optional-dependencies]
+# perch = ["tensorflow>=2.18.0"]
+
 dependencies = [
     "beartype>=0.22.9",
     "chex>=0.1.91",
