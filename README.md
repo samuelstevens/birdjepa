@@ -38,6 +38,7 @@ On OSC, we need ffmpeg, which can be loaded with `module load ffmpeg/6.1.1`.
   - [ ] NEPA ([sihanxu.me/nepa](https://sihanxu.me/nepa)): modern ViT training tricks
   - [ ] Perception Encoder ([arxiv.org/abs/2504.13181](https://arxiv.org/abs/2504.13181)): modern ViT training tricks
 - [ ] Implement asymmetric patch sizes (16x16, 8x32, 4x64)
+- [ ] Quantization (https://github.com/google/qwix)
 
 ### Objective
 

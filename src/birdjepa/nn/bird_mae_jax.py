@@ -1,7 +1,6 @@
 """JAX implementation of Bird-MAE encoder for loading pretrained weights."""
 
 import dataclasses
-import functools
 import logging
 import os.path
 
@@ -74,6 +73,7 @@ def get_2d_sincos_pos_embed(
     return pos_embed
 
 
+@jaxtyped(typechecker=beartype.beartype)
 class PatchEmbed(eqx.Module):
     """Patch embedding using 2D convolution."""
 
@@ -111,10 +111,10 @@ class Attention(eqx.Module):
     head_dim: int = eqx.field(static=True)
     scale: float = eqx.field(static=True)
 
-    qkv_weight: Float[Array, "three_dim dim"]
-    qkv_bias: Float[Array, "three_dim"]
+    qkv_weight: Float[Array, "3dim dim"]
+    qkv_bias: Float[Array, " 3dim"]
     proj_weight: Float[Array, "dim dim"]
-    proj_bias: Float[Array, "dim"]
+    proj_bias: Float[Array, " dim"]
 
     def __init__(self, dim: int, n_heads: int, *, key: PRNGKeyArray):
         k1, k2 = jr.split(key)
@@ -144,9 +144,9 @@ class MLP(eqx.Module):
     """MLP with GELU activation."""
 
     fc1_weight: Float[Array, "hidden dim"]
-    fc1_bias: Float[Array, "hidden"]
+    fc1_bias: Float[Array, " hidden"]
     fc2_weight: Float[Array, "dim hidden"]
-    fc2_bias: Float[Array, "dim"]
+    fc2_bias: Float[Array, " dim"]
 
     def __init__(self, dim: int, hidden_dim: int, *, key: PRNGKeyArray):
         k1, k2 = jr.split(key)
@@ -165,11 +165,11 @@ class MLP(eqx.Module):
 class Block(eqx.Module):
     """Transformer block (pre-norm)."""
 
-    norm1_weight: Float[Array, "dim"]
-    norm1_bias: Float[Array, "dim"]
+    norm1_weight: Float[Array, " dim"]
+    norm1_bias: Float[Array, " dim"]
     attn: Attention
-    norm2_weight: Float[Array, "dim"]
-    norm2_bias: Float[Array, "dim"]
+    norm2_weight: Float[Array, " dim"]
+    norm2_bias: Float[Array, " dim"]
     mlp: MLP
     eps: float = eqx.field(static=True)
 

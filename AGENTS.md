@@ -35,6 +35,7 @@
 - Try to keep code short. Shorter code is in principle easier to read. If variable names are really long, shorten based on conventions in this codebase (..._indices -> ..._i). Since you use `uvx ruff format --preview`, if you can make a small variable name change to fit everything on one line, that's a good idea. When variables are used once, simply inline it.
 - If you make edits to a file and notice that I made edits to your edits, note the changes I make compared to your initial version and explicitly describe the style of changes. Keep these preferences in mind as you write the rest of the code.
 - Prefer `import x.y` over `from x import y`. This makes it immediately clear where each function comes from when reading code (e.g., `datasets.load_dataset()` vs `load_dataset()`), avoids name collisions, and makes grep-ing for usages unambiguous. Relative imports like `from . import module` are fine, but avoid `from .module import function`. Exception: use `import torch.nn.functional as F` since it's pervasive in PyTorch codebases.
+- Don't add complexity for marginal performance gains. Simpler code that's slightly slower is often better. Only optimize when profiling shows a real bottleneck
 
 # Defensive Programming
 
