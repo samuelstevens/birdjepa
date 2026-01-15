@@ -18,7 +18,7 @@ dependencies = [
     "jax[cuda12]>=0.8.2",
     "jaxtyping>=0.2.38",
     "librosa>=0.11.0",
-    "marimo>=0.18.4",
+    "marimo[mcp]>=0.18.4",
     "matplotlib>=3.10.8",
     "maturin[patchelf]>=1.10.2",
     "optax>=0.2.6",
@@ -71,3 +71,6 @@ filterwarnings = [
 markers = [
     "slow: slow tests (e.g., large models, long-running parity checks)",
 ]
+
+[tool.marimo.runtime]
+watcher_on_save = "autorun"

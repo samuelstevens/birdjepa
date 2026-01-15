@@ -14,6 +14,7 @@
 
 - Public docs for developers and users are in markdown in docs/src. Internal, messier design and implementation docs are in markdown in docs/research/issues. Both are valuable sources of context when getting started.
 - You can use `gh` to access issues and PRs on GitHub to gather more context. We use GitHub issues a lot to share ideas and communicate about problems, so you should almost always check to see if there's a relevant GitHub issue for whatever you're working on.
+- Use subagents when needed.
 
 # Code Style
 

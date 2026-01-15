@@ -3,23 +3,38 @@
 ## High Priority
 
 ### Fix multi-GPU JAX distributed training failures
-**STATUS: FIXED - Increase heartbeat_timeout_seconds to 300**
+**STATUS: FIXED - Use explicit coordinator from submitit**
 
-Root cause: XLA compilation of first train step with gradient checkpointing + multi-device sharding takes longer than the default 100s heartbeat timeout, causing the coordination service to declare both processes dead.
+Using `submitit.helpers.TorchDistributedEnvironment()` to get the coordinator address and passing it explicitly to `jax.distributed.initialize()` fixes the heartbeat issue.
 
-**Fix applied in `pretrain.py`:**
+**Previous issue:** Jobs died at exactly `heartbeat_timeout_seconds` after start when relying on JAX's auto-detection. Training continued fine (NCCL collectives worked) but coordinator heartbeat gRPC channel failed.
+
+**Key insight from debugging:**
+- The JAX coordinator uses a separate gRPC channel from training collectives
+- Training can succeed while heartbeats fail (different network paths)
+- Auto-detected port (65422 from `job_id % 4096 + 61440`) may have issues
+- Explicit coordinator port (27508 from submitit) works correctly
+- 1800s timeout survives the issue; explicit coordinator fixes it properly
+
+**Fix in `pretrain.py`:**
 ```python
+dist_env = submitit.helpers.TorchDistributedEnvironment()
+coordinator_address = f"{dist_env.master_addr}:{dist_env.master_port}"
 jax.distributed.initialize(
-    initialization_timeout=600,
-    heartbeat_timeout_seconds=300,  # Increased from default 100s
+    coordinator_address=coordinator_address,
+    num_processes=dist_env.world_size,
+    process_id=dist_env.rank,
+    initialization_timeout=300,
+    heartbeat_timeout_seconds=120,
 )
 ```
 
-**Verified working:** Job 3189658 trained 30+ steps on 2 GPUs (a0131) with loss decreasing normally.
+**Verified:** Job 3192373 ran 12+ min with training, using 120s heartbeat timeout.
 
-**Related issue:** https://github.com/jax-ml/jax/issues/33852
-
-**Logs:** `logs/3189658_0_log.out` (multi-GPU success with fix)
+**Related issues:**
+- https://github.com/jax-ml/jax/issues/33852 (XLA compilation hangs)
+- https://github.com/jax-ml/jax/issues/16788 (Slurm GPU detection)
+- https://github.com/jax-ml/jax/issues/23452 (GPU binding)
 
 ### Cache resamplers in Rust loader
 Currently re-initializing rubato SincFixedIn resampler for every sample. This is expensive (~10ms overhead per sample). Should cache resamplers by (source_rate, target_rate) tuple.

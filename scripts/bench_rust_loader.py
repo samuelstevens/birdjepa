@@ -5,8 +5,12 @@ import resource
 import time
 
 import polars as pl
+import logging
 
 import birdjepa.helpers
+
+log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+logging.basicConfig(level=logging.INFO, format=log_format, force=True)
 
 
 def get_arrow_files() -> list[str]:
@@ -102,7 +106,7 @@ def main():
     executor = submitit.SlurmExecutor(folder="logs/bench_rust_loader")
     # OSC allocates ~10GB RAM per CPU, so request enough CPUs for desired memory
     mem_gb = 64
-    n_cpus = max(48, mem_gb // 10)
+    n_cpus = max(*worker_counts, mem_gb // 10)
     executor.update_parameters(
         partition="preemptible-nextgen",
         account="PAS2136",

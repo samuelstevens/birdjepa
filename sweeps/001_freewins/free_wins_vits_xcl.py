@@ -1,13 +1,16 @@
-"""Sweep: AdamW LR sweep for ViT-S on BirdSet XCL (supervised baseline)."""
+"""Sweep: ViT-S on XCL with all 'free wins' enabled (RoPE, QK-Norm, SwiGLU, LayerScale).
+
+Compares AdamW vs Muon optimizer with different learning rates.
+"""
 
 
 def make_cfgs() -> list[dict]:
     cfgs = []
 
     train_data = {"__class__": "XenoCanto", "subset": "XCL"}
-    # Use 10k train samples for validation (XCL has no labeled valid split)
     test_data = {"__class__": "XenoCanto", "subset": "XCL", "n_samples": 10_000}
 
+    # ViT-S with all free wins enabled
     model = {
         "input_h": 512,
         "input_w": 128,
@@ -16,18 +19,34 @@ def make_cfgs() -> list[dict]:
         "embed_dim": 384,
         "depth": 12,
         "n_heads": 6,
+        # Free wins
+        "use_rope": True,
+        "rope_base": 100.0,
+        "use_qk_norm": True,
+        "use_swiglu": True,
+        "use_layerscale": True,
+        "layerscale_init": 1e-4,
     }
 
-    lrs = [3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
+    # Test both optimizers at their typical LRs
+    # AdamW: 1e-3 was optimal from prior sweep
+    # Muon: typically needs different LR, try a few values
+    configs = [
+        ("adamw", 1e-3),
+        ("muon", 1e-3),
+        ("muon", 3e-3),
+        ("muon", 1e-2),
+    ]
 
-    for lr in lrs:
+    for optimizer, lr in configs:
         cfgs.append({
             "train_data": train_data,
             "test_data": test_data,
             "model": model,
             "objective": {"__class__": "SupervisedConfig"},
-            "batch_size": 2048,  # 1024 per GPU
+            "batch_size": 2048,
             "lr": lr,
+            "optimizer": optimizer,
             "schedule": "wsd",
             "warmup_steps": 5000,
             "decay_steps": 0,
