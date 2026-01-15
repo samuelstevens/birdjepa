@@ -115,8 +115,7 @@ impl SpectrogramTransform {
             .collect();
 
         // Mel filterbank using Kaldi/Slaney formula
-        let mel_filterbank =
-            create_kaldi_mel_filterbank(sample_rate, n_fft, n_mels, f_min, f_max);
+        let mel_filterbank = create_kaldi_mel_filterbank(sample_rate, n_fft, n_mels, f_min, f_max);
 
         Self {
             win_length,

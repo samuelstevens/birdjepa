@@ -150,7 +150,8 @@ fn extract_sample(
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| {
             ArrowError::InvalidColumnType(
-                "ebird_code (expected int64, got string - dataset must use ClassLabel feature)".to_string(),
+                "ebird_code (expected int64, got string - dataset must use ClassLabel feature)"
+                    .to_string(),
             )
         })?;
     let label = if label_array.is_null(row) {
