@@ -32,8 +32,9 @@ def make_cfgs() -> list[dict]:
         "objective": {"__class__": "LeJEPAConfig", "proj_dim": 16},
         "batch_size": 256,
         "lr": 2e-3,
-        "epochs": 800,
-        "n_workers": 4,
+        "n_steps": 100_000,  # ~280 epochs on XCM (90k samples / 256 batch = 350 steps/epoch)
+        "n_workers": 48,  # Rust loader threads
+        "window_size": 10_000,
     })
 
     # ViT-B: embed_dim=768, depth=12, n_heads=12
@@ -52,8 +53,9 @@ def make_cfgs() -> list[dict]:
         "objective": {"__class__": "LeJEPAConfig", "proj_dim": 16},
         "batch_size": 256,
         "lr": 2e-3,
-        "epochs": 800,
-        "n_workers": 4,
+        "n_steps": 100_000,
+        "n_workers": 48,
+        "window_size": 10_000,
     })
 
     return cfgs
