@@ -126,9 +126,7 @@ class Config:
     """Path to checkpoint to resume from."""
     # Multi-GPU
     n_gpus: int = 1
-    """Number of GPUs for data parallel training."""
-    single_process: bool = False
-    """Use single-process multi-device mode. When True, one process sees all GPUs (avoids JAX distributed coordination). When False, one process per GPU (requires JAX distributed)."""
+    """Number of GPUs for data parallel training (single process sees all GPUs)."""
     # Slurm
     slurm_acct: str = ""
     """Slurm account string. Empty means run locally."""
@@ -312,72 +310,8 @@ def make_train_step(optim, data_sharding, model_sharding):
 
 @beartype.beartype
 def worker_fn(cfg: Config):
-    """Main training function with optional data parallel support."""
-    # Use force=True to override any handlers set by submitit
+    """Main training function. Uses single-process multi-GPU mode."""
     logging.basicConfig(level=logging.INFO, format=log_format, force=True)
-
-    # Initialize multi-process JAX distributed runtime for multi-GPU SLURM jobs
-    # Each SLURM task is one process; this coordinates across them
-    # Skip for single-GPU to avoid heartbeat timeout issues during long JIT
-    import multiprocessing
-
-    n_tasks = int(os.environ.get("SLURM_NTASKS", "1"))
-    if n_tasks > 1 and multiprocessing.parent_process() is None:
-        # Use submitit to get distributed environment, then pass explicitly to JAX
-        # This avoids relying on JAX's Slurm auto-detection
-        import socket
-
-        import submitit.helpers
-
-        # Debug logging for heartbeat failures
-        hostname = socket.gethostname()
-        slurm_job_id = os.environ.get("SLURM_JOB_ID", "unknown")
-        slurm_nodelist = os.environ.get("SLURM_NODELIST", "unknown")
-        slurm_procid = os.environ.get("SLURM_PROCID", "unknown")
-        logger.info(
-            "Node debug: hostname=%s, job=%s, nodelist=%s, procid=%s",
-            hostname,
-            slurm_job_id,
-            slurm_nodelist,
-            slurm_procid,
-        )
-
-        dist_env = submitit.helpers.TorchDistributedEnvironment()
-        coordinator_address = f"{dist_env.master_addr}:{dist_env.master_port}"
-        logger.info(
-            "Distributed env: coordinator=%s, rank=%d/%d, local_rank=%d/%d",
-            coordinator_address,
-            dist_env.rank,
-            dist_env.world_size,
-            dist_env.local_rank,
-            dist_env.local_world_size,
-        )
-
-        # Try to resolve coordinator address to check reachability
-        try:
-            coord_ip = socket.gethostbyname(dist_env.master_addr)
-            logger.info("Coordinator resolves to IP: %s", coord_ip)
-        except socket.gaierror as e:
-            logger.warning(
-                "Failed to resolve coordinator %s: %s", dist_env.master_addr, e
-            )
-
-        init_start = time.perf_counter()
-        jax.distributed.initialize(
-            coordinator_address=coordinator_address,
-            num_processes=dist_env.world_size,
-            process_id=dist_env.rank,
-            initialization_timeout=300,
-            heartbeat_timeout_seconds=120,  # Short for fast failure detection
-        )
-        init_elapsed = time.perf_counter() - init_start
-        logger.info(
-            "Initialized JAX distributed: %d processes (took %.1fs)",
-            jax.process_count(),
-            init_elapsed,
-        )
-    elif n_tasks == 1:
-        logger.info("Single-process mode, skipping JAX distributed initialization")
 
     if cfg.device == "gpu":
         assert birdjepa.helpers.jax_has_gpu(), "GPU not available"
@@ -388,14 +322,11 @@ def worker_fn(cfg: Config):
     logger.info("Using %d device(s) for training", len(mesh.devices))
     logger.info("Devices: %s", [str(d) for d in mesh.devices])
 
-    # Only process 0 logs to wandb in multi-process mode
-    is_main = jax.process_index() == 0
-    if is_main:
-        assert cfg.run_id
-        dct = dataclasses.asdict(cfg)
-        dct["slurm_job_id"] = os.environ.get("SLURM_JOB_ID")
-        wandb.init(project="birdjepa", config=dct, id=cfg.run_id, resume="allow")
-        logger.info("wandb run id: %s", cfg.run_id)
+    assert cfg.run_id
+    dct = dataclasses.asdict(cfg)
+    dct["slurm_job_id"] = os.environ.get("SLURM_JOB_ID")
+    wandb.init(project="birdjepa", config=dct, id=cfg.run_id, resume="allow")
+    logger.info("wandb run id: %s", cfg.run_id)
 
     key = jr.key(cfg.seed)
 
@@ -431,12 +362,11 @@ def worker_fn(cfg: Config):
     logger.info("Created objective: %s", type(objective).__name__)
 
     # Create dataloaders using Rust loader
-    # Shard data across processes so each GPU loads different samples
     logger.info("Creating train dataloader")
     assert isinstance(cfg.train_data, birdjepa.data.XenoCanto)
     train_loader = birdjepa.data.RustXenoCantoLoader(
         cfg.train_data,
-        seed=cfg.seed + jax.process_index(),  # Unique seed per process
+        seed=cfg.seed,
         batch_size=cfg.batch_size,
         n_workers=cfg.n_workers,
         shuffle_buffer_size=cfg.window_size,
@@ -508,11 +438,8 @@ def worker_fn(cfg: Config):
     logger.info("Optimizer initialized")
 
     ckpt_dpath = cfg.ckpt_to / cfg.run_id
-
-    # Ensure checkpoint directory exists
-    if is_main:
-        ckpt_dpath.mkdir(parents=True, exist_ok=True)
-        logger.info("Checkpoint dir: %s", ckpt_dpath)
+    ckpt_dpath.mkdir(parents=True, exist_ok=True)
+    logger.info("Checkpoint dir: %s", ckpt_dpath)
 
     # Create checkpoint manager (handles retention, async saves)
     logger.info("Creating checkpoint manager")
@@ -566,8 +493,6 @@ def worker_fn(cfg: Config):
         step += 1
 
         # Checkpoint model state (orbax decides whether to actually save based on interval)
-        # NOTE: All processes must call save() - orbax handles primary host logic internally
-        # NOTE: Don't save JAX PRNG key - it's host-local and can't be serialized in distributed mode
         ckpt_mngr.save(
             step=step,
             encoder=models["encoder"],
@@ -605,18 +530,17 @@ def worker_fn(cfg: Config):
                 sec_per_step,
                 metric_strs,
             )
-            if is_main:
-                log_dict = {
-                    "step": step,
-                    "lr": lr,
-                    "train/probe": float(metrics["probe_loss"]),
-                    "train/tgt_entropy": tgt_entropy,
-                    "train/sec_per_step": sec_per_step,
-                }
-                for k, v in metrics.items():
-                    if k not in ("loss", "probe_loss"):
-                        log_dict[f"train/{k}"] = float(v)
-                wandb.log(log_dict)
+            log_dict = {
+                "step": step,
+                "lr": lr,
+                "train/probe": float(metrics["probe_loss"]),
+                "train/tgt_entropy": tgt_entropy,
+                "train/sec_per_step": sec_per_step,
+            }
+            for k, v in metrics.items():
+                if k not in ("loss", "probe_loss"):
+                    log_dict[f"train/{k}"] = float(v)
+            wandb.log(log_dict)
 
         # Evaluate periodically
         if step % cfg.eval_every == 0:
@@ -653,11 +577,9 @@ def worker_fn(cfg: Config):
             acc = correct / max(1, total)
             test_loss /= max(1, n_test_batches)
             logger.info("step=%d test_acc=%.4f test_loss=%.4f", step, acc, test_loss)
-            if is_main:
-                wandb.log({"step": step, "test/acc": acc, "test/loss": test_loss})
+            wandb.log({"step": step, "test/acc": acc, "test/loss": test_loss})
 
     # Save final checkpoint and wait for async saves to complete
-    # NOTE: All processes must call save() - orbax handles primary host logic internally
     ckpt_mngr.save(
         step=step,
         encoder=models["encoder"],
@@ -668,8 +590,7 @@ def worker_fn(cfg: Config):
         force=True,
     )
     ckpt_mngr.wait_until_finished()
-    if is_main:
-        wandb.finish()
+    wandb.finish()
 
 
 @beartype.beartype
@@ -715,9 +636,6 @@ def cli(cfg: Config):
         )
         assert c.n_hours == base.n_hours, "n_hours must match all cfgs"
         assert c.n_gpus == base.n_gpus, "n_gpus must match all cfgs"
-        assert c.single_process == base.single_process, (
-            "single_process must match all cfgs"
-        )
         assert c.n_workers == base.n_workers, "n_workers must match all cfgs"
         assert c.log_to == base.log_to, "log_to must match all cfgs"
 
@@ -732,14 +650,12 @@ def cli(cfg: Config):
     if n_cpus > base.n_workers:
         logger.info("Requesting %d CPUs to get %dGB RAM", n_cpus, base.mem_gb)
     tag = pathlib.Path(base.sweep).stem if base.sweep else "local"
-    # Single-process mode: one process sees all GPUs, avoids JAX distributed coordination
-    # Multi-process mode: one process per GPU, requires JAX distributed (heartbeat timeouts)
-    ntasks = 1 if base.single_process else base.n_gpus
+    # Single process sees all GPUs (no JAX distributed coordination needed)
     executor.update_parameters(
         time=int(base.n_hours * 60),
         partition=base.slurm_partition,
         gpus_per_node=base.n_gpus,
-        ntasks_per_node=ntasks,
+        ntasks_per_node=1,
         cpus_per_task=n_cpus,
         stderr_to_stdout=True,
         account=base.slurm_acct,
