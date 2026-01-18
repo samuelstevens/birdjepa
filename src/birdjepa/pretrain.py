@@ -57,8 +57,17 @@ def compute_tgt_entropy(targets: np.ndarray) -> float:
 
 
 def _batch_to_jax(batch: dict) -> dict:
-    """Convert numeric arrays in batch to JAX, drop non-numeric fields."""
-    return {k: jnp.asarray(v) for k, v in batch.items() if _is_numeric_array(v)}
+    """Convert numeric arrays in batch to JAX, drop non-numeric fields.
+
+    Makes explicit copies to avoid buffer reuse issues with data loaders.
+    """
+    result = {}
+    for k, v in batch.items():
+        if _is_numeric_array(v):
+            # Make a copy to avoid buffer reuse issues, then convert to JAX
+            v_copy = np.array(v, copy=True)
+            result[k] = jnp.asarray(v_copy)
+    return result
 
 
 @beartype.beartype
@@ -121,6 +130,8 @@ class Config:
     # Multi-GPU
     n_gpus: int = 1
     """Number of GPUs for data parallel training."""
+    single_process: bool = False
+    """Use single-process multi-device mode. When True, one process sees all GPUs (avoids JAX distributed coordination). When False, one process per GPU (requires JAX distributed)."""
     # Slurm
     slurm_acct: str = ""
     """Slurm account string. Empty means run locally."""
@@ -238,9 +249,12 @@ def make_train_step(optim, data_sharding, model_sharding):
                 models["objective"],
                 models["probe"],
             )
+
             losses, emb, targets = objective(batch, encoder, key=key)
+
             obj_loss = sum(losses.values())
             probe_logits = jax.vmap(probe)(emb)
+
             probe_loss = softmax_cross_entropy(probe_logits, targets)
             total_loss = obj_loss + probe_loss
             return total_loss, {
@@ -315,7 +329,6 @@ def worker_fn(cfg: Config):
         # Use submitit to get distributed environment, then pass explicitly to JAX
         # This avoids relying on JAX's Slurm auto-detection
         import socket
-        import time
 
         import submitit.helpers
 
@@ -367,7 +380,7 @@ def worker_fn(cfg: Config):
             init_elapsed,
         )
     elif n_tasks == 1:
-        logger.info("Single-GPU mode, skipping JAX distributed initialization")
+        logger.info("Single-process mode, skipping JAX distributed initialization")
 
     if cfg.device == "gpu":
         assert birdjepa.helpers.jax_has_gpu(), "GPU not available"
@@ -544,7 +557,11 @@ def worker_fn(cfg: Config):
         tgt_entropy = compute_tgt_entropy(batch["target"])
 
         batch = _batch_to_jax(batch)
-        batch = eqx.filter_shard(batch, data_sharding)
+
+        # Use explicit jax.device_put instead of eqx.filter_shard to avoid buffer corruption issues in single-process multi-device mode
+        batch = {k: jax.device_put(v, data_sharding) for k, v in batch.items()}
+        jax.tree.map(lambda x: x.block_until_ready(), batch)
+
         step_key, key = jr.split(key)
 
         models, opt_state, metrics = train_step(models, opt_state, batch, key=step_key)
@@ -701,6 +718,9 @@ def cli(cfg: Config):
         )
         assert c.n_hours == base.n_hours, "n_hours must match all cfgs"
         assert c.n_gpus == base.n_gpus, "n_gpus must match all cfgs"
+        assert c.single_process == base.single_process, (
+            "single_process must match all cfgs"
+        )
         assert c.n_workers == base.n_workers, "n_workers must match all cfgs"
         assert c.log_to == base.log_to, "log_to must match all cfgs"
 
@@ -715,11 +735,14 @@ def cli(cfg: Config):
     if n_cpus > base.n_workers:
         logger.info("Requesting %d CPUs to get %dGB RAM", n_cpus, base.mem_gb)
     tag = pathlib.Path(base.sweep).stem if base.sweep else "local"
+    # Single-process mode: one process sees all GPUs, avoids JAX distributed coordination
+    # Multi-process mode: one process per GPU, requires JAX distributed (heartbeat timeouts)
+    ntasks = 1 if base.single_process else base.n_gpus
     executor.update_parameters(
         time=int(base.n_hours * 60),
         partition=base.slurm_partition,
         gpus_per_node=base.n_gpus,
-        ntasks_per_node=base.n_gpus,  # One process per GPU (stable multi-GPU mode)
+        ntasks_per_node=ntasks,
         cpus_per_task=n_cpus,
         stderr_to_stdout=True,
         account=base.slurm_acct,
