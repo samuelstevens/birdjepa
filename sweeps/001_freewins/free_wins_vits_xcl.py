@@ -50,7 +50,7 @@ def make_cfgs() -> list[dict]:
             "schedule": "wsd",
             "warmup_steps": 5000,
             "decay_steps": 0,
-            "n_steps": 50_000,
+            "n_steps": 10_000,
             "log_every": 5,
             "eval_every": 1000,
             "n_workers": 60,
@@ -59,7 +59,7 @@ def make_cfgs() -> list[dict]:
             "n_hours": 12.0,
             "mem_gb": 128,
             "slurm_acct": "PAS2136",
-            "slurm_partition": "nextgen",
+            "slurm_partition": "preemptible-nextgen",
             "ckpt_to": "/fs/ess/PAS2136/samuelstevens/birdjepa/checkpoints",
         })
 
