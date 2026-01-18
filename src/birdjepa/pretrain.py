@@ -59,15 +59,12 @@ def compute_tgt_entropy(targets: np.ndarray) -> float:
 def _batch_to_jax(batch: dict) -> dict:
     """Convert numeric arrays in batch to JAX, drop non-numeric fields.
 
-    Makes explicit copies to avoid buffer reuse issues with data loaders.
+    Note: jnp.asarray copies data to JAX memory. The Rust dataloader allocates
+    fresh memory per batch (no buffer reuse), so an explicit numpy copy is
+    likely unnecessary. We keep it simple here - if corruption issues arise,
+    add np.array(v, copy=True) before jnp.asarray.
     """
-    result = {}
-    for k, v in batch.items():
-        if _is_numeric_array(v):
-            # Make a copy to avoid buffer reuse issues, then convert to JAX
-            v_copy = np.array(v, copy=True)
-            result[k] = jnp.asarray(v_copy)
-    return result
+    return {k: jnp.asarray(v) for k, v in batch.items() if _is_numeric_array(v)}
 
 
 @beartype.beartype
