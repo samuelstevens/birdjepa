@@ -116,8 +116,6 @@ class Config:
     # Checkpointing
     ckpt_to: pathlib.Path = pathlib.Path("./checkpoints")
     """Directory for checkpoints."""
-    resume_from: str = ""
-    """Path to checkpoint to resume from."""
     # Multi-GPU
     n_gpus: int = 1
     """Number of GPUs for data parallel training (single process sees all GPUs)."""
@@ -674,6 +672,25 @@ def worker_fn(cfg: Config):
     wandb.finish()
 
 
+class TrainingJob:
+    """Checkpointable training job for submitit timeout/preemption handling.
+
+    On timeout, submitit calls checkpoint() which requeues the same job.
+    worker_fn auto-resumes from latest checkpoint in ckpt_to/run_id.
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def __call__(self):
+        worker_fn(self.cfg)
+
+    def checkpoint(self):
+        import submitit.helpers
+
+        return submitit.helpers.DelayedSubmission(TrainingJob(self.cfg))
+
+
 @beartype.beartype
 def cli(cfg: Config):
     """CLI entrypoint: run locally or submit to Slurm."""
@@ -723,7 +740,7 @@ def cli(cfg: Config):
     import submitit
     import submitit.core.utils
 
-    executor = submitit.SlurmExecutor(folder=base.log_to)
+    executor = submitit.SlurmExecutor(folder=base.log_to, max_num_timeout=3)
     # OSC allocates ~10GB RAM per CPU, so request enough CPUs for desired memory
     n_cpus = (
         max(base.mem_gb // 10, base.n_workers) if base.mem_gb > 0 else base.n_workers
@@ -749,7 +766,7 @@ def cli(cfg: Config):
     )
 
     with executor.batch():
-        jobs = [executor.submit(worker_fn, c) for c in cfgs]
+        jobs = [executor.submit(TrainingJob(c)) for c in cfgs]
 
     time.sleep(5.0)
     for j, job in enumerate(jobs):
