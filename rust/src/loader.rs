@@ -39,6 +39,26 @@ struct ProcessedSample {
     index: i64,
 }
 
+/// Pipeline statistics for diagnostics.
+pub struct PipelineStats {
+    /// Times I/O thread blocked waiting to send (channel full = workers slow)
+    pub io_send_blocked: AtomicUsize,
+    /// Times workers blocked waiting to receive (channel empty = I/O slow)
+    pub worker_recv_blocked: AtomicUsize,
+    /// Total samples successfully processed by workers
+    pub samples_processed: AtomicUsize,
+}
+
+impl PipelineStats {
+    fn new() -> Self {
+        Self {
+            io_send_blocked: AtomicUsize::new(0),
+            worker_recv_blocked: AtomicUsize::new(0),
+            samples_processed: AtomicUsize::new(0),
+        }
+    }
+}
+
 /// Python-facing pipelined data loader.
 #[pyclass]
 pub struct Loader {
@@ -46,9 +66,12 @@ pub struct Loader {
     batch_size: usize,
     clip_samples: usize,
     spectrogram: Arc<SpectrogramTransform>,
+    raw_channel_capacity: usize,
 
     // Pipeline state
     shuffle_buffer: Arc<ConcurrentShuffleBuffer<ProcessedSample>>,
+    raw_rx: Option<Receiver<RawSample>>,
+    stats: Arc<PipelineStats>,
     shutdown: Arc<AtomicBool>,
     io_handle: Option<JoinHandle<()>>,
     worker_handles: Vec<JoinHandle<()>>,
@@ -169,12 +192,16 @@ impl Loader {
             seed,
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(PipelineStats::new());
 
         let mut loader = Self {
             batch_size,
             clip_samples,
             spectrogram: Arc::clone(&spectrogram),
+            raw_channel_capacity: raw_channel_size,
             shuffle_buffer: Arc::clone(&shuffle_buffer),
+            raw_rx: None,
+            stats: Arc::clone(&stats),
             shutdown: Arc::clone(&shutdown),
             io_handle: None,
             worker_handles: Vec::new(),
@@ -190,6 +217,7 @@ impl Loader {
             raw_channel_size,
             infinite,
             augment,
+            Arc::clone(&stats),
         );
 
         Ok(loader)
@@ -224,6 +252,45 @@ impl Loader {
 
         Ok(Some(self.assemble_batch(py, samples)?))
     }
+
+    /// Get pipeline diagnostics for debugging bottlenecks.
+    ///
+    /// Returns a dict with:
+    /// - raw_channel_len: Current samples waiting in raw channel
+    /// - raw_channel_capacity: Max capacity of raw channel
+    /// - shuffle_buffer_len: Current samples in shuffle buffer
+    /// - shuffle_buffer_capacity: Max capacity of shuffle buffer
+    /// - io_send_blocked: Times I/O thread blocked (channel full = workers slow)
+    /// - worker_recv_blocked: Times workers blocked (channel empty = I/O slow)
+    /// - samples_processed: Total samples processed by workers
+    fn diagnostics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+
+        // Raw channel stats
+        let raw_len = self.raw_rx.as_ref().map(|rx| rx.len()).unwrap_or(0);
+        dict.set_item("raw_channel_len", raw_len)?;
+        dict.set_item("raw_channel_capacity", self.raw_channel_capacity)?;
+
+        // Shuffle buffer stats
+        dict.set_item("shuffle_buffer_len", self.shuffle_buffer.len())?;
+        dict.set_item("shuffle_buffer_capacity", self.shuffle_buffer.capacity())?;
+
+        // Blocking counters
+        dict.set_item(
+            "io_send_blocked",
+            self.stats.io_send_blocked.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "worker_recv_blocked",
+            self.stats.worker_recv_blocked.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "samples_processed",
+            self.stats.samples_processed.load(Ordering::Relaxed),
+        )?;
+
+        Ok(dict)
+    }
 }
 
 impl Loader {
@@ -238,8 +305,12 @@ impl Loader {
         raw_channel_size: usize,
         infinite: bool,
         augment: bool,
+        stats: Arc<PipelineStats>,
     ) {
         let (raw_tx, raw_rx) = bounded(raw_channel_size);
+
+        // Store receiver for diagnostics
+        self.raw_rx = Some(raw_rx.clone());
 
         // Worker completion counter for monitor thread
         let workers_alive = Arc::new(AtomicUsize::new(n_workers));
@@ -247,6 +318,7 @@ impl Loader {
         // Spawn I/O thread
         self.io_handle = Some({
             let shutdown = Arc::clone(&self.shutdown);
+            let stats = Arc::clone(&stats);
             thread::spawn(move || {
                 io_thread_main(
                     arrow_files,
@@ -256,6 +328,7 @@ impl Loader {
                     shutdown,
                     infinite,
                     augment,
+                    stats,
                 );
             })
         });
@@ -268,6 +341,7 @@ impl Loader {
                 let spectrogram = Arc::clone(&self.spectrogram);
                 let shutdown = Arc::clone(&self.shutdown);
                 let workers_alive = Arc::clone(&workers_alive);
+                let stats = Arc::clone(&stats);
                 let clip_samples = self.clip_samples;
 
                 thread::spawn(move || {
@@ -280,6 +354,7 @@ impl Loader {
                         shutdown,
                         augment,
                         workers_alive,
+                        stats,
                     );
                 })
             })
@@ -374,6 +449,7 @@ fn io_thread_main(
     shutdown: Arc<AtomicBool>,
     infinite: bool,
     augment: bool,
+    stats: Arc<PipelineStats>,
 ) {
     let mut epoch_seed = initial_seed;
 
@@ -405,7 +481,7 @@ fn io_thread_main(
 
                 match sample_result {
                     Ok(sample) => {
-                        if !send_sample(&raw_tx, &shutdown, sample, epoch_seed, augment) {
+                        if !send_sample(&raw_tx, &shutdown, sample, epoch_seed, augment, &stats) {
                             return;
                         }
                     }
@@ -429,6 +505,7 @@ fn send_sample(
     sample: Sample,
     epoch_seed: u64,
     augment: bool,
+    stats: &Arc<PipelineStats>,
 ) -> bool {
     let mut raw = RawSample {
         audio_bytes: sample.audio_bytes,
@@ -448,6 +525,8 @@ fn send_sample(
         match raw_tx.send_timeout(raw, Duration::from_millis(100)) {
             Ok(()) => return true,
             Err(SendTimeoutError::Timeout(returned)) => {
+                // Channel full - workers are slow
+                stats.io_send_blocked.fetch_add(1, Ordering::Relaxed);
                 raw = returned; // Retry with same sample
             }
             Err(SendTimeoutError::Disconnected(_)) => return false,
@@ -466,6 +545,7 @@ fn worker_thread_main(
     shutdown: Arc<AtomicBool>,
     augment: bool,
     workers_alive: Arc<AtomicUsize>,
+    stats: Arc<PipelineStats>,
 ) {
     // Ensure counter is decremented even on panic
     struct CounterGuard(Arc<AtomicUsize>);
@@ -483,6 +563,8 @@ fn worker_thread_main(
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
+                // Channel empty - I/O is slow
+                stats.worker_recv_blocked.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -518,6 +600,8 @@ fn worker_thread_main(
         if !shuffle_buffer.push(processed) {
             return;
         }
+
+        stats.samples_processed.fetch_add(1, Ordering::Relaxed);
     }
 }
 

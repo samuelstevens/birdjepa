@@ -67,6 +67,12 @@ class CheckpointManager:
             encoder_config: Transformer config dataclass for the encoder.
             force: If True, save even if step doesn't match save_interval.
         """
+        # Skip if checkpoint already exists at this step (force only bypasses
+        # save_interval check, not the "already exists" check)
+        if step in self._mngr.all_steps():
+            logger.debug("Checkpoint for step %d already exists, skipping", step)
+            return
+
         self._mngr.save(
             step,
             args=ocp.args.Composite(

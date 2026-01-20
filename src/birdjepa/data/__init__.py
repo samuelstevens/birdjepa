@@ -537,6 +537,24 @@ class RustXenoCantoLoader:
         batch = next(self._loader)
         return self._postprocess(batch)
 
+    def diagnostics(self) -> dict:
+        """Get pipeline diagnostics for debugging bottlenecks.
+
+        Returns a dict with:
+        - raw_channel_len: Current samples waiting in raw channel
+        - raw_channel_capacity: Max capacity of raw channel
+        - shuffle_buffer_len: Current samples in shuffle buffer
+        - shuffle_buffer_capacity: Max capacity of shuffle buffer
+        - io_send_blocked: Times I/O thread blocked (channel full = workers slow)
+        - worker_recv_blocked: Times workers blocked (channel empty = I/O slow)
+        - samples_processed: Total samples processed by workers
+
+        Interpretation:
+        - High io_send_blocked → Workers are slow (CPU bottleneck)
+        - High worker_recv_blocked → I/O is slow (disk/network bottleneck)
+        """
+        return self._loader.diagnostics()
+
     def _postprocess(self, batch: dict) -> dict:
         """Transform Rust loader output to match Python interface."""
         spec_flat = batch["spectrogram"]  # [B, n_mels * n_frames]
@@ -580,7 +598,8 @@ class RustXenoCantoLoader:
 
         return {
             "data": spec.astype(np.float32),
-            "target": np.asarray(labels),  # Converts list to numpy; None values stay as object dtype
+            # Converts list to numpy; None values stay as object dtype
+            "target": np.asarray(labels),
             "label": str_labels,
             "index": indices,
         }

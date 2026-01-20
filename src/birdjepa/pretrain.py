@@ -1,9 +1,3 @@
-"""
-BirdJEPA pretraining.
-
-Based on https://github.com/rbalestr-lab/lejepa/blob/main/MINIMAL.md
-"""
-
 import dataclasses
 import logging
 import os
@@ -312,6 +306,70 @@ def make_train_step(optim, data_sharding, model_sharding):
 def worker_fn(cfg: Config):
     """Main training function. Uses single-process multi-GPU mode."""
     logging.basicConfig(level=logging.INFO, format=log_format, force=True)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    # Initialize multi-process JAX distributed runtime for multi-GPU SLURM jobs
+    # Each SLURM task is one process; this coordinates across them
+    # Skip for single-GPU to avoid heartbeat timeout issues during long JIT
+    import multiprocessing
+
+    n_tasks = int(os.environ.get("SLURM_NTASKS", "1"))
+    if n_tasks > 1 and multiprocessing.parent_process() is None:
+        # Use submitit to get distributed environment, then pass explicitly to JAX
+        # This avoids relying on JAX's Slurm auto-detection
+        import socket
+
+        import submitit.helpers
+
+        # Debug logging for heartbeat failures
+        hostname = socket.gethostname()
+        slurm_job_id = os.environ.get("SLURM_JOB_ID", "unknown")
+        slurm_nodelist = os.environ.get("SLURM_NODELIST", "unknown")
+        slurm_procid = os.environ.get("SLURM_PROCID", "unknown")
+        logger.info(
+            "Node debug: hostname=%s, job=%s, nodelist=%s, procid=%s",
+            hostname,
+            slurm_job_id,
+            slurm_nodelist,
+            slurm_procid,
+        )
+
+        dist_env = submitit.helpers.TorchDistributedEnvironment()
+        coordinator_address = f"{dist_env.master_addr}:{dist_env.master_port}"
+        logger.info(
+            "Distributed env: coordinator=%s, rank=%d/%d, local_rank=%d/%d",
+            coordinator_address,
+            dist_env.rank,
+            dist_env.world_size,
+            dist_env.local_rank,
+            dist_env.local_world_size,
+        )
+
+        # Try to resolve coordinator address to check reachability
+        try:
+            coord_ip = socket.gethostbyname(dist_env.master_addr)
+            logger.info("Coordinator resolves to IP: %s", coord_ip)
+        except socket.gaierror as e:
+            logger.warning(
+                "Failed to resolve coordinator %s: %s", dist_env.master_addr, e
+            )
+
+        init_start = time.perf_counter()
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=dist_env.world_size,
+            process_id=dist_env.rank,
+            initialization_timeout=300,
+            heartbeat_timeout_seconds=120,  # Short for fast failure detection
+        )
+        init_elapsed = time.perf_counter() - init_start
+        logger.info(
+            "Initialized JAX distributed: %d processes (took %.1fs)",
+            jax.process_count(),
+            init_elapsed,
+        )
+    elif n_tasks == 1:
+        logger.info("Single-process mode, skipping JAX distributed initialization")
 
     if cfg.device == "gpu":
         assert birdjepa.helpers.jax_has_gpu(), "GPU not available"
@@ -477,8 +535,8 @@ def worker_fn(cfg: Config):
         if step >= cfg.n_steps:
             break
 
-        # Compute target entropy before converting to JAX (measures shuffle quality)
-        tgt_entropy = compute_tgt_entropy(batch["target"])
+        # Store targets for entropy computation (only computed when logging)
+        targets_np = batch["target"]
 
         batch = _batch_to_jax(batch)
 
@@ -510,16 +568,19 @@ def worker_fn(cfg: Config):
                     peak_gb = stats.get("peak_bytes_in_use", 0) / 1e9
                     logger.info("Device %s peak memory: %.2f GB", device, peak_gb)
 
-        # Average metrics across devices for logging
-        metrics = jax.tree.map(lambda x: float(jnp.mean(x)), metrics)
-
         if step % cfg.log_every == 0:
             now = time.time()
-            sec_per_step = now - last_step_time
+            sec_per_step = (now - last_step_time) / cfg.log_every
             last_step_time = now
 
+            # Compute target entropy (measures shuffle quality)
+            tgt_entropy = compute_tgt_entropy(targets_np)
+
+            # Average metrics across devices for logging
+            metrics = jax.tree.map(lambda x: float(jnp.mean(x)), metrics)
+
             lr = float(schedule(step))
-            metric_strs = " ".join(
+            metric_str = " ".join(
                 f"{k}={float(v):.4g}" for k, v in sorted(metrics.items())
             )
             logger.info(
@@ -528,8 +589,9 @@ def worker_fn(cfg: Config):
                 lr,
                 tgt_entropy,
                 sec_per_step,
-                metric_strs,
+                metric_str,
             )
+<<<<<<< HEAD
             log_dict = {
                 "step": step,
                 "lr": lr,
@@ -541,6 +603,25 @@ def worker_fn(cfg: Config):
                 if k not in ("loss", "probe_loss"):
                     log_dict[f"train/{k}"] = float(v)
             wandb.log(log_dict)
+=======
+            if is_main:
+                log_dict = {
+                    "step": step,
+                    "lr": lr,
+                    "train/probe": float(metrics["probe_loss"]),
+                    "train/tgt_entropy": tgt_entropy,
+                    "train/sec_per_step": sec_per_step,
+                }
+                for k, v in metrics.items():
+                    if k not in ("loss", "probe_loss"):
+                        log_dict[f"train/{k}"] = float(v)
+
+                # Dataloader diagnostics
+                for k, v in train_loader.diagnostics().items():
+                    log_dict[f"dataloader/{k}"] = v
+
+                wandb.log(log_dict)
+>>>>>>> add muon sweep with rope
 
         # Evaluate periodically
         if step % cfg.eval_every == 0:

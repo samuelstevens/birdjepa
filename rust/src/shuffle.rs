@@ -127,6 +127,16 @@ impl<T> ConcurrentShuffleBuffer<T> {
         self.not_full.notify_all();
         self.ready.notify_all();
     }
+
+    /// Get current number of samples in the buffer.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().buffer.len()
+    }
+
+    /// Get buffer capacity.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 
 #[cfg(test)]
