@@ -166,3 +166,84 @@ def test_make_shuffled_dataloader_sharding():
     assert len(expected_shard0) + len(expected_shard1) == n_files
     assert len(expected_shard0) > 0
     assert len(expected_shard1) > 0
+
+
+def test_rust_xenocanto_loader_respects_n_samples():
+    """RustXenoCantoLoader should respect XenoCanto.n_samples."""
+    cfg = birdjepa.data.XenoCanto(subset="XCM", split="train", n_samples=1)
+    loader = birdjepa.data.RustXenoCantoLoader(
+        cfg,
+        seed=0,
+        batch_size=2,
+        n_workers=1,
+        shuffle_buffer_size=32,
+        shuffle_min_size=0,
+        infinite=False,
+    )
+
+    assert len(loader) == cfg.n_samples
+
+
+def test_rust_xenocanto_loader_counts_n_samples():
+    """RustXenoCantoLoader should yield exactly n_samples items."""
+    cfg = birdjepa.data.XenoCanto(subset="XCM", split="train", n_samples=5)
+    loader = birdjepa.data.RustXenoCantoLoader(
+        cfg,
+        seed=0,
+        batch_size=2,
+        n_workers=1,
+        shuffle_buffer_size=32,
+        shuffle_min_size=0,
+        infinite=False,
+    )
+
+    n_seen = 0
+    for batch in loader:
+        n_seen += batch["index"].shape[0]
+
+    assert n_seen == cfg.n_samples
+
+
+def test_rust_xenocanto_loader_requires_n_samples_with_infinite_false():
+    """RustXenoCantoLoader rejects infinite=False when n_samples is None."""
+    cfg = birdjepa.data.XenoCanto(subset="XCM", split="train", n_samples=None)
+    with pytest.raises(AssertionError, match="n_samples=None requires infinite=True"):
+        birdjepa.data.RustXenoCantoLoader(
+            cfg,
+            seed=0,
+            batch_size=2,
+            n_workers=1,
+            shuffle_buffer_size=32,
+            shuffle_min_size=0,
+            infinite=False,
+        )
+
+
+def test_rust_xenocanto_loader_rejects_n_samples_with_infinite_true():
+    """RustXenoCantoLoader rejects n_samples when infinite=True."""
+    cfg = birdjepa.data.XenoCanto(subset="XCM", split="train", n_samples=1)
+    with pytest.raises(AssertionError, match="n_samples requires infinite=False"):
+        birdjepa.data.RustXenoCantoLoader(
+            cfg,
+            seed=0,
+            batch_size=2,
+            n_workers=1,
+            shuffle_buffer_size=32,
+            shuffle_min_size=0,
+            infinite=True,
+        )
+
+
+def test_rust_xenocanto_loader_rejects_zero_n_samples():
+    """RustXenoCantoLoader rejects n_samples=0."""
+    cfg = birdjepa.data.XenoCanto(subset="XCM", split="train", n_samples=0)
+    with pytest.raises(AssertionError, match="n_samples must be > 0"):
+        birdjepa.data.RustXenoCantoLoader(
+            cfg,
+            seed=0,
+            batch_size=2,
+            n_workers=1,
+            shuffle_buffer_size=32,
+            shuffle_min_size=0,
+            infinite=False,
+        )

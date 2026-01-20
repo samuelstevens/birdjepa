@@ -6,6 +6,8 @@ import pytest
 
 from birdjepa._rs import Loader
 
+n_samples_full = 1_000_000_000
+
 
 @pytest.fixture(scope="module")
 def arrow_files():
@@ -18,7 +20,7 @@ def arrow_files():
 
 def test_loader_creates(arrow_files):
     """Loader can be instantiated with Arrow files."""
-    loader = Loader(arrow_files, seed=42, infinite=False)
+    loader = Loader(arrow_files, seed=42, n_samples=n_samples_full, infinite=False)
     # Just verify it doesn't crash - the loader starts pipeline on construction
     batch = next(iter(loader))
     assert batch is not None
@@ -27,7 +29,13 @@ def test_loader_creates(arrow_files):
 def test_loader_iteration(arrow_files):
     """Loader yields batches with expected keys and shapes."""
     batch_size = 8
-    loader = Loader(arrow_files, seed=42, batch_size=batch_size, infinite=False)
+    loader = Loader(
+        arrow_files,
+        seed=42,
+        batch_size=batch_size,
+        n_samples=n_samples_full,
+        infinite=False,
+    )
 
     batch = next(iter(loader))
 
@@ -47,8 +55,20 @@ def test_loader_iteration(arrow_files):
 
 def test_loader_different_seeds(arrow_files):
     """Different seeds produce different batches."""
-    loader1 = Loader(arrow_files, seed=42, batch_size=4, infinite=False)
-    loader2 = Loader(arrow_files, seed=123, batch_size=4, infinite=False)
+    loader1 = Loader(
+        arrow_files,
+        seed=42,
+        batch_size=4,
+        n_samples=n_samples_full,
+        infinite=False,
+    )
+    loader2 = Loader(
+        arrow_files,
+        seed=123,
+        batch_size=4,
+        n_samples=n_samples_full,
+        infinite=False,
+    )
 
     batch1 = next(iter(loader1))
     batch2 = next(iter(loader2))
@@ -60,7 +80,13 @@ def test_loader_different_seeds(arrow_files):
 
 def test_loader_multiple_batches(arrow_files):
     """Can iterate multiple batches."""
-    loader = Loader(arrow_files, seed=42, batch_size=4, infinite=False)
+    loader = Loader(
+        arrow_files,
+        seed=42,
+        batch_size=4,
+        n_samples=n_samples_full,
+        infinite=False,
+    )
 
     batches = []
     for i, batch in enumerate(loader):
@@ -91,6 +117,43 @@ def test_loader_zero_workers_rejected(arrow_files):
         Loader(arrow_files, seed=42, n_workers=0)
 
 
+def test_loader_infinite_false_requires_n_samples(arrow_files):
+    """Loader rejects infinite=False when n_samples is None."""
+    with pytest.raises(ValueError, match="n_samples"):
+        Loader(arrow_files, seed=42, infinite=False)
+
+
+def test_loader_rejects_n_samples_with_infinite(arrow_files):
+    """Loader rejects n_samples when infinite=True."""
+    with pytest.raises(ValueError, match="n_samples"):
+        Loader(arrow_files, seed=42, n_samples=1, infinite=True)
+
+
+def test_loader_rejects_zero_n_samples(arrow_files):
+    """Loader rejects n_samples=0."""
+    with pytest.raises(ValueError, match="n_samples must be > 0"):
+        Loader(arrow_files, seed=42, n_samples=0, infinite=False)
+
+
+def test_loader_n_samples_below_shuffle_min_size(arrow_files):
+    """Loader drains even if n_samples < shuffle_min_size."""
+    loader = Loader(
+        arrow_files,
+        seed=42,
+        batch_size=4,
+        shuffle_buffer_size=16,
+        shuffle_min_size=8,
+        n_samples=3,
+        infinite=False,
+    )
+
+    n_samples = 0
+    for batch in loader:
+        n_samples += batch["spectrogram"].shape[0]
+
+    assert n_samples == 3
+
+
 def test_loader_small_shuffle_buffer(arrow_files):
     """Small shuffle buffer forces evictions - verifies shuffle logic."""
     # Use tiny buffer so evictions happen immediately
@@ -101,6 +164,7 @@ def test_loader_small_shuffle_buffer(arrow_files):
         batch_size=8,
         shuffle_buffer_size=16,  # Very small - forces evictions after 16 samples
         shuffle_min_size=8,  # min_size < capacity
+        n_samples=n_samples_full,
         infinite=False,
     )
 
@@ -147,6 +211,7 @@ def test_loader_partial_batch(arrow_files):
         batch_size=100,
         shuffle_buffer_size=50,
         shuffle_min_size=0,  # Allow partial batches to drain
+        n_samples=n_samples_full,
         infinite=False,
     )
 
@@ -201,6 +266,7 @@ def test_loader_returns_indices(arrow_files):
         batch_size=8,
         shuffle_buffer_size=32,
         shuffle_min_size=16,
+        n_samples=n_samples_full,
         infinite=False,
     )
 
@@ -220,6 +286,7 @@ def test_loader_indices_unique_within_epoch(arrow_files):
         batch_size=16,
         shuffle_buffer_size=32,
         shuffle_min_size=16,
+        n_samples=n_samples_full,
         infinite=False,
     )
 
@@ -247,6 +314,7 @@ def test_loader_indices_canonical_range(arrow_files):
         batch_size=100,
         shuffle_buffer_size=200,
         shuffle_min_size=100,
+        n_samples=n_samples_full,
         infinite=False,
     )
 
@@ -274,6 +342,7 @@ def test_loader_finite_mode_exhausts(arrow_files):
         batch_size=100,
         shuffle_buffer_size=200,
         shuffle_min_size=0,  # Allow immediate draining
+        n_samples=n_samples_full,
         infinite=False,
     )
 
@@ -328,6 +397,7 @@ def test_rust_labels_match_python():
         batch_size=32,
         shuffle_buffer_size=100,
         shuffle_min_size=10,
+        n_samples=n_samples_full,
         infinite=False,
         augment=False,
     )
