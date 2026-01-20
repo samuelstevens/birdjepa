@@ -52,7 +52,9 @@ def test_spectrogram_parity():
     rust_spec = rust_transform(samples)
 
     # Both return [n_frames, n_mels]
-    assert rust_spec.shape == py_spec.shape, f"Shape mismatch: {rust_spec.shape} vs {py_spec.shape}"
+    assert rust_spec.shape == py_spec.shape, (
+        f"Shape mismatch: {rust_spec.shape} vs {py_spec.shape}"
+    )
 
     # Values must match within tolerance
     np.testing.assert_allclose(rust_spec, py_spec, rtol=RTOL, atol=ATOL)
@@ -167,5 +169,7 @@ def test_spectrogram_parity_property(duration: float, seed: int):
     )
     rust_spec = rust_transform(samples)
 
-    assert rust_spec.shape == py_spec.shape, f"Shape mismatch: {rust_spec.shape} vs {py_spec.shape}"
+    assert rust_spec.shape == py_spec.shape, (
+        f"Shape mismatch: {rust_spec.shape} vs {py_spec.shape}"
+    )
     np.testing.assert_allclose(rust_spec, py_spec, rtol=RTOL, atol=ATOL)

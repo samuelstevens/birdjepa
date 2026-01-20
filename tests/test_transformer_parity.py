@@ -175,14 +175,14 @@ def test_transformer_forward_parity():
 
     # Compare outputs
     np.testing.assert_allclose(
-        np.asarray(jax_out["cls"]),
+        np.asarray(jax_out.cls),
         pt_out["cls"].numpy(),
         rtol=RTOL,
         atol=ATOL,
         err_msg="CLS token mismatch",
     )
     np.testing.assert_allclose(
-        np.asarray(jax_out["patches"]),
+        np.asarray(jax_out.patches),
         pt_out["patches"].numpy(),
         rtol=RTOL,
         atol=ATOL,
@@ -240,7 +240,7 @@ def test_transformer_backward_parity():
     # JAX: compute gradient of mean CLS output w.r.t. input
     def jax_loss_fn(model, x, grid, key):
         out = model(x, grid=grid, key=key)
-        return out["cls"].mean()
+        return out.cls.mean()
 
     key = jax.random.key(0)
     jax_loss, jax_grads = eqx.filter_value_and_grad(jax_loss_fn)(

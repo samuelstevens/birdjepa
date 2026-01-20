@@ -553,13 +553,15 @@ def worker_fn(cfg: Config):
             end_value=0.0,
         )
     else:
-        tp.assert_never(cfg.model)
+        tp.assert_never(cfg.schedule)
+
     if cfg.optimizer == "muon":
         optim = optax.contrib.muon(learning_rate=schedule)
     elif cfg.optimizer == "adamw":
         optim = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
     else:
         tp.assert_never(cfg.optimizer)
+
     if cfg.grad_clip > 0:
         optim = optax.chain(
             optax.clip_by_global_norm(cfg.grad_clip),

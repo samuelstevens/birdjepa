@@ -24,9 +24,9 @@ def test_transformer_forward_smoke():
 
     out = model(x_bnk, grid=grid_bn2, key=fwd_key)
 
-    assert out["cls"].shape == (2, 1, 64)
-    assert out["patches"].shape == (2, 64, 64)
-    assert out["reg"].shape == (2, 0, 64)
+    assert out.cls.shape == (2, 1, 64)
+    assert out.patches.shape == (2, 64, 64)
+    assert out.reg.shape == (2, 0, 64)
 
 
 def test_transformer_visible_patches_only():
@@ -45,8 +45,8 @@ def test_transformer_visible_patches_only():
 
     out = model(x_visible, grid=grid_visible, key=fwd_key)
 
-    assert out["cls"].shape == (2, 1, 64)
-    assert out["patches"].shape == (2, 16, 64)
+    assert out.cls.shape == (2, 1, 64)
+    assert out.patches.shape == (2, 16, 64)
 
 
 @st.composite
@@ -66,7 +66,9 @@ def patch_config(draw):
 def test_patchify_roundtrip(config, batch_size):
     """Patchify then unpatchify should recover original."""
     h, w, patch_h, patch_w = config
-    cfg = transformer.Transformer(input_h=h, input_w=w, patch_h=patch_h, patch_w=patch_w)
+    cfg = transformer.Transformer(
+        input_h=h, input_w=w, patch_h=patch_h, patch_w=patch_w
+    )
     key = jax.random.key(0)
     x_bhw = jax.random.normal(key, (batch_size, h, w))
 
@@ -323,8 +325,14 @@ def test_attention_qk_norm_and_rope():
 def test_transformer_rope_mode():
     """With use_rope=True, rope_embed is set and pos_embed_hw is None."""
     cfg = transformer.Transformer(
-        input_h=32, input_w=32, patch_h=4, patch_w=4,
-        embed_dim=64, depth=2, n_heads=4, use_rope=True,
+        input_h=32,
+        input_w=32,
+        patch_h=4,
+        patch_w=4,
+        embed_dim=64,
+        depth=2,
+        n_heads=4,
+        use_rope=True,
     )
     model = transformer.TransformerModel(cfg, key=jr.key(0))
 
@@ -335,8 +343,14 @@ def test_transformer_rope_mode():
 def test_transformer_absolute_mode():
     """With use_rope=False, pos_embed_hw is set and rope_embed is None."""
     cfg = transformer.Transformer(
-        input_h=32, input_w=32, patch_h=4, patch_w=4,
-        embed_dim=64, depth=2, n_heads=4, use_rope=False,
+        input_h=32,
+        input_w=32,
+        patch_h=4,
+        patch_w=4,
+        embed_dim=64,
+        depth=2,
+        n_heads=4,
+        use_rope=False,
     )
     model = transformer.TransformerModel(cfg, key=jr.key(0))
 
@@ -362,15 +376,22 @@ def test_transformer_output_shapes_both_modes():
     out_rope = model_rope(x_bnk, grid=grid, key=jr.key(2))
     out_abs = model_abs(x_bnk, grid=grid, key=jr.key(3))
 
-    assert out_rope["cls"].shape == out_abs["cls"].shape
-    assert out_rope["patches"].shape == out_abs["patches"].shape
+    assert out_rope.cls.shape == out_abs.cls.shape
+    assert out_rope.patches.shape == out_abs.patches.shape
 
 
 def test_transformer_gradient_flow_with_rope():
     """Gradients propagate through RoPE correctly."""
     cfg = transformer.Transformer(
-        input_h=32, input_w=32, patch_h=4, patch_w=4,
-        embed_dim=64, depth=2, n_heads=4, use_rope=True, grad_ckpt=False,
+        input_h=32,
+        input_w=32,
+        patch_h=4,
+        patch_w=4,
+        embed_dim=64,
+        depth=2,
+        n_heads=4,
+        use_rope=True,
+        grad_ckpt=False,
     )
     model = transformer.TransformerModel(cfg, key=jr.key(0))
 
@@ -379,7 +400,7 @@ def test_transformer_gradient_flow_with_rope():
 
     def loss_fn(m):
         out = m(x_bnk, grid=grid, key=jr.key(1))
-        return out["cls"].mean() + out["patches"].mean()
+        return out.cls.mean() + out.patches.mean()
 
     grads = eqx.filter_grad(loss_fn)(model)
 
@@ -393,8 +414,15 @@ def test_transformer_gradient_flow_with_rope():
 def test_transformer_scan_vs_loop_with_rope():
     """Scan and loop modes produce same outputs with RoPE."""
     base_cfg = dict(
-        input_h=32, input_w=32, patch_h=4, patch_w=4,
-        embed_dim=64, depth=2, n_heads=4, use_rope=True, grad_ckpt=False,
+        input_h=32,
+        input_w=32,
+        patch_h=4,
+        patch_w=4,
+        embed_dim=64,
+        depth=2,
+        n_heads=4,
+        use_rope=True,
+        grad_ckpt=False,
     )
 
     cfg_scan = transformer.Transformer(**base_cfg, use_scan=True)
@@ -409,8 +437,8 @@ def test_transformer_scan_vs_loop_with_rope():
     out_scan = model_scan(x_bnk, grid=grid, key=jr.key(0))
     out_loop = model_loop(x_bnk, grid=grid, key=jr.key(0))
 
-    assert jnp.allclose(out_scan["cls"], out_loop["cls"], atol=1e-5)
-    assert jnp.allclose(out_scan["patches"], out_loop["patches"], atol=1e-5)
+    assert jnp.allclose(out_scan.cls, out_loop.cls, atol=1e-5)
+    assert jnp.allclose(out_scan.patches, out_loop.patches, atol=1e-5)
 
 
 # -----------------------------------------------------------------------------
@@ -437,9 +465,17 @@ def test_transformer_config_free_wins_defaults():
 def test_all_free_wins_forward():
     """Model with all free wins enabled runs forward pass."""
     cfg = transformer.Transformer(
-        input_h=32, input_w=32, patch_h=4, patch_w=4,
-        embed_dim=64, depth=2, n_heads=4,
-        use_rope=True, use_qk_norm=True, use_swiglu=True, use_layerscale=True,
+        input_h=32,
+        input_w=32,
+        patch_h=4,
+        patch_w=4,
+        embed_dim=64,
+        depth=2,
+        n_heads=4,
+        use_rope=True,
+        use_qk_norm=True,
+        use_swiglu=True,
+        use_layerscale=True,
     )
     model = transformer.TransformerModel(cfg, key=jr.key(0))
 
@@ -448,18 +484,26 @@ def test_all_free_wins_forward():
 
     out = model(x_bnk, grid=grid, key=jr.key(1))
 
-    assert out["cls"].shape == (2, 1, 64)
-    assert out["patches"].shape == (2, 64, 64)
-    assert not jnp.any(jnp.isnan(out["cls"]))
-    assert not jnp.any(jnp.isnan(out["patches"]))
+    assert out.cls.shape == (2, 1, 64)
+    assert out.patches.shape == (2, 64, 64)
+    assert not jnp.any(jnp.isnan(out.cls))
+    assert not jnp.any(jnp.isnan(out.patches))
 
 
 def test_all_free_wins_backward():
     """Model with all free wins computes gradients without NaN/Inf."""
     cfg = transformer.Transformer(
-        input_h=32, input_w=32, patch_h=4, patch_w=4,
-        embed_dim=64, depth=2, n_heads=4,
-        use_rope=True, use_qk_norm=True, use_swiglu=True, use_layerscale=True,
+        input_h=32,
+        input_w=32,
+        patch_h=4,
+        patch_w=4,
+        embed_dim=64,
+        depth=2,
+        n_heads=4,
+        use_rope=True,
+        use_qk_norm=True,
+        use_swiglu=True,
+        use_layerscale=True,
         grad_ckpt=False,
     )
     model = transformer.TransformerModel(cfg, key=jr.key(0))
@@ -469,7 +513,7 @@ def test_all_free_wins_backward():
 
     def loss_fn(m):
         out = m(x_bnk, grid=grid, key=jr.key(1))
-        return out["cls"].mean() + out["patches"].mean()
+        return out.cls.mean() + out.patches.mean()
 
     grads = eqx.filter_grad(loss_fn)(model)
 
@@ -490,10 +534,17 @@ def test_all_free_wins_backward():
 def test_free_wins_combinations(use_rope, use_qk_norm, use_swiglu, use_layerscale):
     """All combinations of free wins produce valid outputs."""
     cfg = transformer.Transformer(
-        input_h=16, input_w=16, patch_h=4, patch_w=4,
-        embed_dim=32, depth=1, n_heads=4,
-        use_rope=use_rope, use_qk_norm=use_qk_norm,
-        use_swiglu=use_swiglu, use_layerscale=use_layerscale,
+        input_h=16,
+        input_w=16,
+        patch_h=4,
+        patch_w=4,
+        embed_dim=32,
+        depth=1,
+        n_heads=4,
+        use_rope=use_rope,
+        use_qk_norm=use_qk_norm,
+        use_swiglu=use_swiglu,
+        use_layerscale=use_layerscale,
     )
     model = transformer.TransformerModel(cfg, key=jr.key(0))
 
@@ -502,5 +553,5 @@ def test_free_wins_combinations(use_rope, use_qk_norm, use_swiglu, use_layerscal
 
     out = model(x_bnk, grid=grid, key=jr.key(1))
 
-    assert out["cls"].shape == (1, 1, 32)
-    assert not jnp.any(jnp.isnan(out["cls"]))
+    assert out.cls.shape == (1, 1, 32)
+    assert not jnp.any(jnp.isnan(out.cls))
