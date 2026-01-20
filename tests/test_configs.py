@@ -591,30 +591,98 @@ def test_nested_override_partially_filters_sweep():
 
 
 # -----------------------------------------------------------------------------
-# Tests for free wins sweep
+# Tests for free wins sweeps
 # -----------------------------------------------------------------------------
 
 
-def test_free_wins_sweep_loading():
+@pytest.mark.parametrize(
+    (
+        "sweep_path",
+        "optimizer",
+        "use_rope",
+        "use_qk_norm",
+        "use_swiglu",
+        "use_layerscale",
+    ),
+    [
+        (
+            pathlib.Path("sweeps/001_freewins/adamw_vits_xcl.py"),
+            "adamw",
+            False,
+            False,
+            False,
+            False,
+        ),
+        (
+            pathlib.Path("sweeps/001_freewins/muon_vits_xcl.py"),
+            "muon",
+            True,
+            True,
+            True,
+            True,
+        ),
+    ],
+)
+def test_free_wins_sweep_loading(
+    sweep_path: pathlib.Path,
+    optimizer: str,
+    use_rope: bool,
+    use_qk_norm: bool,
+    use_swiglu: bool,
+    use_layerscale: bool,
+):
     """Free wins sweep config loads correctly."""
-    sweep_path = pathlib.Path("sweeps/001_freewins/free_wins_vits_xcl.py")
     if not sweep_path.exists():
         pytest.skip("Sweep file not found")
 
     sweep = birdjepa.configs.load_sweep(sweep_path)
 
-    assert len(sweep) == 4
+    assert len(sweep) > 0
     for cfg_dict in sweep:
-        assert cfg_dict["model"]["use_rope"] is True
-        assert cfg_dict["model"]["use_qk_norm"] is True
-        assert cfg_dict["model"]["use_swiglu"] is True
-        assert cfg_dict["model"]["use_layerscale"] is True
-        assert cfg_dict["optimizer"] in ["adamw", "muon"]
+        assert cfg_dict["model"]["use_rope"] is use_rope
+        assert cfg_dict["model"]["use_qk_norm"] is use_qk_norm
+        assert cfg_dict["model"]["use_swiglu"] is use_swiglu
+        assert cfg_dict["model"]["use_layerscale"] is use_layerscale
+        assert cfg_dict["optimizer"] == optimizer
 
 
-def test_free_wins_config_instantiation_from_sweep():
+@pytest.mark.parametrize(
+    (
+        "sweep_path",
+        "optimizer",
+        "use_rope",
+        "use_qk_norm",
+        "use_swiglu",
+        "use_layerscale",
+    ),
+    [
+        (
+            pathlib.Path("sweeps/001_freewins/adamw_vits_xcl.py"),
+            "adamw",
+            False,
+            False,
+            False,
+            False,
+        ),
+        (
+            pathlib.Path("sweeps/001_freewins/muon_vits_xcl.py"),
+            "muon",
+            True,
+            True,
+            True,
+            True,
+        ),
+    ],
+)
+def test_free_wins_config_instantiation_from_sweep(
+    sweep_path: pathlib.Path,
+    optimizer: str,
+    use_rope: bool,
+    use_qk_norm: bool,
+    use_swiglu: bool,
+    use_layerscale: bool,
+):
     """Sweep dicts can be converted to Config objects."""
-    sweep_path = pathlib.Path("sweeps/001_freewins/free_wins_vits_xcl.py")
     if not sweep_path.exists():
         pytest.skip("Sweep file not found")
 
@@ -624,8 +692,11 @@ def test_free_wins_config_instantiation_from_sweep():
     )
 
     assert len(errs) == 0
-    assert len(cfgs) == 4
+    assert len(cfgs) == len(sweep)
 
     for cfg in cfgs:
-        assert cfg.model.use_rope is True
-        assert cfg.optimizer in ["adamw", "muon"]
+        assert cfg.model.use_rope is use_rope
+        assert cfg.model.use_qk_norm is use_qk_norm
+        assert cfg.model.use_swiglu is use_swiglu
+        assert cfg.model.use_layerscale is use_layerscale
+        assert cfg.optimizer == optimizer

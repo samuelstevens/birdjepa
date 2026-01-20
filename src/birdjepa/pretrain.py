@@ -2,6 +2,7 @@ import dataclasses
 import logging
 import os
 import pathlib
+import sys
 import time
 import typing as tp
 
@@ -20,6 +21,9 @@ import birdjepa.data
 import birdjepa.helpers
 import birdjepa.nn.objectives
 import birdjepa.nn.transformer
+
+if tp.TYPE_CHECKING:
+    import submitit.helpers
 
 log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 logger = logging.getLogger("birdjepa.pretrain")
@@ -53,12 +57,30 @@ def compute_tgt_entropy(targets: np.ndarray) -> float:
 def _batch_to_jax(batch: dict) -> dict:
     """Convert numeric arrays in batch to JAX, drop non-numeric fields.
 
-    Note: jnp.asarray copies data to JAX memory. The Rust dataloader allocates
-    fresh memory per batch (no buffer reuse), so an explicit numpy copy is
-    likely unnecessary. We keep it simple here - if corruption issues arise,
-    add np.array(v, copy=True) before jnp.asarray.
+    We copy numpy arrays before transferring to JAX to avoid buffer reuse
+    issues with the Rust dataloader.
     """
-    return {k: jnp.asarray(v) for k, v in batch.items() if _is_numeric_array(v)}
+    result: dict[str, jax.Array] = {}
+    for key, value in batch.items():
+        if not _is_numeric_array(value):
+            continue
+        if isinstance(value, np.ndarray):
+            value = np.array(value, copy=True)
+        result[key] = jnp.asarray(value)
+    return result
+
+
+def _batch_to_device(batch: dict, sharding) -> dict[str, jax.Array]:
+    """Copy batch arrays and place on sharded device."""
+    result: dict[str, jax.Array] = {}
+    for key, value in batch.items():
+        if not _is_numeric_array(value):
+            continue
+        if isinstance(value, np.ndarray):
+            value = np.array(value, copy=True)
+        result[key] = jax.device_put(value, sharding)
+    jax.tree.map(lambda x: x.block_until_ready(), result)
+    return result
 
 
 @beartype.beartype
@@ -134,6 +156,8 @@ class Config:
     """Path to sweep file with make_cfgs() function."""
     run_id: str = ""
     """Optional W&B run id for deterministic runs and checkpoint paths."""
+    tags: list[str] = dataclasses.field(default_factory=list)
+    """W&B tags for organizing runs."""
     # Rust dataloader settings
     window_size: int = 10000
     """Shuffle buffer size for Rust loader (samples)."""
@@ -203,13 +227,20 @@ def wsd_schedule(
     return optax.join_schedules(schedules, boundaries)
 
 
-def make_train_step(optim, data_sharding, model_sharding):
+def make_train_step(
+    optim,
+    data_sharding,
+    model_sharding,
+    *,
+    check_nans: bool = False,
+):
     """Create train_step function with sharding.
 
     Args:
         optim: Optax optimizer.
         data_sharding: NamedSharding for batch data (shard along batch dim).
         model_sharding: NamedSharding for model params (replicated).
+        check_nans: Emit debug logs when loss is non-finite.
 
     Returns:
         train_step function.
@@ -252,6 +283,35 @@ def make_train_step(optim, data_sharding, model_sharding):
             }
 
         (loss, aux), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(models)
+
+        if check_nans:
+
+            def _log_nonfinite(_):
+                data = batch["data"]
+                targets = batch["target"]
+                emb = aux["emb"]
+                obj_loss = sum(aux["losses"].values())
+                emb_has_nan = jnp.any(jnp.isnan(emb))
+                data_has_nan = jnp.any(jnp.isnan(data))
+                jax.debug.print(
+                    "Nonfinite loss: loss={loss} obj={obj} probe={probe} emb_nan={emb_nan} emb_min={emb_min} emb_max={emb_max} data_nan={data_nan} data_min={data_min} data_max={data_max} target_min={target_min} target_max={target_max}",
+                    loss=loss,
+                    obj=obj_loss,
+                    probe=aux["probe_loss"],
+                    emb_nan=emb_has_nan,
+                    emb_min=jnp.nanmin(emb),
+                    emb_max=jnp.nanmax(emb),
+                    data_nan=data_has_nan,
+                    data_min=jnp.nanmin(data),
+                    data_max=jnp.nanmax(data),
+                    target_min=jnp.min(targets),
+                    target_max=jnp.max(targets),
+                )
+                return loss
+
+            loss = jax.lax.cond(
+                jnp.isfinite(loss), lambda _: loss, _log_nonfinite, None
+            )
 
         # Get trainable params
         params = {k: eqx.filter(v, eqx.is_inexact_array) for k, v in models.items()}
@@ -369,6 +429,32 @@ def worker_fn(cfg: Config):
     elif n_tasks == 1:
         logger.info("Single-process mode, skipping JAX distributed initialization")
 
+    debug_nans = os.environ.get("BIRDJEPA_DEBUG_NANS") == "1"
+    check_nans = debug_nans or os.environ.get("BIRDJEPA_CHECK_NANS") == "1"
+    if debug_nans:
+        jax.config.update("jax_debug_nans", True)
+        jax.config.update("jax_debug_infs", True)
+        logger.info("Enabled JAX NaN/Inf debugging")
+
+    def _assert_finite(label: str, array: object) -> None:
+        if not check_nans:
+            return
+        if not _is_numeric_array(array):
+            return
+        array_np = np.asarray(array)
+        if np.isfinite(array_np).all():
+            return
+        n_nan = int(np.isnan(array_np).sum())
+        n_inf = int(np.isinf(array_np).sum())
+        array_min = float(np.nanmin(array_np))
+        array_max = float(np.nanmax(array_np))
+        msg = (
+            f"Non-finite values in {label}: n_nan={n_nan} n_inf={n_inf} "
+            f"min={array_min:.4g} max={array_max:.4g}"
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
     if cfg.device == "gpu":
         assert birdjepa.helpers.jax_has_gpu(), "GPU not available"
 
@@ -381,7 +467,13 @@ def worker_fn(cfg: Config):
     assert cfg.run_id
     dct = dataclasses.asdict(cfg)
     dct["slurm_job_id"] = os.environ.get("SLURM_JOB_ID")
-    wandb.init(project="birdjepa", config=dct, id=cfg.run_id, resume="allow")
+    wandb.init(
+        project="birdjepa",
+        config=dct,
+        id=cfg.run_id,
+        resume="allow",
+        tags=cfg.tags,
+    )
     logger.info("wandb run id: %s", cfg.run_id)
 
     key = jr.key(cfg.seed)
@@ -514,7 +606,12 @@ def worker_fn(cfg: Config):
 
     # Create train_step with sharding
     logger.info("Creating train_step function")
-    train_step = make_train_step(optim, data_sharding, model_sharding)
+    train_step = make_train_step(
+        optim,
+        data_sharding,
+        model_sharding,
+        check_nans=check_nans,
+    )
 
     # Training loop (step-based with infinite iterator)
     logger.info("Starting training from step %d (total %d)", start_step, cfg.n_steps)
@@ -524,6 +621,12 @@ def worker_fn(cfg: Config):
     # Initial sharding of models and optimizer state
     models = eqx.filter_shard(models, model_sharding)
     opt_state = eqx.filter_shard(opt_state, model_sharding)
+
+    if check_nans:
+        for name, model in models.items():
+            params = eqx.filter(model, eqx.is_inexact_array)
+            for leaf in jax.tree.leaves(params):
+                _assert_finite(f"params.{name}", leaf)
 
     # TODO: total is wrong when resuming (should be cfg.n_steps - step)
     last_step_time = time.time()
@@ -536,11 +639,11 @@ def worker_fn(cfg: Config):
         # Store targets for entropy computation (only computed when logging)
         targets_np = batch["target"]
 
-        batch = _batch_to_jax(batch)
+        if debug_nans and step < 5:
+            for name, value in batch.items():
+                _assert_finite(f"batch.{name}", value)
 
-        # Use explicit jax.device_put instead of eqx.filter_shard to avoid buffer corruption issues in single-process multi-device mode
-        batch = {k: jax.device_put(v, data_sharding) for k, v in batch.items()}
-        jax.tree.map(lambda x: x.block_until_ready(), batch)
+        batch = _batch_to_device(batch, data_sharding)
 
         step_key, key = jr.split(key)
 
@@ -589,7 +692,6 @@ def worker_fn(cfg: Config):
                 sec_per_step,
                 metric_str,
             )
-<<<<<<< HEAD
             log_dict = {
                 "step": step,
                 "lr": lr,
@@ -600,26 +702,12 @@ def worker_fn(cfg: Config):
             for k, v in metrics.items():
                 if k not in ("loss", "probe_loss"):
                     log_dict[f"train/{k}"] = float(v)
+
+            # Dataloader diagnostics
+            for k, v in train_loader.diagnostics().items():
+                log_dict[f"dataloader/{k}"] = v
+
             wandb.log(log_dict)
-=======
-            if is_main:
-                log_dict = {
-                    "step": step,
-                    "lr": lr,
-                    "train/probe": float(metrics["probe_loss"]),
-                    "train/tgt_entropy": tgt_entropy,
-                    "train/sec_per_step": sec_per_step,
-                }
-                for k, v in metrics.items():
-                    if k not in ("loss", "probe_loss"):
-                        log_dict[f"train/{k}"] = float(v)
-
-                # Dataloader diagnostics
-                for k, v in train_loader.diagnostics().items():
-                    log_dict[f"dataloader/{k}"] = v
-
-                wandb.log(log_dict)
->>>>>>> add muon sweep with rope
 
         # Evaluate periodically
         if step % cfg.eval_every == 0:
@@ -672,12 +760,19 @@ def worker_fn(cfg: Config):
     wandb.finish()
 
 
-class TrainingJob:
-    """Checkpointable training job for submitit timeout/preemption handling.
+@beartype.beartype
+def _worker_fn_checkpoint(cfg: Config) -> "submitit.helpers.DelayedSubmission":
+    import submitit.helpers
 
-    On timeout, submitit calls checkpoint() which requeues the same job.
-    worker_fn auto-resumes from latest checkpoint in ckpt_to/run_id.
-    """
+    return submitit.helpers.DelayedSubmission(worker_fn, cfg)
+
+
+setattr(worker_fn, "__submitit_checkpoint__", _worker_fn_checkpoint)
+setattr(worker_fn, "checkpoint", _worker_fn_checkpoint)
+
+
+class TrainingJob:
+    """Checkpointable wrapper for submitit experiments."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -749,6 +844,24 @@ def cli(cfg: Config):
         logger.info("Requesting %d CPUs to get %dGB RAM", n_cpus, base.mem_gb)
     tag = pathlib.Path(base.sweep).stem if base.sweep else "local"
     # Single process sees all GPUs (no JAX distributed coordination needed)
+    setup = [
+        "module load ffmpeg/6.1.1",
+        "export NCCL_IB_DISABLE=1",  # Disable InfiniBand (not available)
+        "export NCCL_P2P_DISABLE=1",  # Use shared memory
+    ]
+    debug_nans = os.environ.get("BIRDJEPA_DEBUG_NANS") == "1"
+    check_nans = os.environ.get("BIRDJEPA_CHECK_NANS") == "1"
+    if debug_nans:
+        setup += [
+            "export BIRDJEPA_DEBUG_NANS=1",
+            "export JAX_DEBUG_NANS=1",
+            "export JAX_DEBUG_INFS=1",
+        ]
+        logger.info("Enabling NaN debugging for Slurm jobs")
+    if check_nans:
+        setup.append("export BIRDJEPA_CHECK_NANS=1")
+        logger.info("Enabling batch NaN checks for Slurm jobs")
+
     executor.update_parameters(
         time=int(base.n_hours * 60),
         partition=base.slurm_partition,
@@ -758,15 +871,21 @@ def cli(cfg: Config):
         stderr_to_stdout=True,
         account=base.slurm_acct,
         job_name=f"pretrain[{tag}]",
-        setup=[
-            "module load ffmpeg/6.1.1",
-            "export NCCL_IB_DISABLE=1",  # Disable InfiniBand (not available)
-            "export NCCL_P2P_DISABLE=1",  # Use shared memory
-        ],
+        setup=setup,
     )
 
+    if os.environ.get("BIRDJEPA_PICKLE_BY_VALUE") == "1":
+        import cloudpickle
+
+        cloudpickle.register_pickle_by_value(sys.modules[__name__])
+        logger.info("Enabled cloudpickle by-value for %s", __name__)
+
     with executor.batch():
-        jobs = [executor.submit(TrainingJob(c)) for c in cfgs]
+        if os.environ.get("BIRDJEPA_SUBMIT_WRAPPER") == "1":
+            logger.info("Submitting TrainingJob wrapper (BIRDJEPA_SUBMIT_WRAPPER=1)")
+            jobs = [executor.submit(TrainingJob(c)) for c in cfgs]
+        else:
+            jobs = [executor.submit(worker_fn, c) for c in cfgs]
 
     time.sleep(5.0)
     for j, job in enumerate(jobs):

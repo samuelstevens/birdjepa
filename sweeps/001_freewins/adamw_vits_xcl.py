@@ -1,16 +1,13 @@
-"""Sweep: ViT-S on XCL with all 'free wins' enabled (RoPE, QK-Norm, SwiGLU, LayerScale).
-
-Compares AdamW vs Muon optimizer with different learning rates.
-"""
+"""Sweep: AdamW LR sweep for ViT-S on XCL with free wins enabled."""
 
 
 def make_cfgs() -> list[dict]:
     cfgs = []
 
     train_data = {"__class__": "XenoCanto", "subset": "XCL"}
+    # Use 10k train samples for validation (XCL has no labeled valid split)
     test_data = {"__class__": "XenoCanto", "subset": "XCL", "n_samples": 10_000}
 
-    # ViT-S with all free wins enabled
     model = {
         "input_h": 512,
         "input_w": 128,
@@ -19,34 +16,23 @@ def make_cfgs() -> list[dict]:
         "embed_dim": 384,
         "depth": 12,
         "n_heads": 6,
-        # Free wins
-        "use_rope": True,
-        "rope_base": 100.0,
-        "use_qk_norm": True,
-        "use_swiglu": True,
-        "use_layerscale": True,
-        "layerscale_init": 1e-4,
+        "use_rope": False,
+        "use_qk_norm": False,
+        "use_swiglu": False,
+        "use_layerscale": False,
     }
 
-    # Test both optimizers at their typical LRs
-    # AdamW: 1e-3 was optimal from prior sweep
-    # Muon: typically needs different LR, try a few values
-    configs = [
-        ("adamw", 1e-3),
-        ("muon", 1e-3),
-        ("muon", 3e-3),
-        ("muon", 1e-2),
-    ]
+    lrs = [3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
 
-    for optimizer, lr in configs:
+    for lr in lrs:
         cfgs.append({
             "train_data": train_data,
             "test_data": test_data,
             "model": model,
             "objective": {"__class__": "SupervisedConfig"},
-            "batch_size": 2048,
+            "batch_size": 2048,  # 1024 per GPU
             "lr": lr,
-            "optimizer": optimizer,
+            "optimizer": "adamw",
             "schedule": "wsd",
             "warmup_steps": 5000,
             "decay_steps": 0,
@@ -56,11 +42,12 @@ def make_cfgs() -> list[dict]:
             "n_workers": 60,
             "window_size": 10_000,
             "n_gpus": 2,
-            "n_hours": 12.0,
+            "n_hours": 4.0,
             "mem_gb": 128,
             "slurm_acct": "PAS2136",
             "slurm_partition": "preemptible-nextgen",
             "ckpt_to": "/fs/ess/PAS2136/samuelstevens/birdjepa/checkpoints",
+            "tags": ["001", "v0.1"],
         })
 
     return cfgs

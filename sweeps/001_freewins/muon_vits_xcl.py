@@ -1,7 +1,4 @@
-"""Sweep: ViT-S on XCL with all 'free wins' enabled (RoPE, QK-Norm, SwiGLU, LayerScale).
-
-Compares AdamW vs Muon optimizer with different learning rates.
-"""
+"""Sweep: Muon LR sweep for ViT-S on XCL with free wins enabled."""
 
 
 def make_cfgs() -> list[dict]:
@@ -26,16 +23,9 @@ def make_cfgs() -> list[dict]:
         "layerscale_init": 1e-4,
     }
 
-    configs = [
-        # ("adamw", 1e-3),  # Done: 90.3% test_acc (run 64dr53yj)
-        # ("muon", 1e-3),   # Done: 85.1% test_acc
-        # ("muon", 3e-3),   # Done: 86.8% test_acc
-        # ("muon", 1e-2),   # Done: 85.9% test_acc
-        ("muon", 3e-2),
-        ("muon", 1e-1),
-    ]
+    lrs = [3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
 
-    for optimizer, lr in configs:
+    for lr in lrs:
         cfgs.append({
             "train_data": train_data,
             "test_data": test_data,
@@ -43,7 +33,7 @@ def make_cfgs() -> list[dict]:
             "objective": {"__class__": "SupervisedConfig"},
             "batch_size": 2048,
             "lr": lr,
-            "optimizer": optimizer,
+            "optimizer": "muon",
             "schedule": "wsd",
             "warmup_steps": 5000,
             "decay_steps": 0,
@@ -53,11 +43,12 @@ def make_cfgs() -> list[dict]:
             "n_workers": 60,
             "window_size": 10_000,
             "n_gpus": 2,
-            "n_hours": 12.0,
+            "n_hours": 4.0,
             "mem_gb": 128,
-            "slurm_acct": "",
-            "slurm_partition": "",
-            "ckpt_to": "/research/nfs_su_809/workspace/stevens.994/birdjepa/checkpoints",
+            "slurm_acct": "PAS2136",
+            "slurm_partition": "preemptible-nextgen",
+            "ckpt_to": "/fs/ess/PAS2136/samuelstevens/birdjepa/checkpoints",
+            "tags": ["001", "v0.1"],
         })
 
     return cfgs
