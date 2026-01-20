@@ -54,3 +54,32 @@ def test_muon_optimizer_step():
     for v in jax.tree_util.tree_leaves(updates):
         assert not jnp.any(jnp.isnan(v))
         assert not jnp.any(jnp.isinf(v))
+
+
+def test_wsd_schedule_guards_duplicate_boundaries(monkeypatch):
+    """wsd_schedule should avoid duplicate join_schedules boundaries."""
+    original_join = pretrain.optax.join_schedules
+    boundaries_record: dict[str, list[int]] = {}
+
+    def join_schedules(schedules, boundaries):
+        boundaries_record["boundaries"] = list(boundaries)
+        return original_join(schedules, boundaries)
+
+    monkeypatch.setattr(pretrain.optax, "join_schedules", join_schedules)
+
+    try:
+        pretrain.wsd_schedule(
+            peak_value=1.0,
+            total_steps=10,
+            warmup_steps=3,
+            decay_steps=7,
+            end_value=0.0,
+        )
+    except AssertionError:
+        return
+
+    boundaries = boundaries_record.get("boundaries")
+    assert boundaries is not None, "Expected join_schedules to be called."
+    assert len(boundaries) == len(set(boundaries)), (
+        f"Duplicate boundaries: {boundaries}"
+    )
