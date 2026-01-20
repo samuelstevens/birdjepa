@@ -54,22 +54,6 @@ def compute_tgt_entropy(targets: np.ndarray) -> float:
     return float(-np.sum(probs * np.log(probs + 1e-10)))
 
 
-def _batch_to_jax(batch: dict) -> dict:
-    """Convert numeric arrays in batch to JAX, drop non-numeric fields.
-
-    We copy numpy arrays before transferring to JAX to avoid buffer reuse
-    issues with the Rust dataloader.
-    """
-    result: dict[str, jax.Array] = {}
-    for key, value in batch.items():
-        if not _is_numeric_array(value):
-            continue
-        if isinstance(value, np.ndarray):
-            value = np.array(value, copy=True)
-        result[key] = jnp.asarray(value)
-    return result
-
-
 def _batch_to_device(batch: dict, sharding) -> dict[str, jax.Array]:
     """Copy batch arrays and place on sharded device."""
     result: dict[str, jax.Array] = {}
@@ -81,6 +65,23 @@ def _batch_to_device(batch: dict, sharding) -> dict[str, jax.Array]:
         result[key] = jax.device_put(value, sharding)
     jax.tree.map(lambda x: x.block_until_ready(), result)
     return result
+
+
+def _pool_embeddings(
+    out: birdjepa.nn.transformer.EncoderOutput, probe_pooling: str
+) -> jax.Array:
+    """Pool embeddings from encoder outputs."""
+    if probe_pooling == "cls":
+        emb = out.cls.mean(axis=-2)
+    elif probe_pooling == "patches":
+        emb = out.patches.mean(axis=-2)
+    else:
+        tp.assert_never(probe_pooling)
+
+    # LeJEPA keeps a view dimension (v, b, d); flatten to (v*b, d) for probe.
+    if emb.ndim == 3:
+        emb = emb.reshape(-1, emb.shape[-1])
+    return emb
 
 
 @beartype.beartype
@@ -118,7 +119,7 @@ class Config:
     """Random seed."""
     device: tp.Literal["cpu", "gpu"] = "gpu"
     """Device to train on."""
-    probe_pooling: str = "cls"
+    probe_pooling: tp.Literal["cls", "patches"] = "cls"
     """Pooling for probe: 'cls' (mean of CLS tokens) or 'patches' (mean of patches)."""
     source_rank: int = 0
     """Low-rank bottleneck for source prediction head. 0 = disabled."""
@@ -211,28 +212,42 @@ def wsd_schedule(
         f"Negative stable steps: {warmup_steps=} + {decay_steps=} > {total_steps=}"
     )
 
-    schedules = [
-        optax.constant_schedule(peak_value),
-    ]
-    boundaries = []
+    segments: list[tuple[int, optax.Schedule]] = []
     if warmup_steps > 0:
-        schedules.insert(0, optax.linear_schedule(0.0, peak_value, warmup_steps))
-        boundaries.append(warmup_steps)
+        segments.append((
+            warmup_steps,
+            optax.linear_schedule(0.0, peak_value, warmup_steps),
+        ))
+    if stable_steps > 0:
+        segments.append((stable_steps, optax.constant_schedule(peak_value)))
     if decay_steps > 0:
-        schedules.append(optax.linear_schedule(peak_value, end_value, decay_steps))
-        boundaries.append(warmup_steps + stable_steps)
+        segments.append((
+            decay_steps,
+            optax.linear_schedule(peak_value, end_value, decay_steps),
+        ))
 
-    if not boundaries:
-        return schedules[0]
+    if not segments:
+        return optax.constant_schedule(peak_value)
+    if len(segments) == 1:
+        return segments[0][1]
+
+    schedules = [segment[1] for segment in segments]
+    boundaries = []
+    n_steps = 0
+    for n_segment_steps, _ in segments[:-1]:
+        n_steps += n_segment_steps
+        boundaries.append(n_steps)
+
     return optax.join_schedules(schedules, boundaries)
 
 
+@beartype.beartype
 def make_train_step(
     optim,
     data_sharding,
     model_sharding,
     *,
-    check_nans: bool = False,
+    probe_pooling: str,
 ):
     """Create train_step function with sharding.
 
@@ -240,7 +255,6 @@ def make_train_step(
         optim: Optax optimizer.
         data_sharding: NamedSharding for batch data (shard along batch dim).
         model_sharding: NamedSharding for model params (replicated).
-        check_nans: Emit debug logs when loss is non-finite.
 
     Returns:
         train_step function.
@@ -268,50 +282,23 @@ def make_train_step(
                 models["probe"],
             )
 
-            losses, emb, targets = objective(batch, encoder, key=key)
+            losses, out, targets = objective(batch, encoder, key=key, mode="train")
+            emb = _pool_embeddings(out, probe_pooling)
+            targets_probe = targets.reshape(-1)
 
             obj_loss = sum(losses.values())
             probe_logits = jax.vmap(probe)(emb)
 
-            probe_loss = softmax_cross_entropy(probe_logits, targets)
+            probe_loss = softmax_cross_entropy(probe_logits, targets_probe)
             total_loss = obj_loss + probe_loss
             return total_loss, {
                 "losses": losses,
                 "probe_loss": probe_loss,
                 "emb": emb,
-                "targets": targets,
+                "targets": targets_probe,
             }
 
         (loss, aux), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(models)
-
-        if check_nans:
-
-            def _log_nonfinite(_):
-                data = batch["data"]
-                targets = batch["target"]
-                emb = aux["emb"]
-                obj_loss = sum(aux["losses"].values())
-                emb_has_nan = jnp.any(jnp.isnan(emb))
-                data_has_nan = jnp.any(jnp.isnan(data))
-                jax.debug.print(
-                    "Nonfinite loss: loss={loss} obj={obj} probe={probe} emb_nan={emb_nan} emb_min={emb_min} emb_max={emb_max} data_nan={data_nan} data_min={data_min} data_max={data_max} target_min={target_min} target_max={target_max}",
-                    loss=loss,
-                    obj=obj_loss,
-                    probe=aux["probe_loss"],
-                    emb_nan=emb_has_nan,
-                    emb_min=jnp.nanmin(emb),
-                    emb_max=jnp.nanmax(emb),
-                    data_nan=data_has_nan,
-                    data_min=jnp.nanmin(data),
-                    data_max=jnp.nanmax(data),
-                    target_min=jnp.min(targets),
-                    target_max=jnp.max(targets),
-                )
-                return loss
-
-            loss = jax.lax.cond(
-                jnp.isfinite(loss), lambda _: loss, _log_nonfinite, None
-            )
 
         # Get trainable params
         params = {k: eqx.filter(v, eqx.is_inexact_array) for k, v in models.items()}
@@ -358,6 +345,34 @@ def make_train_step(
         return new_models, new_opt_state, metrics
 
     return train_step
+
+
+@beartype.beartype
+def make_eval_step(
+    probe_pooling: tp.Literal["cls", "patches"],
+):
+    """Create eval_step function with sharding."""
+
+    @eqx.filter_jit
+    def eval_step(models, batch, *, key):
+        encoder, objective, probe = (
+            models["encoder"],
+            models["objective"],
+            models["probe"],
+        )
+        losses, out, targets = objective(batch, encoder, key=key, mode="eval")
+        emb = _pool_embeddings(out, probe_pooling)
+        targets_probe = targets.reshape(-1)
+
+        logits = jax.vmap(probe)(emb)
+        preds = jnp.argmax(logits, axis=1)
+        correct = jnp.sum(preds == targets_probe)
+        total = targets_probe.shape[0]
+
+        loss = sum(losses.values())
+        return correct, total, loss
+
+    return eval_step
 
 
 @beartype.beartype
@@ -429,32 +444,6 @@ def worker_fn(cfg: Config):
     elif n_tasks == 1:
         logger.info("Single-process mode, skipping JAX distributed initialization")
 
-    debug_nans = os.environ.get("BIRDJEPA_DEBUG_NANS") == "1"
-    check_nans = debug_nans or os.environ.get("BIRDJEPA_CHECK_NANS") == "1"
-    if debug_nans:
-        jax.config.update("jax_debug_nans", True)
-        jax.config.update("jax_debug_infs", True)
-        logger.info("Enabled JAX NaN/Inf debugging")
-
-    def _assert_finite(label: str, array: object) -> None:
-        if not check_nans:
-            return
-        if not _is_numeric_array(array):
-            return
-        array_np = np.asarray(array)
-        if np.isfinite(array_np).all():
-            return
-        n_nan = int(np.isnan(array_np).sum())
-        n_inf = int(np.isinf(array_np).sum())
-        array_min = float(np.nanmin(array_np))
-        array_max = float(np.nanmax(array_np))
-        msg = (
-            f"Non-finite values in {label}: n_nan={n_nan} n_inf={n_inf} "
-            f"min={array_min:.4g} max={array_max:.4g}"
-        )
-        logger.error(msg)
-        raise ValueError(msg)
-
     if cfg.device == "gpu":
         assert birdjepa.helpers.jax_has_gpu(), "GPU not available"
 
@@ -508,6 +497,7 @@ def worker_fn(cfg: Config):
         cfg.objective, cfg.model, train_ds, key=obj_key
     )
     logger.info("Created objective: %s", type(objective).__name__)
+    eval_step = make_eval_step(cfg.probe_pooling)
 
     # Create dataloaders using Rust loader
     logger.info("Creating train dataloader")
@@ -610,7 +600,7 @@ def worker_fn(cfg: Config):
         optim,
         data_sharding,
         model_sharding,
-        check_nans=check_nans,
+        probe_pooling=cfg.probe_pooling,
     )
 
     # Training loop (step-based with infinite iterator)
@@ -622,12 +612,6 @@ def worker_fn(cfg: Config):
     models = eqx.filter_shard(models, model_sharding)
     opt_state = eqx.filter_shard(opt_state, model_sharding)
 
-    if check_nans:
-        for name, model in models.items():
-            params = eqx.filter(model, eqx.is_inexact_array)
-            for leaf in jax.tree.leaves(params):
-                _assert_finite(f"params.{name}", leaf)
-
     # TODO: total is wrong when resuming (should be cfg.n_steps - step)
     last_step_time = time.time()
     for batch in birdjepa.helpers.progress(
@@ -638,10 +622,6 @@ def worker_fn(cfg: Config):
 
         # Store targets for entropy computation (only computed when logging)
         targets_np = batch["target"]
-
-        if debug_nans and step < 5:
-            for name, value in batch.items():
-                _assert_finite(f"batch.{name}", value)
 
         batch = _batch_to_device(batch, data_sharding)
 
@@ -711,9 +691,6 @@ def worker_fn(cfg: Config):
 
         # Evaluate periodically
         if step % cfg.eval_every == 0:
-            encoder = models["encoder"]
-            probe = models["probe"]
-            objective = models["objective"]
             correct = 0
             total = 0
             test_loss = 0.0
@@ -724,23 +701,12 @@ def worker_fn(cfg: Config):
                 if n_test_batches >= n_eval_batches:
                     break
                 n_test_batches += 1
-                data = jnp.asarray(test_batch["data"])
-                targets = jnp.asarray(test_batch["target"])
-                x_bnk, grid = birdjepa.nn.transformer.patchify(data, cfg.model)
-                out = encoder(x_bnk, grid=grid, key=eval_key)
-                if cfg.probe_pooling == "cls":
-                    emb = out["cls"].mean(axis=1)
-                else:
-                    emb = out["patches"].mean(axis=1)
-                logits = jax.vmap(probe)(emb)
-                preds = jnp.argmax(logits, axis=1)
-                correct += int(jnp.sum(preds == targets))
-                total += targets.shape[0]
                 eval_key, obj_key = jr.split(eval_key)
-                batch_jax = _batch_to_jax(test_batch)
-                losses, _, _ = objective(batch_jax, encoder, key=obj_key)
-                loss = sum(losses.values())
-                test_loss += float(jnp.mean(loss))
+                batch = _batch_to_device(test_batch, data_sharding)
+                correct_b, total_b, loss_b = eval_step(models, batch, key=obj_key)
+                correct += int(correct_b)
+                total += int(total_b)
+                test_loss += float(loss_b)
             acc = correct / max(1, total)
             test_loss /= max(1, n_test_batches)
             logger.info("step=%d test_acc=%.4f test_loss=%.4f", step, acc, test_loss)
@@ -760,6 +726,7 @@ def worker_fn(cfg: Config):
     wandb.finish()
 
 
+@beartype.beartype
 class TrainingJob:
     """Checkpointable wrapper for submitit experiments."""
 
@@ -838,19 +805,6 @@ def cli(cfg: Config):
         "export NCCL_IB_DISABLE=1",  # Disable InfiniBand (not available)
         "export NCCL_P2P_DISABLE=1",  # Use shared memory
     ]
-    debug_nans = os.environ.get("BIRDJEPA_DEBUG_NANS") == "1"
-    check_nans = os.environ.get("BIRDJEPA_CHECK_NANS") == "1"
-    if debug_nans:
-        setup += [
-            "export BIRDJEPA_DEBUG_NANS=1",
-            "export JAX_DEBUG_NANS=1",
-            "export JAX_DEBUG_INFS=1",
-        ]
-        logger.info("Enabling NaN debugging for Slurm jobs")
-    if check_nans:
-        setup.append("export BIRDJEPA_CHECK_NANS=1")
-        logger.info("Enabling batch NaN checks for Slurm jobs")
-
     executor.update_parameters(
         time=int(base.n_hours * 60),
         partition=base.slurm_partition,
