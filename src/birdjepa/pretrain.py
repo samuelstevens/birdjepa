@@ -23,7 +23,7 @@ import birdjepa.nn.objectives
 import birdjepa.nn.transformer
 
 if tp.TYPE_CHECKING:
-    import submitit.helpers
+    pass
 
 log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 logger = logging.getLogger("birdjepa.pretrain")
@@ -760,17 +760,6 @@ def worker_fn(cfg: Config):
     wandb.finish()
 
 
-@beartype.beartype
-def _worker_fn_checkpoint(cfg: Config) -> "submitit.helpers.DelayedSubmission":
-    import submitit.helpers
-
-    return submitit.helpers.DelayedSubmission(worker_fn, cfg)
-
-
-setattr(worker_fn, "__submitit_checkpoint__", _worker_fn_checkpoint)
-setattr(worker_fn, "checkpoint", _worker_fn_checkpoint)
-
-
 class TrainingJob:
     """Checkpointable wrapper for submitit experiments."""
 
@@ -881,11 +870,7 @@ def cli(cfg: Config):
         logger.info("Enabled cloudpickle by-value for %s", __name__)
 
     with executor.batch():
-        if os.environ.get("BIRDJEPA_SUBMIT_WRAPPER") == "1":
-            logger.info("Submitting TrainingJob wrapper (BIRDJEPA_SUBMIT_WRAPPER=1)")
-            jobs = [executor.submit(TrainingJob(c)) for c in cfgs]
-        else:
-            jobs = [executor.submit(worker_fn, c) for c in cfgs]
+        jobs = [executor.submit(TrainingJob(c)) for c in cfgs]
 
     time.sleep(5.0)
     for j, job in enumerate(jobs):
