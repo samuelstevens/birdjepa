@@ -140,6 +140,13 @@ Register tokens (if used) are appended without positional embeddings, as they se
 </details>
 
 <details>
+<summary>RoPE uses absolute grid indices and precomputed cos/sin tables</summary>
+
+When rotary embeddings are enabled, positions are treated as absolute grid indices (0..n_patches-1) on each axis, not batch-normalized to [-1, 1]. We previously normalized by the batch max, but that made angles batch-dependent and was removed. We precompute axis-specific cos/sin tables at compile time and index them by the grid, matching Equinox's RotaryPositionalEmbedding and avoiding batch-dependent angles.
+
+</details>
+
+<details>
 <summary>LeJEPA projection head is 3-layer MLP with BatchNorm and ReLU</summary>
 
 The LeJEPA projection head uses: Linear(D, 2048) -> BatchNorm -> ReLU -> Linear(2048, 2048) -> BatchNorm -> ReLU -> Linear(2048, proj_dim). The hidden dimension is fixed at 2048.
