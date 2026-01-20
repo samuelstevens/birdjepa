@@ -491,6 +491,12 @@ class RustXenoCantoLoader:
 
         from birdjepa._rs import Loader
 
+        if cfg.n_samples is None:
+            assert infinite, "n_samples=None requires infinite=True"
+        else:
+            assert cfg.n_samples > 0, "n_samples must be > 0"
+            assert not infinite, "n_samples requires infinite=False"
+
         # Load dataset to get Arrow file paths
         ds = datasets.load_dataset("samuelstevens/BirdSet", cfg.subset, split=cfg.split)
         arrow_fpaths = [f["filename"] for f in ds.cache_files]
@@ -501,7 +507,10 @@ class RustXenoCantoLoader:
         self.n_classes = self._class_labels.num_classes
 
         # Store dataset size
-        self._n_samples = len(ds)
+        if cfg.n_samples is not None:
+            self._n_samples = min(cfg.n_samples, len(ds))
+        else:
+            self._n_samples = len(ds)
 
         # Create Rust loader
         augment = cfg.truncate == "random"
@@ -520,6 +529,7 @@ class RustXenoCantoLoader:
             f_min=bird_mae.BIRDMAE_STFT_LOW_FREQ_HZ,
             preemphasis=0.97,
             n_workers=n_workers,
+            n_samples=cfg.n_samples,
             infinite=infinite,
             augment=augment,
         )

@@ -99,6 +99,7 @@ impl Loader {
         raw_channel_size = 256,
         infinite = true,
         augment = true,
+        n_samples = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -120,6 +121,7 @@ impl Loader {
         raw_channel_size: usize,
         infinite: bool,
         augment: bool,
+        n_samples: Option<usize>,
     ) -> PyResult<Self> {
         if arrow_files.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -144,6 +146,23 @@ impl Loader {
         if n_workers == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "n_workers must be > 0",
+            ));
+        }
+        if n_samples.is_some() && infinite {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "n_samples requires infinite=false",
+            ));
+        }
+        if let Some(n_samples) = n_samples {
+            if n_samples == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "n_samples must be > 0",
+                ));
+            }
+        }
+        if n_samples.is_none() && !infinite {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "infinite=false requires n_samples",
             ));
         }
 
@@ -217,6 +236,7 @@ impl Loader {
             raw_channel_size,
             infinite,
             augment,
+            n_samples,
             Arc::clone(&stats),
         );
 
@@ -305,6 +325,7 @@ impl Loader {
         raw_channel_size: usize,
         infinite: bool,
         augment: bool,
+        n_samples: Option<usize>,
         stats: Arc<PipelineStats>,
     ) {
         let (raw_tx, raw_rx) = bounded(raw_channel_size);
@@ -328,6 +349,7 @@ impl Loader {
                     shutdown,
                     infinite,
                     augment,
+                    n_samples,
                     stats,
                 );
             })
@@ -449,16 +471,18 @@ fn io_thread_main(
     shutdown: Arc<AtomicBool>,
     infinite: bool,
     augment: bool,
+    n_samples: Option<usize>,
     stats: Arc<PipelineStats>,
 ) {
     let mut epoch_seed = initial_seed;
 
     loop {
+        let mut n_sent = 0usize;
         // Shuffle file order for this pass
         let mut file_order: Vec<usize> = (0..arrow_files.len()).collect();
         file_order.shuffle(&mut StdRng::seed_from_u64(epoch_seed));
 
-        for &file_idx in &file_order {
+        'files: for &file_idx in &file_order {
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
@@ -483,6 +507,12 @@ fn io_thread_main(
                     Ok(sample) => {
                         if !send_sample(&raw_tx, &shutdown, sample, epoch_seed, augment, &stats) {
                             return;
+                        }
+                        n_sent += 1;
+                        if let Some(limit) = n_samples {
+                            if n_sent >= limit {
+                                break 'files;
+                            }
                         }
                     }
                     Err(e) => eprintln!("io_thread: error reading sample: {}", e),
