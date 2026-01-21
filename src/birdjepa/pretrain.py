@@ -690,10 +690,8 @@ def worker_fn(cfg: Config):
             test_loss = 0.0
 
             eval_key = jr.key(0)  # Fixed key for deterministic eval
-            test_iter = iter(test_loader)
             n_test_batches = 0
-            for _ in range(n_eval_batches):
-                test_batch = next(test_iter)
+            for test_batch in test_loader:
                 n_test_batches += 1
                 eval_key, obj_key = jr.split(eval_key)
                 batch = _batch_to_device(test_batch, data_sharding)
