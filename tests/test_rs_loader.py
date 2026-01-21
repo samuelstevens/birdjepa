@@ -6,6 +6,8 @@ import pytest
 
 from birdjepa._rs import Loader
 
+pytestmark = pytest.mark.skip(reason="Rust loader is internal; test via public APIs")
+
 n_samples_full = 1_000_000_000
 
 
