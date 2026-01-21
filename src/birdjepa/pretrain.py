@@ -506,7 +506,7 @@ def worker_fn(cfg: Config):
         n_test,
         n_classes,
     )
-    n_eval_batches = n_test // cfg.batch_size
+    n_eval_batches = (n_test + cfg.batch_size - 1) // cfg.batch_size
     logger.info("Eval: %d batches", n_eval_batches)
 
     logger.info("Creating objective")
