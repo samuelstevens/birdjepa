@@ -80,7 +80,7 @@ class IndexedXenoCantoDataset(grain.RandomAccessDataSource):
     """XenoCanto dataset using random access (slow on NFS).
 
     Loads audio from HuggingFace BirdSet, takes crops, computes spectrograms on-the-fly.
-    Use ShuffledXenoCantoDataset for NFS-friendly sequential reading.
+    Use RustXenoCantoLoader for high-throughput sequential reading.
     """
 
     def __init__(self, cfg: XenoCanto):
@@ -195,129 +195,6 @@ class IndexedXenoCantoDataset(grain.RandomAccessDataSource):
             )
 
         target = item["ebird_code"]
-        label = self._class_labels.int2str(target)
-        return {"data": spec, "label": label, "target": target, "index": idx}
-
-
-class ShuffledXenoCantoDataset:
-    """XenoCanto dataset using sequential Arrow file reading (NFS-friendly).
-
-    Uses grain's hierarchical shuffle pattern:
-    1. Shuffle Arrow file paths (cheap random access on ~200 paths)
-    2. Read each Arrow file sequentially
-    3. Interleave multiple shards for mixing
-    4. Window shuffle buffer for local randomness
-    """
-
-    def __init__(self, cfg: XenoCanto):
-        import datasets
-
-        self.cfg = cfg
-
-        # Load dataset to get Arrow file paths (HF handles download/validation)
-        ds = datasets.load_dataset("samuelstevens/BirdSet", cfg.subset, split=cfg.split)
-        self.arrow_fpaths = [f["filename"] for f in ds.cache_files]
-        assert self.arrow_fpaths, f"No Arrow files found for {cfg.subset}/{cfg.split}"
-
-        # Get class labels
-        self._class_labels = ds.features["ebird_code"]
-        self.n_classes = self._class_labels.num_classes
-
-        self.max_samples = int(SR_HZ * cfg.clip_sec)
-
-        # Bad indices to filter (per shard filtering happens in decode)
-        self._bad_indices = (
-            BAD_XCL_INDICES if cfg.subset == "XCL" and cfg.split == "train" else set()
-        )
-
-        # RNG for truncation
-        self._rng_seed = cfg.seed
-
-        # Store dataset size for __len__ (needed for logging)
-        self._n_samples = len(ds)
-
-        # RSS logging interval (set by make_shuffled_dataloader)
-        self._rss_log_interval = 500
-
-    def __len__(self) -> int:
-        return self._n_samples
-
-    def __getitem__(self, idx: int) -> dict:
-        raise NotImplementedError(
-            "ShuffledXenoCantoDataset doesn't support random access. "
-            "Use make_shuffled_dataloader() for iteration."
-        )
-
-    def make_shard_iter(self, arrow_fpath: str) -> grain.IterDataset:
-        """Load one Arrow shard as IterDataset (sequential read)."""
-        import pyarrow as pa
-
-        with pa.OSFile(arrow_fpath, "rb") as f:
-            reader = pa.ipc.open_stream(f)
-            table = reader.read_all()
-        rows = table.to_pylist()
-
-        return grain.MapDataset.source(rows).to_iter_dataset()
-
-    def decode_and_transform(self, row: dict) -> dict | None:
-        """Decode audio bytes and compute spectrogram."""
-        import io
-        import os
-
-        import psutil
-        import soundfile as sf
-
-        # Filter bad indices
-        idx = row.get("__index_level_0__", -1)
-        if idx in self._bad_indices:
-            return None
-
-        # Log RSS memory periodically
-        self._decode_count = getattr(self, "_decode_count", 0) + 1
-        if (
-            self._rss_log_interval > 0
-            and self._decode_count % self._rss_log_interval == 0
-        ):
-            rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024**2
-            logger.info(
-                "Worker RSS after %d samples: %.1f MB", self._decode_count, rss_mb
-            )
-
-        # Decode audio using soundfile (more reliable than torchcodec)
-        try:
-            audio_bytes = row["audio"]["bytes"]
-            waveform, sr = sf.read(io.BytesIO(audio_bytes))
-            # Convert to mono if stereo
-            if waveform.ndim > 1:
-                waveform = waveform.mean(axis=1)
-            waveform = waveform.astype(np.float32)
-            # Resample if needed
-            if sr != SR_HZ:
-                import soxr
-
-                waveform = soxr.resample(waveform, sr, SR_HZ)
-        except Exception as err:
-            logger.warning("Failed to decode audio at index %d: %s", idx, err)
-            return None
-
-        # Truncate or pad to clip_sec
-        n_samples = len(waveform)
-        rng = np.random.default_rng(self._rng_seed + idx)
-        if n_samples > self.max_samples:
-            if self.cfg.truncate == "random":
-                start = rng.integers(0, n_samples - self.max_samples)
-            elif self.cfg.truncate == "start":
-                start = 0
-            else:  # end
-                start = n_samples - self.max_samples
-            waveform = waveform[start : start + self.max_samples]
-        elif n_samples < self.max_samples:
-            waveform = np.pad(waveform, (0, self.max_samples - n_samples))
-
-        spec = bird_mae.transform(waveform)
-        spec = birdjepa.augment.apply(spec, self.cfg.augmentations)
-
-        target = row["ebird_code"]
         label = self._class_labels.int2str(target)
         return {"data": spec, "label": label, "target": target, "index": idx}
 
@@ -539,6 +416,10 @@ class RustXenoCantoLoader:
     def __len__(self) -> int:
         return self._n_samples
 
+    def __getitem__(self, idx: int) -> dict:
+        msg = f"RustXenoCantoLoader does not support __getitem__ (idx={idx}); use IndexedXenoCantoDataset for random access"
+        assert False, msg
+
     def __iter__(self):
         iter(self._loader)  # Reset the underlying Rust loader
         return self
@@ -613,95 +494,3 @@ class RustXenoCantoLoader:
             "label": str_labels,
             "index": indices,
         }
-
-
-@beartype.beartype
-def make_shuffled_dataloader(
-    source: ShuffledXenoCantoDataset,
-    *,
-    seed: int,
-    batch_size: int,
-    n_workers: int,
-    shuffle: bool,
-    drop_last: bool,
-    repeat: bool = False,
-    shard_index: int = 0,
-    shard_count: int = 1,
-    window_size: int = 8000,
-    cycle_length: int = 4,
-    rss_log_interval: int = 500,
-):
-    """Create dataloader with sequential Arrow file reading.
-
-    Uses grain's hierarchical shuffle pattern for NFS-friendly data loading:
-    1. Shuffle Arrow file paths (cheap random access on ~200 paths)
-    2. Read each file sequentially via InterleaveIterDataset
-    3. Window shuffle buffer for local randomness
-
-    Args:
-        source: ShuffledXenoCantoDataset with Arrow file paths.
-        seed: Random seed for shuffling.
-        batch_size: Batch size.
-        n_workers: Number of prefetch workers.
-        shuffle: Whether to shuffle.
-        drop_last: Whether to drop the last incomplete batch.
-        repeat: Whether to repeat indefinitely.
-        shard_index: Index of this shard (0-indexed). Use jax.process_index().
-        shard_count: Total number of shards. Use jax.process_count().
-        window_size: Shuffle buffer size for local randomness (default 8000).
-        cycle_length: Number of shards to interleave concurrently (default 4).
-        rss_log_interval: Log worker RSS memory every N samples (default 500, 0 to disable).
-
-    Returns:
-        Grain IterDataset for iteration.
-    """
-    # Set RSS logging interval on source
-    source._rss_log_interval = rss_log_interval
-
-    # Shard the file list across processes
-    arrow_fpaths = source.arrow_fpaths
-    if shard_count > 1:
-        arrow_fpaths = arrow_fpaths[shard_index::shard_count]
-
-    # Build grain pipeline: shuffle shard order
-    ds = grain.MapDataset.source(arrow_fpaths).seed(seed)
-    if shuffle:
-        ds = ds.shuffle()
-    if repeat:
-        ds = ds.repeat()
-
-    # Map to IterDatasets (shard loading happens when InterleaveIterDataset needs it)
-    ds = ds.map(source.make_shard_iter)
-
-    # Interleave shards for mixing
-    ds = grain.experimental.InterleaveIterDataset(
-        ds,
-        cycle_length=cycle_length,
-        iter_buffer_size=256,
-    )
-
-    # Window shuffle for local randomness (after interleaving)
-    if shuffle and window_size > 0:
-        ds = grain.experimental.WindowShuffleIterDataset(
-            ds,
-            window_size=window_size,
-            seed=seed,
-        )
-
-    # Decode audio and transform to spectrogram, filtering bad samples
-    ds = ds.map(source.decode_and_transform)
-    ds = ds.filter(lambda x: x is not None)
-
-    # Multiprocess prefetch - workers produce individual samples in parallel
-    # This allows decode to happen across all workers concurrently
-    if n_workers > 0:
-        ds = ds.mp_prefetch(
-            grain.MultiprocessingOptions(
-                num_workers=n_workers, per_worker_buffer_size=512
-            )
-        )
-
-    # Batch after prefetch so workers produce samples, not batches
-    ds = ds.batch(batch_size=batch_size, drop_remainder=drop_last)
-
-    return ds

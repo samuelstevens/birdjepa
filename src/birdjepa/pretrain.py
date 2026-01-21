@@ -164,19 +164,6 @@ class Config:
     """Shuffle buffer size for Rust loader (samples)."""
 
 
-@beartype.beartype
-def make_dataset(
-    cfg: birdjepa.data.Config,
-) -> birdjepa.data.Dataset | birdjepa.data.ShuffledXenoCantoDataset:
-    """Create dataset from config."""
-    if isinstance(cfg, birdjepa.data.XenoCanto):
-        return birdjepa.data.ShuffledXenoCantoDataset(cfg)
-    elif isinstance(cfg, birdjepa.data.Cifar100):
-        return birdjepa.data.Cifar100Dataset(cfg)
-    else:
-        tp.assert_never(cfg)
-
-
 def softmax_cross_entropy(logits, labels):
     """Cross-entropy loss for classification."""
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -468,17 +455,14 @@ def worker_fn(cfg: Config):
     key = jr.key(cfg.seed)
 
     # Data
-    logger.info("Loading train dataset")
-    train_ds = make_dataset(cfg.train_data)
-    logger.info("Loading test dataset")
-    test_ds = make_dataset(cfg.test_data)
-    n_classes = train_ds.n_classes
-    logger.info(
-        "Datasets loaded: %d train, %d test, %d classes",
-        len(train_ds),
-        len(test_ds),
-        n_classes,
-    )
+    msg = "LeJEPA objective requires Python datasets; not supported with Rust loader"
+    assert not isinstance(cfg.objective, birdjepa.nn.objectives.LeJEPAConfig), msg
+
+    assert isinstance(cfg.train_data, birdjepa.data.XenoCanto)
+    assert cfg.train_data.n_samples is None, "train_data.n_samples must be None"
+
+    assert isinstance(cfg.test_data, birdjepa.data.XenoCanto)
+    assert cfg.test_data.n_samples is not None, "test_data.n_samples is required"
 
     # Model and objective
     logger.info("Creating encoder")
@@ -491,17 +475,9 @@ def worker_fn(cfg: Config):
         logger.info("Created TransformerModel")
     else:
         tp.assert_never(cfg.model)
-    logger.info("Creating objective")
-    obj_key, key = jr.split(key)
-    objective = birdjepa.nn.objectives.make_objective(
-        cfg.objective, cfg.model, train_ds, key=obj_key
-    )
-    logger.info("Created objective: %s", type(objective).__name__)
-    eval_step = make_eval_step(cfg.probe_pooling)
 
     # Create dataloaders using Rust loader
     logger.info("Creating train dataloader")
-    assert isinstance(cfg.train_data, birdjepa.data.XenoCanto)
     train_loader = birdjepa.data.RustXenoCantoLoader(
         cfg.train_data,
         seed=cfg.seed,
@@ -511,8 +487,7 @@ def worker_fn(cfg: Config):
         shuffle_min_size=cfg.window_size // 2,
         infinite=True,
     )
-    # Test loader with infinite=True so we can reuse across evals
-    assert isinstance(cfg.test_data, birdjepa.data.XenoCanto)
+    logger.info("Creating test dataloader")
     test_loader = birdjepa.data.RustXenoCantoLoader(
         cfg.test_data,
         seed=cfg.seed,
@@ -520,10 +495,27 @@ def worker_fn(cfg: Config):
         n_workers=cfg.n_workers,
         shuffle_buffer_size=1000,
         shuffle_min_size=0,
-        infinite=True,  # Keeps cycling - we break manually
+        infinite=False,
     )
-    n_eval_batches = len(test_ds) // cfg.batch_size
-    logger.info("Dataloaders created (eval: %d batches)", n_eval_batches)
+    n_classes = train_loader.n_classes
+    n_train = len(train_loader)
+    n_test = len(test_loader)
+    logger.info(
+        "Dataloaders created: %d train, %d test, %d classes",
+        n_train,
+        n_test,
+        n_classes,
+    )
+    n_eval_batches = n_test // cfg.batch_size
+    logger.info("Eval: %d batches", n_eval_batches)
+
+    logger.info("Creating objective")
+    obj_key, key = jr.split(key)
+    objective = birdjepa.nn.objectives.make_objective(
+        cfg.objective, cfg.model, train_loader, key=obj_key
+    )
+    logger.info("Created objective: %s", type(objective).__name__)
+    eval_step = make_eval_step(cfg.probe_pooling)
 
     # Online linear probe
     logger.info("Creating linear probe")
