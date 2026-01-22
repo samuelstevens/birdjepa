@@ -26,11 +26,21 @@ fn decode_audio<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<'py, PyArr
     Ok(PyArray1::from_vec(py, waveform))
 }
 
+#[pyfunction]
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
 /// Python module entry point.
 #[pymodule]
 fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<loader::Loader>()?;
     m.add_class::<spectrogram::SpectrogramTransform>()?;
     m.add_function(wrap_pyfunction!(decode_audio, m)?)?;
+    m.add_function(wrap_pyfunction!(build_profile, m)?)?;
     Ok(())
 }
