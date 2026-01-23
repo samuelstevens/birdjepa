@@ -10,9 +10,33 @@ import logging
 import pathlib
 
 import beartype
+import equinox as eqx
+import jax
 import orbax.checkpoint as ocp
 
+import birdjepa.helpers
+
 logger = logging.getLogger(__name__)
+
+
+def _to_numpy(pytree):
+    """Convert JAX arrays to numpy arrays for checkpoint save.
+
+    This avoids Orbax's sharding-related bugs where replicated arrays get
+    scaled by sqrt(n_devices) during restore. By saving numpy arrays,
+    we bypass the problematic sharding handling entirely.
+
+    Must be called AFTER arrays are materialized (e.g., after training step).
+    """
+
+    def convert(x):
+        if hasattr(x, "block_until_ready"):
+            x.block_until_ready()  # Ensure computation is complete
+        if hasattr(x, "device"):
+            return jax.device_get(x)  # Convert to numpy
+        return x
+
+    return jax.tree.map(convert, pytree)
 
 
 class CheckpointManager:
@@ -40,6 +64,7 @@ class CheckpointManager:
                 save_interval_steps=save_interval_steps,
                 max_to_keep=max_to_keep,
                 enable_async_checkpointing=async_checkpointing,
+                single_host_load_and_broadcast=True,
             ),
             item_names=("state", "encoder", "metadata"),
         )
@@ -54,6 +79,7 @@ class CheckpointManager:
         probe,
         opt_state,
         encoder_config,
+        param_norm: float | None = None,
         force: bool = False,
     ):
         """Save a training checkpoint.
@@ -65,6 +91,7 @@ class CheckpointManager:
             probe: Linear probe model.
             opt_state: Optimizer state.
             encoder_config: Transformer config dataclass for the encoder.
+            param_norm: Optional param_norm for the saved state (post-update).
             force: If True, save even if step doesn't match save_interval.
         """
         # Skip if checkpoint already exists at this step (force only bypasses
@@ -73,22 +100,52 @@ class CheckpointManager:
             logger.debug("Checkpoint for step %d already exists, skipping", step)
             return
 
+        # Compute encoder-only norm BEFORE conversion (on original JAX arrays)
+        encoder_params = eqx.filter(encoder, eqx.is_inexact_array)
+        encoder_norm = float(birdjepa.helpers.tree_l2_norm(encoder_params))
+
+        # Convert to numpy to avoid Orbax sharding bugs during restore
+        encoder_np = _to_numpy(encoder)
+
+        # Verify conversion preserved values
+        encoder_np_params = eqx.filter(encoder_np, eqx.is_inexact_array)
+        encoder_norm_after = float(birdjepa.helpers.tree_l2_norm(encoder_np_params))
+        if abs(encoder_norm - encoder_norm_after) > 0.01:
+            logger.error(
+                "CKPT_BUG: encoder_norm changed during numpy conversion! before=%.6f after=%.6f",
+                encoder_norm,
+                encoder_norm_after,
+            )
+        logger.info("CKPT_SAVE step=%d encoder_norm=%.6f", step, encoder_norm)
+
+        metadata = {
+            "step": step,
+            "encoder_config": dataclasses.asdict(encoder_config),
+            "encoder_norm": encoder_norm,  # For verification on restore
+            "param_norm": float(param_norm),
+        }
+
         self._mngr.save(
             step,
             args=ocp.args.Composite(
                 state=ocp.args.StandardSave({
-                    "objective": objective,
-                    "probe": probe,
-                    "opt_state": opt_state,
+                    "objective": _to_numpy(objective),
+                    "probe": _to_numpy(probe),
+                    "opt_state": _to_numpy(opt_state),
                 }),
-                encoder=ocp.args.StandardSave(encoder),
-                metadata=ocp.args.JsonSave({
-                    "step": step,
-                    "encoder_config": dataclasses.asdict(encoder_config),
-                }),
+                encoder=ocp.args.StandardSave(encoder_np),
+                metadata=ocp.args.JsonSave(metadata),
             ),
             force=force,
         )
+
+    @beartype.beartype
+    def should_save(self, step: int, *, force: bool = False) -> bool:
+        if step in self._mngr.all_steps():
+            return False
+        if force:
+            return True
+        return bool(self._mngr.should_save(step))
 
     @beartype.beartype
     def load_training(self, encoder, objective, probe, opt_state, *, encoder_config):
@@ -131,9 +188,37 @@ class CheckpointManager:
             f"Encoder config mismatch: checkpoint has {saved_config}, current is {current_config}"
         )
 
-        logger.info("Loaded checkpoint step=%d", restored["metadata"]["step"])
+        # Verify encoder norm matches what was saved
+        restored_encoder = restored["encoder"]
+        restored_params = eqx.filter(restored_encoder, eqx.is_inexact_array)
+        restored_norm = float(birdjepa.helpers.tree_l2_norm(restored_params))
+        saved_norm = restored["metadata"].get("encoder_norm")
+
+        if saved_norm is not None:
+            ratio = saved_norm / restored_norm if restored_norm > 0 else float("inf")
+            delta = abs(saved_norm - restored_norm)
+            logger.info(
+                "CKPT_RESTORE step=%d saved_encoder_norm=%.6f restored_encoder_norm=%.6f ratio=%.6f delta=%.6f",
+                restored["metadata"]["step"],
+                saved_norm,
+                restored_norm,
+                ratio,
+                delta,
+            )
+            if delta > 1.0:
+                logger.warning(
+                    "CKPT_MISMATCH: encoder_norm changed by %.2f (ratio=%.4f) during checkpoint restore!",
+                    delta,
+                    ratio,
+                )
+        else:
+            logger.info(
+                "Loaded checkpoint step=%d (no encoder_norm in metadata)",
+                restored["metadata"]["step"],
+            )
+
         return (
-            restored["encoder"],
+            restored_encoder,
             restored["state"]["objective"],
             restored["state"]["probe"],
             restored["state"]["opt_state"],

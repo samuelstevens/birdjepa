@@ -2,15 +2,14 @@ import dataclasses
 import logging
 import os
 import pathlib
-import sys
 import time
 import typing as tp
 
 import beartype
 import equinox as eqx
 import jax
-import jax.random as jr
 import jax.numpy as jnp
+import jax.random as jr
 import numpy as np
 import optax
 import wandb
@@ -22,25 +21,9 @@ import birdjepa.helpers
 import birdjepa.nn.objectives
 import birdjepa.nn.transformer
 
-if tp.TYPE_CHECKING:
-    pass
 
 log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 logger = logging.getLogger("birdjepa.pretrain")
-
-
-def _is_numeric_array(x: object) -> bool:
-    """Check if x is a numeric array that can be converted to JAX."""
-    if not isinstance(x, (jax.Array, np.ndarray)):
-        return False
-    dt = getattr(x, "dtype", None)
-    if dt is None:
-        return False
-    return (
-        np.issubdtype(dt, np.bool_)
-        or np.issubdtype(dt, np.integer)
-        or np.issubdtype(dt, np.floating)
-    )
 
 
 def compute_tgt_entropy(targets: np.ndarray) -> float:
@@ -58,7 +41,16 @@ def _batch_to_device(batch: dict, sharding) -> dict[str, jax.Array]:
     """Copy batch arrays and place on sharded device."""
     result: dict[str, jax.Array] = {}
     for key, value in batch.items():
-        if not _is_numeric_array(value):
+        if not eqx.is_array(value):
+            continue
+        dt = getattr(value, "dtype", None)
+        if dt is None:
+            continue
+        if not (
+            np.issubdtype(dt, np.bool_)
+            or np.issubdtype(dt, np.integer)
+            or np.issubdtype(dt, np.floating)
+        ):
             continue
         if isinstance(value, np.ndarray):
             value = np.array(value, copy=True)
@@ -292,16 +284,10 @@ def make_train_step(
         grad_params = {k: eqx.filter(v, eqx.is_inexact_array) for k, v in grads.items()}
 
         # Compute gradient norm before clipping
-        grad_leaves = jax.tree.leaves(grad_params)
-        grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in grad_leaves))
-
-        # Compute per-component gradient norms for debugging
-        enc_grads = jax.tree.leaves(grad_params["encoder"])
-        obj_grads = jax.tree.leaves(grad_params["objective"])
-        probe_grads = jax.tree.leaves(grad_params["probe"])
-        enc_grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in enc_grads))
-        obj_grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in obj_grads))
-        probe_grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in probe_grads))
+        grad_norm = birdjepa.helpers.tree_l2_norm(grad_params)
+        enc_grad_norm = birdjepa.helpers.tree_l2_norm(grad_params["encoder"])
+        obj_grad_norm = birdjepa.helpers.tree_l2_norm(grad_params["objective"])
+        probe_grad_norm = birdjepa.helpers.tree_l2_norm(grad_params["probe"])
 
         updates, new_opt_state = optim.update(grad_params, opt_state, params)
 
@@ -310,13 +296,15 @@ def make_train_step(
         for k in models:
             new_models[k] = eqx.apply_updates(models[k], updates[k])
 
-        # Compute update norms to verify updates are being applied
-        update_leaves = jax.tree.leaves(updates)
-        update_norm = jnp.sqrt(sum(jnp.sum(u**2) for u in update_leaves))
+        # Compute update norm to verify updates are being applied
+        update_norm = birdjepa.helpers.tree_l2_norm(updates)
 
-        # Compute parameter norms
-        param_leaves = jax.tree.leaves(params)
-        param_norm = jnp.sqrt(sum(jnp.sum(p**2) for p in param_leaves))
+        # Compute parameter norms (pre and post update)
+        param_norm_pre = birdjepa.helpers.tree_l2_norm(params)
+        post_params = {
+            k: eqx.filter(v, eqx.is_inexact_array) for k, v in new_models.items()
+        }
+        param_norm = birdjepa.helpers.tree_l2_norm(post_params)
 
         metrics = {
             "loss": loss,
@@ -327,6 +315,7 @@ def make_train_step(
             "probe_grad": probe_grad_norm,
             "update_norm": update_norm,
             "param_norm": param_norm,
+            "param_norm_pre": param_norm_pre,
             **aux["losses"],
         }
         return new_models, new_opt_state, metrics
@@ -601,10 +590,13 @@ def worker_fn(cfg: Config):
     logger.info("Starting training from step %d (total %d)", start_step, cfg.n_steps)
     step = start_step
     models = {"encoder": encoder, "objective": objective, "probe": probe}
+    last_param_norm = None
 
-    # Initial sharding of models and optimizer state
-    models = eqx.filter_shard(models, model_sharding)
-    opt_state = eqx.filter_shard(opt_state, model_sharding)
+    # Place models and optimizer state on sharded devices
+    models, opt_state = jax.tree.map(
+        lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
+        (models, opt_state),
+    )
 
     # TODO: total is wrong when resuming (should be cfg.n_steps - step)
     last_step_time = time.time()
@@ -625,6 +617,30 @@ def worker_fn(cfg: Config):
 
         step += 1
 
+        ckpt_param_norm = None
+        if ckpt_mngr.should_save(step):
+            # Recompute param_norm outside JIT and compare to JIT-computed value
+            params_for_norm = {
+                k: eqx.filter(v, eqx.is_inexact_array) for k, v in models.items()
+            }
+            recomputed_norm = float(birdjepa.helpers.tree_l2_norm(params_for_norm))
+            leaves = jax.tree.leaves(params_for_norm)
+            jit_norm = float(jnp.mean(metrics["param_norm"]))
+            ckpt_param_norm = recomputed_norm
+
+            # Log fingerprint and norm comparison for debugging
+            leaf_count = len(leaves)
+            element_count = sum(p.size for p in leaves)
+            logger.info(
+                "step=%d CKPT_DEBUG recomputed_norm=%.6f jit_norm=%.6f delta=%.6f leaf_count=%d element_count=%d",
+                step,
+                recomputed_norm,
+                jit_norm,
+                recomputed_norm - jit_norm,
+                leaf_count,
+                element_count,
+            )
+
         # Checkpoint model state (orbax decides whether to actually save based on interval)
         ckpt_mngr.save(
             step=step,
@@ -633,6 +649,7 @@ def worker_fn(cfg: Config):
             probe=models["probe"],
             opt_state=opt_state,
             encoder_config=cfg.model,
+            param_norm=ckpt_param_norm,
         )
 
         # Log peak memory usage after first step (includes JIT compilation overhead)
@@ -650,6 +667,8 @@ def worker_fn(cfg: Config):
 
             # Compute target entropy (measures shuffle quality)
             tgt_entropy = compute_tgt_entropy(targets_np)
+            max_entropy = np.log2(cfg.batch_size)
+            tgt_entropy_frac = tgt_entropy / max_entropy  # fraction of max possible
 
             # Average metrics across devices for logging
             metrics = jax.tree.map(lambda x: float(jnp.mean(x)), metrics)
@@ -659,10 +678,11 @@ def worker_fn(cfg: Config):
                 f"{k}={float(v):.4g}" for k, v in sorted(metrics.items())
             )
             logger.info(
-                "step=%d lr=%.2e tgt_entropy=%.2f sec/step=%.1f %s",
+                "step=%d lr=%.2e tgt_entropy=%.2f (%.0f%%) sec/step=%.1f %s",
                 step,
                 lr,
                 tgt_entropy,
+                tgt_entropy_frac * 100,
                 sec_per_step,
                 metric_str,
             )
@@ -671,6 +691,7 @@ def worker_fn(cfg: Config):
                 "lr": lr,
                 "train/probe": float(metrics["probe_loss"]),
                 "train/tgt_entropy": tgt_entropy,
+                "train/tgt_entropy_frac": tgt_entropy_frac,
                 "train/sec_per_step": sec_per_step,
             }
             for k, v in metrics.items():
@@ -682,6 +703,8 @@ def worker_fn(cfg: Config):
                 log_dict[f"dataloader/{k}"] = v
 
             wandb.log(log_dict)
+
+        last_param_norm = metrics["param_norm"]
 
         # Evaluate periodically
         if step % cfg.eval_every == 0:
@@ -705,6 +728,15 @@ def worker_fn(cfg: Config):
             wandb.log({"step": step, "test/acc": acc, "test/loss": test_loss})
 
     # Save final checkpoint and wait for async saves to complete
+    final_param_norm = None
+    if last_param_norm is not None:
+        final_param_norm = float(jnp.mean(last_param_norm))
+    else:
+        final_params = {
+            k: eqx.filter(v, eqx.is_inexact_array) for k, v in models.items()
+        }
+        final_param_norm = float(birdjepa.helpers.tree_l2_norm(final_params))
+
     ckpt_mngr.save(
         step=step,
         encoder=models["encoder"],
@@ -712,6 +744,7 @@ def worker_fn(cfg: Config):
         probe=models["probe"],
         opt_state=opt_state,
         encoder_config=cfg.model,
+        param_norm=final_param_norm,
         force=True,
     )
     ckpt_mngr.wait_until_finished()
@@ -737,7 +770,7 @@ class TrainingJob:
 @beartype.beartype
 def cli(cfg: Config):
     """CLI entrypoint: run locally or submit to Slurm."""
-    logging.basicConfig(level=logging.INFO, format=log_format)
+    logging.basicConfig(level=logging.INFO, format=log_format, force=True)
 
     # Load sweep configs if specified
     if cfg.sweep:
@@ -780,10 +813,18 @@ def cli(cfg: Config):
         assert c.n_workers == base.n_workers, "n_workers must match all cfgs"
         assert c.log_to == base.log_to, "log_to must match all cfgs"
 
+    import birdjepa._rs
     import submitit
     import submitit.core.utils
 
-    executor = submitit.SlurmExecutor(folder=base.log_to, max_num_timeout=3)
+    build_profile = getattr(birdjepa._rs, "build_profile", None)
+    msg = "birdjepa._rs.build_profile is missing; rebuild the Rust extension with `uv run python -m maturin develop --release`"
+    assert build_profile is not None, msg
+    profile = build_profile()
+    msg = f"Rust extension must be built in release mode; got {profile!r}. Rebuild with `uv run python -m maturin develop --release`"
+    assert profile == "release", msg
+
+    executor = submitit.SlurmExecutor(folder=base.log_to, max_num_timeout=10)
     # OSC allocates ~10GB RAM per CPU, so request enough CPUs for desired memory
     n_cpus = (
         max(base.mem_gb // 10, base.n_workers) if base.mem_gb > 0 else base.n_workers
@@ -808,12 +849,6 @@ def cli(cfg: Config):
         job_name=f"pretrain[{tag}]",
         setup=setup,
     )
-
-    if os.environ.get("BIRDJEPA_PICKLE_BY_VALUE") == "1":
-        import cloudpickle
-
-        cloudpickle.register_pickle_by_value(sys.modules[__name__])
-        logger.info("Enabled cloudpickle by-value for %s", __name__)
 
     with executor.batch():
         jobs = [executor.submit(TrainingJob(c)) for c in cfgs]
