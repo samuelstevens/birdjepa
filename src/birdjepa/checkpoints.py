@@ -122,8 +122,9 @@ class CheckpointManager:
             "step": step,
             "encoder_config": dataclasses.asdict(encoder_config),
             "encoder_norm": encoder_norm,  # For verification on restore
-            "param_norm": float(param_norm),
         }
+        if param_norm is not None:
+            metadata["param_norm"] = float(param_norm)
 
         self._mngr.save(
             step,
