@@ -8,11 +8,11 @@ import beartype
 import jax
 import jax.numpy as jnp
 import jax.sharding as jshard
-from jaxtyping import Array, Float, PyTree, jaxtyped
+from jaxtyping import Array, Float, jaxtyped
 
 
 @jaxtyped(typechecker=beartype.beartype)
-def tree_l2_norm(tree: PyTree[Array]) -> Float[Array, ""]:
+def tree_l2_norm(tree) -> Float[Array, ""]:
     """Compute L2 norm of all leaves in a pytree."""
     leaves = jax.tree.leaves(tree)
     sum_sq = jax.tree_util.tree_reduce(jax.lax.add, [jnp.sum(p**2) for p in leaves])
