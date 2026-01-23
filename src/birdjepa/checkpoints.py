@@ -94,10 +94,7 @@ class CheckpointManager:
             param_norm: Optional param_norm for the saved state (post-update).
             force: If True, save even if step doesn't match save_interval.
         """
-        # Skip if checkpoint already exists at this step (force only bypasses
-        # save_interval check, not the "already exists" check)
-        if step in self._mngr.all_steps():
-            logger.debug("Checkpoint for step %d already exists, skipping", step)
+        if not self.should_save(step, force=force):
             return
 
         # Compute encoder-only norm BEFORE conversion (on original JAX arrays)
