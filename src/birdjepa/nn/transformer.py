@@ -1,6 +1,7 @@
 """Simple bidirectional transformer encoder (JAX/Equinox)."""
 
 import dataclasses
+import typing
 
 import beartype
 import equinox as eqx
@@ -8,6 +9,18 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jaxtyping import Array, Float, Int, PRNGKeyArray, jaxtyped
+
+internal_rope_embedding_cache: dict[
+    tuple[int, int, int, float, typing.Any], tuple[Array, Array, Array, Array]
+] = {}
+
+
+class EncoderOutput(typing.NamedTuple):
+    """Encoder outputs."""
+
+    cls: Float[Array, "... n_cls d"]
+    patches: Float[Array, "... n_patches d"]
+    reg: Float[Array, "... n_reg d"]
 
 
 # -------
@@ -124,20 +137,21 @@ class DebugModel(eqx.Module):
         x_btk: Float[Array, "b t k"],
         *,
         grid: Int[Array, "b t 2"],
-        key: PRNGKeyArray,
-    ) -> dict[str, Array]:
+        key: PRNGKeyArray | None,
+    ) -> EncoderOutput:
         """Forward pass matching Transformer interface."""
+        del grid, key
         # Project patches: (B, T, K) -> (B, T, D)
         x = jax.vmap(jax.vmap(self.proj))(x_btk)
 
         # CLS = mean of patches, no actual CLS token
         cls = x.mean(axis=1, keepdims=True)  # (B, 1, D)
 
-        return {
-            "cls": cls,
-            "patches": x,
-            "reg": jnp.zeros((x.shape[0], 0, self.cfg.embed_dim)),
-        }
+        return EncoderOutput(
+            cls=cls,
+            patches=x,
+            reg=jnp.zeros((x.shape[0], 0, self.cfg.embed_dim)),
+        )
 
 
 # Union type for encoder configs
@@ -231,7 +245,17 @@ class PatchEmbed(eqx.Module):
     @jaxtyped(typechecker=beartype.beartype)
     def __call__(self, x_btk: Float[Array, "b t k"]) -> Float[Array, "b t d"]:
         """Project flattened patches to embeddings."""
-        return jax.vmap(jax.vmap(self.proj))(x_btk)
+        weight = self.proj.weight
+        bias = self.proj.bias
+        out = jax.lax.dot_general(
+            x_btk,
+            weight,
+            dimension_numbers=(((2,), (1,)), ((), ())),
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        if bias is not None:
+            out = out + bias
+        return out
 
 
 class RopePositionEmbedding(eqx.Module):
@@ -241,17 +265,42 @@ class RopePositionEmbedding(eqx.Module):
     """
 
     d_head: int = eqx.field(static=True)
-    periods: Float[Array, " d_quarter"]
+    theta: float = eqx.field(static=True)
+    dtype: typing.Any = eqx.field(static=True)
+    n_patches_h: int = eqx.field(static=True)
+    n_patches_w: int = eqx.field(static=True)
 
-    def __init__(self, embed_dim: int, n_heads: int, base: float):
+    def __init__(
+        self,
+        embed_dim: int,
+        n_heads: int,
+        base: float,
+        n_patches_h: int,
+        n_patches_w: int,
+        *,
+        dtype: typing.Any | None = None,
+    ):
         self.d_head = embed_dim // n_heads
         assert self.d_head % 4 == 0, (
             f"head_dim must be divisible by 4, got {self.d_head}"
         )
-        # Periods for each frequency: base^(2i / (d_head/2)) for i in [0, d_head/4)
-        # d_head/4 because we have 2 axes (H, W) and each gets d_head/2 dims
-        d_quarter = self.d_head // 4
-        self.periods = base ** (2 * jnp.arange(d_quarter) / (self.d_head // 2))
+        assert n_patches_h > 0, "n_patches_h must be positive"
+        assert n_patches_w > 0, "n_patches_w must be positive"
+        self.theta = float(base)
+        self.dtype = jnp.float32 if dtype is None else dtype
+        self.n_patches_h = n_patches_h
+        self.n_patches_w = n_patches_w
+
+    @staticmethod
+    def precompute_freqs_cis(
+        axis_dim: int, end: int, theta: float, dtype: typing.Any
+    ) -> tuple[Float[Array, "end half_axis_dim"], Float[Array, "end half_axis_dim"]]:
+        freqs = 1.0 / (
+            theta ** (jnp.arange(0.0, axis_dim, 2)[jnp.newaxis, :] / axis_dim)
+        )
+        t = jnp.arange(float(end))
+        freqs_outer = jnp.outer(t, freqs)
+        return jnp.cos(freqs_outer).astype(dtype), jnp.sin(freqs_outer).astype(dtype)
 
     @jaxtyped(typechecker=beartype.beartype)
     def __call__(
@@ -265,27 +314,42 @@ class RopePositionEmbedding(eqx.Module):
         Returns:
             (sin, cos) each of shape (B, T, d_head).
         """
-        b, t, _ = grid.shape
-        # Normalize coords to [-1, +1] range (separate normalization for H and W)
-        # We don't know the actual grid size, so use max coord in batch
-        h_coords = grid[..., 0].astype(jnp.float32)
-        w_coords = grid[..., 1].astype(jnp.float32)
-        h_max = jnp.maximum(h_coords.max(), 1.0)
-        w_max = jnp.maximum(w_coords.max(), 1.0)
-        h_norm = (h_coords + 0.5) / (h_max + 1) * 2 - 1  # [-1, +1]
-        w_norm = (w_coords + 0.5) / (w_max + 1) * 2 - 1  # [-1, +1]
+        axis_dim = self.d_head // 2
 
-        # Compute angles: 2π × coord / period
-        # Shape: (B, T, d_quarter)
-        angles_h = 2 * jnp.pi * h_norm[..., None] / self.periods[None, None, :]
-        angles_w = 2 * jnp.pi * w_norm[..., None] / self.periods[None, None, :]
+        with jax.ensure_compile_time_eval():
+            cache_key = (
+                axis_dim,
+                self.n_patches_h,
+                self.n_patches_w,
+                self.theta,
+                self.dtype,
+            )
+            if cache_key not in internal_rope_embedding_cache:
+                cos_h, sin_h = self.precompute_freqs_cis(
+                    axis_dim, self.n_patches_h, self.theta, self.dtype
+                )
+                cos_w, sin_w = self.precompute_freqs_cis(
+                    axis_dim, self.n_patches_w, self.theta, self.dtype
+                )
+                internal_rope_embedding_cache[cache_key] = (cos_h, sin_h, cos_w, sin_w)
 
-        # Interleave H and W angles, then tile to fill d_head
-        # [H angles | W angles] for first half, repeat for second half
-        angles = jnp.concatenate([angles_h, angles_w], axis=-1)  # (B, T, d_head/2)
-        angles = jnp.tile(angles, 2)  # (B, T, d_head)
+            cos_h_all, sin_h_all, cos_w_all, sin_w_all = internal_rope_embedding_cache[
+                cache_key
+            ]
 
-        return jnp.sin(angles), jnp.cos(angles)
+        h_idx = grid[..., 0]
+        w_idx = grid[..., 1]
+        cos_h = cos_h_all[h_idx]
+        sin_h = sin_h_all[h_idx]
+        cos_w = cos_w_all[w_idx]
+        sin_w = sin_w_all[w_idx]
+
+        sin_hw = jnp.concatenate([sin_h, sin_w], axis=-1)
+        cos_hw = jnp.concatenate([cos_h, cos_w], axis=-1)
+        sin = jnp.tile(sin_hw, 2)
+        cos = jnp.tile(cos_hw, 2)
+
+        return sin, cos
 
 
 @jaxtyped(typechecker=beartype.beartype)
@@ -521,7 +585,7 @@ class TransformerModel(eqx.Module):
 
     Takes pre-patchified input (B, T, kernel) + grid coordinates. This allows encoder to process any subset of patches (for MAE efficiency).
 
-    Returns a dict with "cls", "patches", and "reg" keys for flexible pooling.
+    Returns EncoderOutput for flexible pooling.
     """
 
     cfg: Transformer = eqx.field(static=True)
@@ -558,7 +622,11 @@ class TransformerModel(eqx.Module):
         # Positional embeddings
         if cfg.use_rope:
             self.rope_embed = RopePositionEmbedding(
-                cfg.embed_dim, cfg.n_heads, cfg.rope_base
+                cfg.embed_dim,
+                cfg.n_heads,
+                cfg.rope_base,
+                cfg.n_patches_h,
+                cfg.n_patches_w,
             )
             self.pos_embed_hw = None
         else:
@@ -587,8 +655,8 @@ class TransformerModel(eqx.Module):
         x_btk: Float[Array, "b t k"],
         *,
         grid: Int[Array, "b t 2"],
-        key: PRNGKeyArray,
-    ) -> dict[str, Array]:
+        key: PRNGKeyArray | None,
+    ) -> EncoderOutput:
         """Forward pass with pre-patchified input.
 
         Args:
@@ -597,10 +665,10 @@ class TransformerModel(eqx.Module):
             key: PRNG key for dropout (optional, None = no dropout).
 
         Returns:
-            Dict with keys:
-                "cls": (B, n_cls_tokens, D) - CLS token embeddings
-                "patches": (B, T, D) - patch embeddings
-                "reg": (B, n_reg_tokens, D) - register tokens (empty if n_reg_tokens=0)
+            EncoderOutput with fields:
+                cls: (B, n_cls_tokens, D) - CLS token embeddings
+                patches: (B, T, D) - patch embeddings
+                reg: (B, n_reg_tokens, D) - register tokens (empty if n_reg_tokens=0)
         """
         b, t, _ = x_btk.shape
         n_cls = self.cfg.n_cls_tokens
@@ -627,28 +695,46 @@ class TransformerModel(eqx.Module):
             x = jnp.concatenate([x, reg], axis=1)  # (B, n_cls+T+n_reg, D)
 
         # Transformer blocks
-        block_keys = jr.split(key, self.cfg.depth)
-
         if self.cfg.use_scan:
             # Scan implementation (faster compilation, better memory)
             assert not isinstance(self.blocks, tuple)
             block_arrays, block_static = eqx.partition(self.blocks, eqx.is_array)
 
-            def scan_fn(
-                x: Float[Array, "b n d"], inputs: tuple
-            ) -> tuple[Float[Array, "b n d"], None]:
-                arrays_i, key_i = inputs
-                block = eqx.combine(arrays_i, block_static)
-                if self.cfg.grad_ckpt:
-                    return jax.checkpoint(
-                        lambda x: block(x, key=key_i, rope=rope, n_prefix=n_cls)
-                    )(x), None
-                return block(x, key=key_i, rope=rope, n_prefix=n_cls), None
+            if key is None:
 
-            x, _ = jax.lax.scan(scan_fn, x, (block_arrays, block_keys))
+                def scan_fn_no_key(
+                    x: Float[Array, "b n d"], arrays_i
+                ) -> tuple[Float[Array, "b n d"], None]:
+                    block = eqx.combine(arrays_i, block_static)
+                    if self.cfg.grad_ckpt:
+                        return jax.checkpoint(
+                            lambda x: block(x, key=None, rope=rope, n_prefix=n_cls)
+                        )(x), None
+                    return block(x, key=None, rope=rope, n_prefix=n_cls), None
+
+                x, _ = jax.lax.scan(scan_fn_no_key, x, block_arrays)
+            else:
+                block_keys = jr.split(key, self.cfg.depth)
+
+                def scan_fn(
+                    x: Float[Array, "b n d"], inputs: tuple
+                ) -> tuple[Float[Array, "b n d"], None]:
+                    arrays_i, key_i = inputs
+                    block = eqx.combine(arrays_i, block_static)
+                    if self.cfg.grad_ckpt:
+                        return jax.checkpoint(
+                            lambda x: block(x, key=key_i, rope=rope, n_prefix=n_cls)
+                        )(x), None
+                    return block(x, key=key_i, rope=rope, n_prefix=n_cls), None
+
+                x, _ = jax.lax.scan(scan_fn, x, (block_arrays, block_keys))
         else:
             # Explicit loop (for debugging gradient flow)
             assert isinstance(self.blocks, tuple)
+            if key is None:
+                block_keys = [None] * len(self.blocks)
+            else:
+                block_keys = jr.split(key, self.cfg.depth)
             for block, blk_key in zip(self.blocks, block_keys):
                 if self.cfg.grad_ckpt:
                     x = jax.checkpoint(
@@ -670,4 +756,4 @@ class TransformerModel(eqx.Module):
         else:
             reg_out = jnp.zeros((b, 0, self.cfg.embed_dim))
 
-        return {"cls": cls_out, "patches": patches_out, "reg": reg_out}
+        return EncoderOutput(cls=cls_out, patches=patches_out, reg=reg_out)

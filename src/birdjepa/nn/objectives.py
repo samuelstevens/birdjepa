@@ -2,6 +2,7 @@
 
 import abc
 import dataclasses
+import typing as tp
 
 import beartype
 import chex
@@ -10,7 +11,7 @@ import jax
 import jax.numpy as jnp
 
 # (sam) TODO: I want to use chex instead of PRNGKeyArray
-from jaxtyping import Array, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Float, Int, PRNGKeyArray, jaxtyped
 
 import birdjepa.data
 import birdjepa.nn.transformer
@@ -63,6 +64,9 @@ class PixioConfig:
 Config = SupervisedConfig | LeJEPAConfig | PixioConfig
 
 
+Targets = Int[Array, " b"] | Int[Array, " v b"]
+
+
 class Objective(abc.ABC):
     """Abstract base class for training objectives."""
 
@@ -72,22 +76,25 @@ class Objective(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
+    @jaxtyped(typechecker=beartype.beartype)
     def __call__(
         self,
         batch: dict,
         encoder: eqx.Module,
         *,
         key: PRNGKeyArray,
-    ) -> tuple[dict[str, Array], Float[Array, "b d"], Int[Array, " b"]]:
-        """Compute objective losses.
+        mode: tp.Literal["train", "eval"],
+    ) -> tuple[dict[str, Array], birdjepa.nn.transformer.EncoderOutput, Targets]:
+        """Compute objective losses and embeddings.
 
         Args:
             batch: Dict with at least "data" and "target" keys.
             encoder: Transformer encoder.
-            key: PRNG key for forward pass.
+            key: PRNG key for stochastic operations.
+            mode: "train" or "eval" mode.
 
         Returns:
-            (losses, embeddings, targets) where losses is a dict of named losses.
+            (losses, out, targets) where out is EncoderOutput.
         """
         ...
 
@@ -128,39 +135,40 @@ class Supervised(eqx.Module, Objective):
         """Supervised doesn't need to wrap the dataset."""
         return base_ds
 
+    @jaxtyped(typechecker=beartype.beartype)
     def __call__(
         self,
         batch: dict,
         encoder: eqx.Module,
         *,
         key: PRNGKeyArray,
-    ) -> tuple[dict[str, Array], Float[Array, "b d"], Int[Array, " b"]]:
+        mode: tp.Literal["train", "eval"],
+    ) -> tuple[dict[str, Array], birdjepa.nn.transformer.EncoderOutput, Targets]:
         """Compute supervised loss.
 
         Args:
             batch: Dict with "data" (B, H, W) and "target" (B,).
             encoder: Transformer encoder.
             key: PRNG key for encoder forward pass.
+            mode: "train" or "eval" mode.
 
         Returns:
-            (losses, embeddings, targets) where losses has "ce" key.
+            (losses, out, targets) where losses has "ce" key.
         """
+        if mode != "train" and mode != "eval":
+            tp.assert_never(mode)
         data_bhw = batch["data"]
         target_b = batch["target"]
 
         # Patchify and encode
         x_bnk, grid_bn2 = birdjepa.nn.transformer.patchify(data_bhw, self.encoder_cfg)
-        out = encoder(x_bnk, grid=grid_bn2, key=key)
-
-        # Use mean of CLS tokens for classification
-        emb_bd = out["cls"].mean(axis=1)  # (B, D)
-
-        # Classification loss
+        enc_key = None if mode == "eval" else key
+        out = encoder(x_bnk, grid=grid_bn2, key=enc_key)
+        emb_bd = out.cls.mean(axis=1)  # (B, D)
         logits = jax.vmap(self.head)(emb_bd)
         ce_loss = softmax_cross_entropy(logits, target_b)
-
         losses = {"ce": ce_loss}
-        return losses, emb_bd, target_b
+        return losses, out, target_b
 
 
 # -----------------------------------------------------------------------------
@@ -274,24 +282,24 @@ class LeJEPA(eqx.Module, Objective):
         """Wrap dataset with multi-view augmentation."""
         return MultiViewDataset(base_ds, n_views=self.cfg.n_views)
 
+    @jaxtyped(typechecker=beartype.beartype)
     def __call__(
         self,
         batch: dict,
         encoder: eqx.Module,
         *,
         key: PRNGKeyArray,
-    ) -> tuple[dict[str, Array], Float[Array, "n d"], Int[Array, " n"]]:
-        """Compute LeJEPA loss.
+        mode: tp.Literal["train", "eval"],
+    ) -> tuple[dict[str, Array], birdjepa.nn.transformer.EncoderOutput, Targets]:
+        """Compute LeJEPA loss."""
+        if mode != "train" and mode != "eval":
+            tp.assert_never(mode)
 
-        Args:
-            batch: Dict with "views" (B, V, H, W) and "target" (B,).
-            encoder: Transformer encoder.
-            key: PRNG key for SIGReg and encoder.
-
-        Returns:
-            (losses, embeddings, targets) where losses has "inv" and "sigreg" keys.
-        """
-        enc_key, sigreg_key = jax.random.split(key)
+        if mode == "train":
+            enc_key, sigreg_key = jax.random.split(key)
+        else:
+            enc_key = None
+            sigreg_key = key
 
         views_bvhw = batch["views"]
         target_b = batch["target"]
@@ -302,31 +310,34 @@ class LeJEPA(eqx.Module, Objective):
 
         # Patchify and encode
         x_bnk, grid_bn2 = birdjepa.nn.transformer.patchify(views_flat, self.encoder_cfg)
-        out = encoder(x_bnk, grid=grid_bn2, key=enc_key)
+        out_flat = encoder(x_bnk, grid=grid_bn2, key=enc_key)
+        out = birdjepa.nn.transformer.EncoderOutput(
+            cls=out_flat.cls.reshape(v, b, *out_flat.cls.shape[1:]),
+            patches=out_flat.patches.reshape(v, b, *out_flat.patches.shape[1:]),
+            reg=out_flat.reg.reshape(v, b, *out_flat.reg.shape[1:]),
+        )
 
-        # Use mean of CLS tokens: (n, n_cls, D) -> (n, D) where n = b*v
-        emb_nd = out["cls"].mean(axis=1)
+        v, b = out.cls.shape[:2]
+
+        # Use mean of CLS tokens: (v, b, n_cls, D) -> (v, b, D)
+        emb_vbd = out.cls.mean(axis=2)
+        emb_nd = emb_vbd.reshape(v * b, -1)
 
         # Project through projection head
         proj_np = jax.vmap(self._project)(emb_nd)  # (n, proj_dim)
-        proj_vbp = proj_np.reshape(b, v, -1).transpose(1, 0, 2)  # (v, b, proj_dim)
+        proj_vbp = proj_np.reshape(v, b, -1)
 
-        # LeJEPA losses
-        # Invariance loss: embeddings from different views should match
         mean_proj = proj_vbp.mean(axis=0)  # (b, p)
         inv_loss = ((mean_proj - proj_vbp) ** 2).mean()
 
-        # SIGReg loss: encourage standard Gaussian distribution
         sigreg_loss = self.sigreg(proj_vbp, key=sigreg_key)
-
-        # Repeat targets for each view
-        target_n = jnp.repeat(target_b, v)
 
         losses = {
             "inv": inv_loss * (1 - self.cfg.lamb),
             "sigreg": sigreg_loss * self.cfg.lamb,
         }
-        return losses, emb_nd, target_n
+        target_vb = jnp.broadcast_to(target_b[None, :], (v, b))
+        return losses, out, target_vb
 
 
 # -----------------------------------------------------------------------------
@@ -365,7 +376,7 @@ class PixioDecoder(eqx.Module):
         self.embed = eqx.nn.Linear(encoder_cfg.embed_dim, cfg.decoder_dim, key=keys[0])
 
         # Decoder blocks (stacked via filter_vmap for scan optimization)
-        decoder_cfg = birdjepa.nn.transformer.Config(
+        decoder_cfg = birdjepa.nn.transformer.Transformer(
             input_h=encoder_cfg.input_h,
             input_w=encoder_cfg.input_w,
             patch_h=encoder_cfg.patch_h,
@@ -485,25 +496,26 @@ class Pixio(eqx.Module, Objective):
         """Pixio doesn't need to wrap the dataset."""
         return base_ds
 
+    @jaxtyped(typechecker=beartype.beartype)
     def __call__(
         self,
         batch: dict,
         encoder: eqx.Module,
         *,
         key: PRNGKeyArray,
-    ) -> tuple[dict[str, Array], Float[Array, "b d"], Int[Array, " b"]]:
+        mode: tp.Literal["train", "eval"],
+    ) -> tuple[dict[str, Array], birdjepa.nn.transformer.EncoderOutput, Targets]:
         """Compute Pixio (MAE) loss.
 
         Args:
             batch: Dict with "data" (B, H, W) and "target" (B,).
             encoder: Transformer encoder.
             key: PRNG key for masking and forward pass.
+            mode: "train" or "eval" mode.
 
         Returns:
-            (losses, embeddings, targets) where losses has "mse" key.
+            (losses, out, targets) where losses has "mse" key.
         """
-        mask_key, enc_key, dec_key = jax.random.split(key, 3)
-
         data_bhw = batch["data"]
         target_b = batch["target"]
         b = data_bhw.shape[0]
@@ -511,6 +523,16 @@ class Pixio(eqx.Module, Objective):
         # 1. Patchify
         x_bnk, grid_bn2 = birdjepa.nn.transformer.patchify(data_bhw, self.encoder_cfg)
         n_patches = x_bnk.shape[1]
+
+        if mode == "train":
+            mask_key, enc_key, dec_key = jax.random.split(key, 3)
+            full_key = None
+        elif mode == "eval":
+            mask_key, dec_key = jax.random.split(key, 2)
+            enc_key = None
+            full_key = None
+        else:
+            tp.assert_never(mode)
 
         # 2. Generate mask (True = masked)
         mask_bn = make_block_mask(
@@ -523,7 +545,8 @@ class Pixio(eqx.Module, Objective):
         )
 
         # 3. Compute visible count
-        n_visible = int(n_patches * (1 - self.cfg.mask_ratio))
+        n_masked_target = int(n_patches * self.cfg.mask_ratio)
+        n_visible = n_patches - n_masked_target
 
         # 4. Gather visible patches using argsort trick for static shapes
         # Sort by mask value (False=0 comes first), then take first n_visible
@@ -538,42 +561,35 @@ class Pixio(eqx.Module, Objective):
 
         # 5. Encode visible patches only
         out = encoder(x_visible, grid=grid_visible, key=enc_key)
-        enc_visible = out["patches"]
+        enc_visible = out.patches
+        cls_bd = out.cls.mean(axis=1)  # (B, D)
 
-        # Mean of CLS tokens
-        cls_bd = out["cls"].mean(axis=1)  # (B, D)
-
-        # 6. Prepare decoder input: insert mask tokens at masked positions
-        # Start with zeros, add mask tokens, then scatter visible patches
+        # Prepare decoder input: insert mask tokens at masked positions
         dec_input = jnp.zeros((b, n_patches, self.encoder_cfg.embed_dim))
         dec_input = dec_input + self.mask_token
-        # Then scatter visible patches
         for i in range(n_visible):
             idx = visible_indices[:, i]  # (B,)
             vals = enc_visible[:, i]  # (B, D)
             dec_input = dec_input.at[jnp.arange(b), idx].set(vals)
 
-        # 7. Decode to pixel predictions
+        # Decode to pixel predictions
         _, pred_bnk = self.decoder(cls_bd, dec_input, key=dec_key)
 
-        # 8. Compute MSE loss on masked patches only (with per-patch normalization)
-        target_bnk = x_bnk
-        mean = target_bnk.mean(axis=-1, keepdims=True)
-        var = target_bnk.var(axis=-1, keepdims=True)
-        target_bnk = (target_bnk - mean) / jnp.sqrt(var + 1e-6)
+        mean = x_bnk.mean(axis=-1, keepdims=True)
+        var = x_bnk.var(axis=-1, keepdims=True)
+        target_bnk = (x_bnk - mean) / jnp.sqrt(var + 1e-6)
 
-        # Masked MSE: only compute loss on masked patches
         mask_bnk = mask_bn[:, :, None]  # (B, N, 1)
         diff_sq = (pred_bnk - target_bnk) ** 2
         masked_diff = diff_sq * mask_bnk
         mse_loss = masked_diff.sum() / (mask_bn.sum() * pred_bnk.shape[-1])
-
         losses = {"mse": mse_loss}
 
-        # 9. Return CLS embedding for probe
-        emb_bd = cls_bd
+        if mode == "train":
+            return losses, out, target_b
 
-        return losses, emb_bd, target_b
+        out_full = encoder(x_bnk, grid=grid_bn2, key=full_key)
+        return losses, out_full, target_b
 
 
 @beartype.beartype

@@ -417,8 +417,9 @@ class RustXenoCantoLoader:
         return self._n_samples
 
     def __getitem__(self, idx: int) -> dict:
-        msg = f"RustXenoCantoLoader does not support __getitem__ (idx={idx}); use IndexedXenoCantoDataset for random access"
-        assert False, msg
+        raise NotImplementedError(
+            f"RustXenoCantoLoader does not support __getitem__ (idx={idx}); use IndexedXenoCantoDataset for random access"
+        )
 
     def __iter__(self):
         iter(self._loader)  # Reset the underlying Rust loader
