@@ -1,6 +1,52 @@
 # Param Norm Mismatch Between Logs and Checkpoints
 
-## Summary (2026-01-22)
+## Status: RESOLVED (2026-01-23)
+
+Two separate bugs were identified and fixed:
+
+1. **Pre-update vs post-update mismatch** (fixed 2026-01-22): Logged param_norm was computed from pre-update parameters while checkpoints saved post-update parameters.
+
+2. **Orbax GPU sharding bug** (fixed 2026-01-23): Orbax incorrectly scaled replicated arrays by `sqrt(n_devices)` during checkpoint restore on multi-GPU systems.
+
+## Fix Summary
+
+The Orbax bug was fixed in `src/birdjepa/checkpoints.py` by converting JAX arrays to numpy before saving:
+
+```python
+def _to_numpy(pytree):
+    """Convert JAX arrays to numpy arrays for checkpoint save.
+
+    This avoids Orbax's sharding-related bugs where replicated arrays get
+    scaled by sqrt(n_devices) during restore. By saving numpy arrays,
+    we bypass the problematic sharding handling entirely.
+    """
+    def convert(x):
+        if hasattr(x, "block_until_ready"):
+            x.block_until_ready()  # Ensure computation is complete
+        if hasattr(x, "device"):
+            return jax.device_get(x)  # Convert to numpy
+        return x
+    return jax.tree.map(convert, pytree)
+```
+
+Verification logging was added to detect any future issues:
+- `CKPT_SAVE` logs encoder_norm at save time
+- `CKPT_RESTORE` compares saved vs restored encoder_norm (ratio should be 1.0)
+- Checkpoint metadata stores `encoder_norm` for verification
+
+## Verification (Job 3348594)
+
+```
+CKPT_SAVE step=1 encoder_norm=164.788406
+CKPT_SAVE step=500 encoder_norm=170.250153
+CKPT_RESTORE step=500 saved_encoder_norm=170.250153 restored_encoder_norm=170.250153 ratio=1.000000 delta=0.000000
+```
+
+---
+
+# Historical Investigation
+
+## Original Summary (2026-01-22)
 
 For sweep 3309878, checkpoint param_norm values are consistently lower than logged train/param_norm values. The gap grows with step (8000 -> 10000) and is far larger than update_norm from the same logs. CPU and GPU results match for tisomkvs, so this is not a CPU/GPU restore issue. Component norms (encoder/objective/probe) show the same downward bias.
 

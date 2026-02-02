@@ -37,6 +37,10 @@ def compute_tgt_entropy(targets: np.ndarray) -> float:
     return float(-np.sum(probs * np.log(probs + 1e-10)))
 
 
+def _none_to_nan(value: float | None) -> float:
+    return float("nan") if value is None else float(value)
+
+
 def _batch_to_device(batch: dict, sharding) -> dict[str, jax.Array]:
     """Copy batch arrays and place on sharded device."""
     result: dict[str, jax.Array] = {}
@@ -109,6 +113,10 @@ class Config:
     """Evaluate on test set every N steps."""
     seed: int = 42
     """Random seed."""
+    prng_mode: tp.Literal["stateful", "stateless", "checkpointed"] = "stateful"
+    """PRNG mode: stateful (default), stateless (fold_in step), or checkpointed (save/restore key)."""
+    disable_stochastic: bool = False
+    """If True, disable stochastic ops and force deterministic data settings."""
     device: tp.Literal["cpu", "gpu"] = "gpu"
     """Device to train on."""
     probe_pooling: tp.Literal["cls", "patches"] = "cls"
@@ -154,6 +162,8 @@ class Config:
     # Rust dataloader settings
     window_size: int = 10000
     """Shuffle buffer size for Rust loader (samples)."""
+    reset_loader_at_step: int | None = None
+    """Debug: reset dataloader at this step to test if loss jumps (None = disabled)."""
 
 
 def softmax_cross_entropy(logits, labels):
@@ -423,6 +433,38 @@ def worker_fn(cfg: Config):
     if cfg.device == "gpu":
         assert birdjepa.helpers.jax_has_gpu(), "GPU not available"
 
+    if cfg.disable_stochastic:
+        train_data = cfg.train_data
+        if isinstance(train_data, birdjepa.data.XenoCanto):
+            train_data = dataclasses.replace(
+                train_data,
+                truncate="start",
+                augmentations=[],
+            )
+        elif isinstance(train_data, birdjepa.data.Cifar100):
+            train_data = dataclasses.replace(train_data, augmentations=[])
+        else:
+            tp.assert_never(train_data)
+
+        test_data = cfg.test_data
+        if isinstance(test_data, birdjepa.data.XenoCanto):
+            test_data = dataclasses.replace(
+                test_data,
+                truncate="start",
+                augmentations=[],
+            )
+        elif isinstance(test_data, birdjepa.data.Cifar100):
+            test_data = dataclasses.replace(test_data, augmentations=[])
+        else:
+            tp.assert_never(test_data)
+
+        cfg = dataclasses.replace(
+            cfg, train_data=train_data, test_data=test_data, window_size=1
+        )
+
+    msg = f"Unexpected prng_mode: {cfg.prng_mode}"
+    assert cfg.prng_mode in ("stateful", "stateless", "checkpointed"), msg
+
     # Set up sharding (works for both single and multi-GPU)
     n_devices = jax.device_count()
     mesh, data_sharding, model_sharding = birdjepa.helpers.setup_sharding(n_devices)
@@ -442,16 +484,19 @@ def worker_fn(cfg: Config):
     logger.info("wandb run id: %s", cfg.run_id)
 
     key = jr.key(cfg.seed)
+    base_key = key
 
     # Data
     msg = "LeJEPA objective requires Python datasets; not supported with Rust loader"
     assert not isinstance(cfg.objective, birdjepa.nn.objectives.LeJEPAConfig), msg
 
-    assert isinstance(cfg.train_data, birdjepa.data.XenoCanto)
-    assert cfg.train_data.n_samples is None, "train_data.n_samples must be None"
+    train_data = cfg.train_data
+    assert isinstance(train_data, birdjepa.data.XenoCanto)
+    assert train_data.n_samples is None, "train_data.n_samples must be None"
 
-    assert isinstance(cfg.test_data, birdjepa.data.XenoCanto)
-    assert cfg.test_data.n_samples is not None, "test_data.n_samples is required"
+    test_data = cfg.test_data
+    assert isinstance(test_data, birdjepa.data.XenoCanto)
+    assert test_data.n_samples is not None, "test_data.n_samples is required"
 
     # Model and objective
     logger.info("Creating encoder")
@@ -468,7 +513,7 @@ def worker_fn(cfg: Config):
     # Create dataloaders using Rust loader
     logger.info("Creating train dataloader")
     train_loader = birdjepa.data.RustXenoCantoLoader(
-        cfg.train_data,
+        train_data,
         seed=cfg.seed,
         batch_size=cfg.batch_size,
         n_workers=cfg.n_workers,
@@ -478,7 +523,7 @@ def worker_fn(cfg: Config):
     )
     logger.info("Creating test dataloader")
     test_loader = birdjepa.data.RustXenoCantoLoader(
-        cfg.test_data,
+        test_data,
         seed=cfg.seed,
         batch_size=cfg.batch_size,
         n_workers=cfg.n_workers,
@@ -573,8 +618,12 @@ def worker_fn(cfg: Config):
         encoder, objective, probe, opt_state, encoder_config=cfg.model
     )
     if restored is not None:
-        encoder, objective, probe, opt_state, start_step = restored
-        # Note: Rust loader state and PRNG key are not checkpointed
+        encoder, objective, probe, opt_state, start_step, restored_key = restored
+        if cfg.prng_mode == "checkpointed":
+            msg = "checkpointed prng_mode requires prng_key in checkpoint metadata"
+            assert restored_key is not None, msg
+            key = restored_key
+        # Note: Rust loader state is not checkpointed
         logger.info("Resumed from checkpoint (dataloader restarts from beginning)")
 
     # Create train_step with sharding
@@ -598,24 +647,51 @@ def worker_fn(cfg: Config):
         (models, opt_state),
     )
 
+    # Helper to create train loader (reused for reset test)
+    def _make_train_loader():
+        return birdjepa.data.RustXenoCantoLoader(
+            train_data,
+            seed=cfg.seed,
+            batch_size=cfg.batch_size,
+            n_workers=cfg.n_workers,
+            shuffle_buffer_size=cfg.window_size,
+            shuffle_min_size=cfg.window_size // 2,
+            infinite=True,
+        )
+
     # TODO: total is wrong when resuming (should be cfg.n_steps - step)
     last_step_time = time.time()
-    for batch in birdjepa.helpers.progress(
-        train_loader, every=cfg.log_every, total=cfg.n_steps
-    ):
-        if step >= cfg.n_steps:
-            break
+    train_iter = iter(train_loader)
+    while step < cfg.n_steps:
+        batch = next(train_iter)
 
         # Store targets for entropy computation (only computed when logging)
         targets_np = batch["target"]
 
         batch = _batch_to_device(batch, data_sharding)
 
-        step_key, key = jr.split(key)
+        if cfg.prng_mode == "stateless":
+            step_key = jr.fold_in(base_key, step)
+        else:
+            step_key, key = jr.split(key)
 
         models, opt_state, metrics = train_step(models, opt_state, batch, key=step_key)
 
         step += 1
+
+        # Debug: reset dataloader mid-training to test if loss jumps
+        if cfg.reset_loader_at_step and step == cfg.reset_loader_at_step:
+            logger.info(
+                "RESET_LOADER_TEST: Resetting dataloader at step %d (loss before: %.4f)",
+                step,
+                float(jnp.mean(metrics["probe_loss"])),
+            )
+            del train_loader
+            train_loader = _make_train_loader()
+            train_iter = iter(train_loader)
+            logger.info(
+                "RESET_LOADER_TEST: New dataloader created, continuing training"
+            )
 
         ckpt_param_norm = None
         if ckpt_mngr.should_save(step):
@@ -649,6 +725,7 @@ def worker_fn(cfg: Config):
             probe=models["probe"],
             opt_state=opt_state,
             encoder_config=cfg.model,
+            prng_key=key if cfg.prng_mode == "checkpointed" else None,
             param_norm=ckpt_param_norm,
         )
 
@@ -674,6 +751,7 @@ def worker_fn(cfg: Config):
             metrics = jax.tree.map(lambda x: float(jnp.mean(x)), metrics)
 
             lr = float(schedule(step))
+            step_opt_stats = birdjepa.checkpoints.get_opt_state_stats(opt_state)
             metric_str = " ".join(
                 f"{k}={float(v):.4g}" for k, v in sorted(metrics.items())
             )
@@ -690,6 +768,9 @@ def worker_fn(cfg: Config):
                 "step": step,
                 "lr": lr,
                 "train/probe": float(metrics["probe_loss"]),
+                "train/opt_state_l2": _none_to_nan(step_opt_stats["l2"]),
+                "train/opt_state_abs_mean": _none_to_nan(step_opt_stats["abs_mean"]),
+                "train/opt_state_abs_max": _none_to_nan(step_opt_stats["abs_max"]),
                 "train/tgt_entropy": tgt_entropy,
                 "train/tgt_entropy_frac": tgt_entropy_frac,
                 "train/sec_per_step": sec_per_step,
@@ -744,6 +825,7 @@ def worker_fn(cfg: Config):
         probe=models["probe"],
         opt_state=opt_state,
         encoder_config=cfg.model,
+        prng_key=key if cfg.prng_mode == "checkpointed" else None,
         param_norm=final_param_norm,
         force=True,
     )
@@ -850,8 +932,7 @@ def cli(cfg: Config):
         setup=setup,
     )
 
-    with executor.batch():
-        jobs = [executor.submit(TrainingJob(c)) for c in cfgs]
+    jobs = [executor.submit(TrainingJob(c)) for c in cfgs]
 
     time.sleep(5.0)
     for j, job in enumerate(jobs):

@@ -1,3 +1,16 @@
+# 01/28/2026
+
+Loss jump on resume: dataloader reset test
+
+We ran a controlled experiment to see if resetting the dataloader alone causes the loss/EMA jump at resume.
+
+- Reset run: `9lm0bfgu` (forced dataloader reset at step 1000)
+- Control run: `knze87mn` (same config/seed, no reset)
+- Outcome: both runs show smooth loss/EMA through step 1000 with similar small decreases.
+- EMA(0.05) deltas at step 1000 were near zero and almost identical between runs (reset: -0.0067; control: -0.0094).
+
+Conclusion: dataloader reset alone is insufficient to explain the 2-4 point loss jumps seen on true checkpoint resume.
+
 # 12/18/2025
 
 Evaluation methods from Bird MAE and Song MAE papers
@@ -663,3 +676,111 @@ step,ckpt_param_norm,ckpt_param_norm_encoder,ckpt_param_norm_objective,ckpt_para
 9000,6388.49,6253.24,963.446,884.073,7472,-1083.51
 9500,6750.71,6626.63,949.567,870.733,7861,-1110.29
 10000,7130.38,7017.03,933.661,855.501,8249,-1118.62
+
+# 01/25/2026
+
+## Muon vs AdamW Optimizer Comparison @ 10K Steps
+
+Ran systematic LR sweeps comparing AdamW (baseline architecture) vs Muon (with "free wins" architecture changes). Both use WSD schedule with 5000 warmup steps, supervised objective on XCL, ViT-S encoder, batch size 2048.
+
+### Configuration Differences
+
+| Setting | AdamW Sweep | Muon Sweep |
+|---------|-------------|------------|
+| Optimizer | AdamW | Muon |
+| RoPE | No | Yes (base=100) |
+| QK-Norm | No | Yes |
+| SwiGLU | No | Yes |
+| LayerScale | No | Yes (init=1e-4) |
+| LRs tested | 3e-4, 1e-3, 3e-3, 1e-2, 3e-2 | 3e-2, 1e-1, 3e-1 |
+
+### Final Results (10K steps)
+
+AdamW (no free wins) - Job 3350525:
+
+| LR | Run ID | Final Loss |
+|----|--------|------------|
+| 3e-4 | wexdzk6k | 5.49 |
+| 1e-3 | lw5lzgmt | 5.31 |
+| 3e-3 | 650nxn08 | 6.85 |
+| 1e-2 | xwksdgtw | 7.24 |
+| 3e-2 | yk68ws1y | 8.13 |
+
+Muon + free wins - Job 3350538:
+
+| LR | Run ID | Final Loss |
+|----|--------|------------|
+| 3e-2 | 8c77us66 | 5.03 |
+| 1e-1 | 6n9menos | 8.38 |
+| 3e-1 | g3cz884x | 9.01 |
+
+### Summary
+
+| Optimizer | Best LR | Final Loss |
+|-----------|---------|------------|
+| Muon + free wins | 3e-2 | 5.03 |
+| AdamW (baseline) | 1e-3 | 5.31 |
+
+Muon with free wins beats AdamW by 0.28 loss (5.03 vs 5.31). Muon optimal LR is 30x higher than AdamW optimal LR (0.03 vs 0.001).
+
+Note: Higher Muon LRs (0.1, 0.3) diverged. The sweet spot for Muon + free wins appears to be around lr=0.03. For AdamW without free wins, optimal LR is around 1e-3.
+
+Sweep configs: `sweeps/001_freewins/adamw_vits_xcl.py`, `sweeps/001_freewins/muon_vits_xcl_highlr.py`
+
+## Investigating Training Variance
+
+While analyzing results, discovered an earlier run (wjxvpnqh) with identical config to 8c77us66 but dramatically different final loss: 1.14 vs 5.03.
+
+### Investigation
+
+Both runs had:
+- Same git commit (8ad48e5)
+- Same config (lr=0.03, Muon, free wins, seed=42)
+- Same number of preemptions/restarts (2 each)
+
+Loss trajectories diverged around step 7000-8000:
+
+| Step | wjxvpnqh | 8c77us66 |
+|------|----------|----------|
+| 7000 | 4.80 | 2.63 |
+| 8000 | 1.80 | 5.29 |
+| final | 1.14 | 5.03 |
+
+At step 7000, 8c77us66 was actually better (2.63 vs 4.80). Then the runs diverged dramatically. Both had checkpoint restores around step 7005.
+
+### Root Cause: Dirty Worktree
+
+The worktree has uncommitted changes to key files:
+
+- `src/birdjepa/nn/transformer.py`: Major RoPE changes (caching, precomputation), EncoderOutput NamedTuple, key parameter changed to `PRNGKeyArray | None`
+- `src/birdjepa/nn/objectives.py`: Added `mode: Literal["train", "eval"]` parameter, changed return type to EncoderOutput
+- `src/birdjepa/data/__init__.py`: Minor change
+
+These uncommitted changes could cause different training behavior across runs if the worktree state differed between submissions.
+
+### Seed Variance Test
+
+Submitted 3 runs with identical config but different seeds to test training reproducibility with the current (dirty) worktree:
+
+| Job | Run ID | Seed |
+|-----|--------|------|
+| 3352503_0 | 27i3idlk | 1 |
+| 3352503_1 | xy9gn8ek | 2 |
+| 3352503_2 | 7bdmyn24 | 3 |
+
+Config: lr=0.03, Muon optimizer, all free wins enabled, 10K steps, WSD schedule.
+Sweep config: `sweeps/001_freewins/muon_seed_test.py`
+
+### Expected Outcomes
+
+1. If all 3 runs converge to similar loss (~5.0): Training is stable, the earlier variance was due to worktree differences
+2. If losses vary significantly (>1.0 difference): Training is unstable, possibly due to:
+   - Checkpoint resume behavior on preemption
+   - Muon optimizer sensitivity to initialization
+   - Something in the free wins architecture (LayerScale init, RoPE, etc.)
+
+### Plan Forward
+
+1. Wait for seed variance test to complete (~4 hours on preemptible)
+2. If stable: commit the current changes, run final comparison
+3. If unstable: investigate checkpoint resume code, consider lowering LR or adjusting warmup
