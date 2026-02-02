@@ -1,9 +1,13 @@
-"""Sweep: PRNG and stochasticity tests for resume loss jumps.
+"""Sweep: checkpoint save/load roundtrip without dataloader restart.
 
-Hypothesis: loss jumps are caused by resume-only stochastic differences. We test:
-- stateless PRNG (fold_in step)
-- checkpointed PRNG key restore
-- disabling stochastic ops and data randomness
+Implements Idea 5 in `docs/issues/006-resume-loss-jump/FINDINGS.md`.
+
+Goal: isolate whether Orbax checkpoint save/restore itself causes a loss jump.
+We force an in-process save->load at a chosen step while continuing to consume
+batches from the same Rust dataloader iterator.
+
+This sweep includes a Muon run (matches Idea 4) and an AdamW run for comparison.
+Edit as needed.
 """
 
 
@@ -28,14 +32,14 @@ def make_cfgs() -> list[dict]:
         },
         "objective": {"__class__": "SupervisedConfig"},
         "batch_size": 2048,
-        "lr": 0.03,
-        "optimizer": "muon",
         "schedule": "wsd",
         "warmup_steps": 5000,
         "decay_steps": 0,
         "n_steps": 10_000,
         "log_every": 5,
-        "eval_every": 1000,
+        "lr": 3e-3,
+        # Avoid eval pauses around the roundtrip step; edit as needed.
+        "eval_every": 10_000,
         "n_workers": 60,
         "window_size": 10_000,
         "seed": 1,
@@ -45,22 +49,16 @@ def make_cfgs() -> list[dict]:
         "slurm_acct": "PAS2136",
         "slurm_partition": "preemptible-nextgen",
         "ckpt_to": "/fs/ess/PAS2136/samuelstevens/birdjepa/checkpoints",
+        "prng_mode": "checkpointed",
+        "debug_roundtrip_ckpt_at_step": 1000,
+        "tags": ["006", "ckpt-roundtrip"],
     }
 
     cfgs = []
-    cfgs.append({
-        **base,
-        "prng_mode": "stateless",
-        "tags": ["006", "resume-loss-jump", "prng-stateless"],
-    })
-    cfgs.append({
-        **base,
-        "prng_mode": "checkpointed",
-        "tags": ["006", "resume-loss-jump", "prng-checkpointed"],
-    })
-    cfgs.append({
-        **base,
-        "debug_disable_stochastic": True,
-        "tags": ["006", "resume-loss-jump", "no-stochastic"],
-    })
+
+    for optim in ["muon", "adamw"]:
+        cfgs.append({**base, "optimizer": optim, "prng_mode": "stateless"})
+        cfgs.append({**base, "optimizer": optim, "prng_mode": "checkpointed"})
+        cfgs.append({**base, "optimizer": optim, "debug_disable_stochastic": True})
+
     return cfgs

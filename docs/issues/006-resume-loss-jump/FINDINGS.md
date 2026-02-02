@@ -107,11 +107,47 @@ Conversely, if the in-process checkpoint roundtrip is smooth, then the loss jump
 
 ## Experiment
 
-- Add a debug option to `pretrain.py` to force a checkpoint roundtrip at a chosen step `S` (e.g., 1000):
-  - Save a checkpoint at step `S` and block until the async save is finished.
-  - Immediately call `CheckpointManager.load_training(...)` and replace (encoder, objective, probe, opt_state, step) with the restored values.
-  - Critically: do not recreate the Rust dataloader or iterator; continue training using the same `train_iter`.
-- Compare loss_pr/loss_ce and norm metrics in a small window around `S` (same plotting approach as Ideas 3-4).
+### Code Changes
+
+Add `cfg.debug_roundtrip_steps: list[int] = []` to the pretrain config. When non-empty, perform an in-process checkpoint roundtrip after completing each listed step:
+
+1. Create a debug `CheckpointManager` pointing to `outputs/<run_id>/debug_ckpt/` with `async_checkpointing=False` (synchronous saves).
+2. Call `debug_mngr.save(step, ..., force=True)` to save checkpoint.
+3. Call `debug_mngr.load_training(encoder, objective, probe, opt_state, encoder_config=...)` which returns `(encoder, objective, probe, opt_state, step, prng_key)`.
+4. Replace in-memory state with restored values. Keep in-memory PRNG (ignore returned `prng_key`) to isolate test to model/optimizer state.
+5. Call `jax.clear_caches()` to force JIT re-trace of train_step.
+6. Do not restart the Rust dataloader or iterator; continue using the same `train_iter`.
+
+Error handling:
+- If save/restore raises an exception: abort the run.
+- If restored state differs from pre-save state beyond tolerance (atol=1e-6, rtol=1e-5): log warning but continue training.
+
+LR schedule is stateful: optax stores the step counter inside `opt_state`. Restoring `opt_state` automatically continues the LR schedule at the correct step.
+
+### Sweep Design
+
+Sweep file: `docs/issues/006-resume-loss-jump/idea5_roundtrip.py`
+
+| Condition | PRNG Mode | debug_roundtrip_steps |
+|-----------|-----------|----------------------|
+| roundtrip | stateless | [500, 1000, 1500] |
+| roundtrip | checkpointed | [500, 1000, 1500] |
+| roundtrip | no_stochastic | [500, 1000, 1500] |
+| control | stateless | [] |
+| control | checkpointed | [] |
+| control | no_stochastic | [] |
+
+- 6 runs total (3 PRNG modes x 2 conditions)
+- 2000 steps per run
+- Base config: same as Idea 4 PRNG mode sweep
+- `checkpoint_every=10000` to disable normal checkpointing
+- Same seed for all runs (for fair comparison between roundtrip and control)
+- Slurm: preemptible-nextgen partition, no requeue (--no-requeue)
+- W&B: same project as Idea 4, tag="idea5_roundtrip"
+
+### Analysis
+
+Manual analysis in notebook after runs complete. Compare loss_pr/loss_ce around the roundtrip step vs control runs to determine whether checkpoint save/restore alone creates a discontinuity.
 
 ## Results
 

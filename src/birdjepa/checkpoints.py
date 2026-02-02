@@ -12,6 +12,7 @@ import pathlib
 import beartype
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import orbax.checkpoint as ocp
 
 import birdjepa.helpers
@@ -37,6 +38,54 @@ def _to_numpy(pytree):
         return x
 
     return jax.tree.map(convert, pytree)
+
+
+def _none_to_nan(value: float | None) -> float:
+    return float("nan") if value is None else value
+
+
+def _opt_state_stats(opt_state) -> dict:
+    float_tree = eqx.filter(opt_state, eqx.is_inexact_array)
+    float_leaves = [leaf for leaf in jax.tree.leaves(float_tree) if leaf is not None]
+
+    array_tree = eqx.filter(opt_state, eqx.is_array)
+    count_values = [
+        int(leaf)
+        for leaf in jax.tree.leaves(array_tree)
+        if leaf is not None
+        and jnp.issubdtype(leaf.dtype, jnp.integer)
+        and leaf.shape == ()
+    ]
+
+    if not float_leaves:
+        return {
+            "l2": None,
+            "abs_mean": None,
+            "abs_max": None,
+            "count_values": count_values,
+        }
+
+    n_elems = sum(leaf.size for leaf in float_leaves)
+    l2 = float(birdjepa.helpers.tree_l2_norm(float_leaves))
+    abs_sum = jax.tree_util.tree_reduce(
+        jax.lax.add, [jnp.sum(jnp.abs(leaf)) for leaf in float_leaves]
+    )
+    abs_max = jax.tree_util.tree_reduce(
+        jax.lax.max, [jnp.max(jnp.abs(leaf)) for leaf in float_leaves]
+    )
+    abs_mean = float(abs_sum) / max(1, n_elems)
+    abs_max = float(abs_max)
+    return {
+        "l2": l2,
+        "abs_mean": abs_mean,
+        "abs_max": abs_max,
+        "count_values": count_values,
+    }
+
+
+@beartype.beartype
+def get_opt_state_stats(opt_state) -> dict:
+    return _opt_state_stats(opt_state)
 
 
 class CheckpointManager:
@@ -79,6 +128,7 @@ class CheckpointManager:
         probe,
         opt_state,
         encoder_config,
+        prng_key=None,
         param_norm: float | None = None,
         force: bool = False,
     ):
@@ -91,6 +141,7 @@ class CheckpointManager:
             probe: Linear probe model.
             opt_state: Optimizer state.
             encoder_config: Transformer config dataclass for the encoder.
+            prng_key: Optional PRNG key to save for deterministic resume.
             param_norm: Optional param_norm for the saved state (post-update).
             force: If True, save even if step doesn't match save_interval.
         """
@@ -115,13 +166,30 @@ class CheckpointManager:
             )
         logger.info("CKPT_SAVE step=%d encoder_norm=%.6f", step, encoder_norm)
 
+        opt_stats = _opt_state_stats(opt_state)
+        logger.info(
+            "CKPT_SAVE step=%d opt_state_l2=%.6f abs_mean=%.6f abs_max=%.6f count_values=%s",
+            step,
+            _none_to_nan(opt_stats["l2"]),
+            _none_to_nan(opt_stats["abs_mean"]),
+            _none_to_nan(opt_stats["abs_max"]),
+            opt_stats["count_values"],
+        )
+
         metadata = {
             "step": step,
             "encoder_config": dataclasses.asdict(encoder_config),
             "encoder_norm": encoder_norm,  # For verification on restore
+            "opt_state_l2": opt_stats["l2"],
+            "opt_state_abs_mean": opt_stats["abs_mean"],
+            "opt_state_abs_max": opt_stats["abs_max"],
+            "opt_state_count_values": opt_stats["count_values"],
         }
         if param_norm is not None:
             metadata["param_norm"] = float(param_norm)
+        if prng_key is not None:
+            key_data = jax.random.key_data(prng_key)
+            metadata["prng_key"] = jax.device_get(key_data).tolist()
 
         self._mngr.save(
             step,
@@ -149,7 +217,7 @@ class CheckpointManager:
     def load_training(self, encoder, objective, probe, opt_state, *, encoder_config):
         """Load latest checkpoint for training resume.
 
-        Returns (encoder, objective, probe, opt_state, start_step) or None if no checkpoint.
+        Returns (encoder, objective, probe, opt_state, start_step, prng_key) or None if no checkpoint.
 
         Args:
             encoder: Abstract encoder structure for restore.
@@ -158,8 +226,7 @@ class CheckpointManager:
             opt_state: Abstract optimizer state structure for restore.
             encoder_config: Current encoder config dataclass. Must match saved config.
 
-        Note: JAX PRNG key is not checkpointed (host-local, can't serialize in distributed mode).
-        Caller should continue using existing key after resume.
+        Note: PRNG key is only restored if saved in metadata. Caller should handle None.
         """
         step = self._mngr.latest_step()
         if step is None:
@@ -215,12 +282,83 @@ class CheckpointManager:
                 restored["metadata"]["step"],
             )
 
+        opt_state = restored["state"]["opt_state"]
+        opt_stats = _opt_state_stats(opt_state)
+        saved_opt_l2 = restored["metadata"].get("opt_state_l2")
+        saved_opt_abs_mean = restored["metadata"].get("opt_state_abs_mean")
+        saved_opt_abs_max = restored["metadata"].get("opt_state_abs_max")
+        saved_counts = restored["metadata"].get("opt_state_count_values")
+        logger.info(
+            "CKPT_RESTORE step=%d opt_state_l2=%.6f abs_mean=%.6f abs_max=%.6f count_values=%s",
+            restored["metadata"]["step"],
+            _none_to_nan(opt_stats["l2"]),
+            _none_to_nan(opt_stats["abs_mean"]),
+            _none_to_nan(opt_stats["abs_max"]),
+            opt_stats["count_values"],
+        )
+        if saved_opt_l2 is not None and opt_stats["l2"] is not None:
+            delta = abs(saved_opt_l2 - opt_stats["l2"])
+            ratio = (
+                saved_opt_l2 / opt_stats["l2"] if opt_stats["l2"] > 0 else float("inf")
+            )
+            logger.info(
+                "CKPT_OPT_STATE_DELTA step=%d saved_l2=%.6f restored_l2=%.6f ratio=%.6f delta=%.6f",
+                restored["metadata"]["step"],
+                saved_opt_l2,
+                opt_stats["l2"],
+                ratio,
+                delta,
+            )
+        if saved_opt_abs_mean is not None and opt_stats["abs_mean"] is not None:
+            delta = abs(saved_opt_abs_mean - opt_stats["abs_mean"])
+            logger.info(
+                "CKPT_OPT_STATE_ABS_MEAN_DELTA step=%d saved=%.6f restored=%.6f delta=%.6f",
+                restored["metadata"]["step"],
+                saved_opt_abs_mean,
+                opt_stats["abs_mean"],
+                delta,
+            )
+        if saved_opt_abs_max is not None and opt_stats["abs_max"] is not None:
+            delta = abs(saved_opt_abs_max - opt_stats["abs_max"])
+            logger.info(
+                "CKPT_OPT_STATE_ABS_MAX_DELTA step=%d saved=%.6f restored=%.6f delta=%.6f",
+                restored["metadata"]["step"],
+                saved_opt_abs_max,
+                opt_stats["abs_max"],
+                delta,
+            )
+        if saved_counts is not None and opt_stats["count_values"]:
+            if saved_counts != opt_stats["count_values"]:
+                logger.warning(
+                    "CKPT_COUNT_MISMATCH step=%d saved_counts=%s restored_counts=%s",
+                    restored["metadata"]["step"],
+                    saved_counts,
+                    opt_stats["count_values"],
+                )
+        if opt_stats["count_values"]:
+            step_val = int(restored["metadata"]["step"])
+            if not all(count == step_val for count in opt_stats["count_values"]):
+                logger.warning(
+                    "CKPT_COUNT_STEP_MISMATCH step=%d opt_state_counts=%s",
+                    step_val,
+                    opt_stats["count_values"],
+                )
+
+        prng_key = None
+        saved_prng_key = restored["metadata"].get("prng_key")
+        if saved_prng_key is not None:
+            msg = "jax.random.wrap_key_data is required to restore PRNG key"
+            assert hasattr(jax.random, "wrap_key_data"), msg
+            key_data = jnp.array(saved_prng_key, dtype=jnp.uint32)
+            prng_key = jax.random.wrap_key_data(key_data)
+
         return (
             restored_encoder,
             restored["state"]["objective"],
             restored["state"]["probe"],
             restored["state"]["opt_state"],
             restored["metadata"]["step"],
+            prng_key,
         )
 
     def wait_until_finished(self):

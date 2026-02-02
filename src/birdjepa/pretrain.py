@@ -64,7 +64,8 @@ def _batch_to_device(batch: dict, sharding) -> dict[str, jax.Array]:
 
 
 def _pool_embeddings(
-    out: birdjepa.nn.transformer.EncoderOutput, probe_pooling: str
+    out: birdjepa.nn.transformer.EncoderOutput,
+    probe_pooling: tp.Literal["cls", "patches"],
 ) -> jax.Array:
     """Pool embeddings from encoder outputs."""
     if probe_pooling == "cls":
@@ -115,8 +116,8 @@ class Config:
     """Random seed."""
     prng_mode: tp.Literal["stateful", "stateless", "checkpointed"] = "stateful"
     """PRNG mode: stateful (default), stateless (fold_in step), or checkpointed (save/restore key)."""
-    disable_stochastic: bool = False
-    """If True, disable stochastic ops and force deterministic data settings."""
+    debug_disable_stochastic: bool = False
+    """Debug: disable stochastic ops and force deterministic data settings."""
     device: tp.Literal["cpu", "gpu"] = "gpu"
     """Device to train on."""
     probe_pooling: tp.Literal["cls", "patches"] = "cls"
@@ -162,8 +163,10 @@ class Config:
     # Rust dataloader settings
     window_size: int = 10000
     """Shuffle buffer size for Rust loader (samples)."""
-    reset_loader_at_step: int | None = None
+    debug_reset_loader_at_step: int | None = None
     """Debug: reset dataloader at this step to test if loss jumps (None = disabled)."""
+    debug_roundtrip_steps: list[int] = dataclasses.field(default_factory=list)
+    """Debug: checkpoint save/load roundtrip at these steps without restarting the dataloader (empty = disabled)."""
 
 
 def softmax_cross_entropy(logits, labels):
@@ -236,7 +239,7 @@ def make_train_step(
     data_sharding,
     model_sharding,
     *,
-    probe_pooling: str,
+    probe_pooling: tp.Literal["cls", "patches"],
 ):
     """Create train_step function with sharding.
 
@@ -433,7 +436,7 @@ def worker_fn(cfg: Config):
     if cfg.device == "gpu":
         assert birdjepa.helpers.jax_has_gpu(), "GPU not available"
 
-    if cfg.disable_stochastic:
+    if cfg.debug_disable_stochastic:
         train_data = cfg.train_data
         if isinstance(train_data, birdjepa.data.XenoCanto):
             train_data = dataclasses.replace(
@@ -640,6 +643,23 @@ def worker_fn(cfg: Config):
     step = start_step
     models = {"encoder": encoder, "objective": objective, "probe": probe}
     last_param_norm = None
+    debug_roundtrip_steps_set: set[int] = set()
+    debug_roundtrip_mngr = None
+    if cfg.debug_roundtrip_steps:
+        for s in cfg.debug_roundtrip_steps:
+            assert s > 0, f"debug_roundtrip_steps must be > 0, got {s}"
+            assert s <= cfg.n_steps, (
+                f"debug_roundtrip_steps must be <= n_steps ({cfg.n_steps}), got {s}"
+            )
+        debug_roundtrip_steps_set = set(cfg.debug_roundtrip_steps)
+        assert wandb.run is not None, "wandb.run must be initialized"
+        debug_ckpt_dir = pathlib.Path(wandb.run.dir) / "debug_ckpt"
+        debug_roundtrip_mngr = birdjepa.checkpoints.CheckpointManager(
+            debug_ckpt_dir,
+            save_interval_steps=1,
+            max_to_keep=1,
+            async_checkpointing=False,
+        )
 
     # Place models and optimizer state on sharded devices
     models, opt_state = jax.tree.map(
@@ -680,7 +700,7 @@ def worker_fn(cfg: Config):
         step += 1
 
         # Debug: reset dataloader mid-training to test if loss jumps
-        if cfg.reset_loader_at_step and step == cfg.reset_loader_at_step:
+        if cfg.debug_reset_loader_at_step and step == cfg.debug_reset_loader_at_step:
             logger.info(
                 "RESET_LOADER_TEST: Resetting dataloader at step %d (loss before: %.4f)",
                 step,
@@ -728,6 +748,87 @@ def worker_fn(cfg: Config):
             prng_key=key if cfg.prng_mode == "checkpointed" else None,
             param_norm=ckpt_param_norm,
         )
+
+        if step in debug_roundtrip_steps_set:
+            assert debug_roundtrip_mngr is not None
+            logger.info(
+                "CKPT_ROUNDTRIP_TEST: Starting checkpoint roundtrip at step %d", step
+            )
+
+            # Capture pre-save state for validation
+            pre_save_state = (models, opt_state)
+
+            # Save checkpoint synchronously (debug_roundtrip_mngr has async=False)
+            debug_roundtrip_mngr.save(
+                step=step,
+                encoder=models["encoder"],
+                objective=models["objective"],
+                probe=models["probe"],
+                opt_state=opt_state,
+                encoder_config=cfg.model,
+                prng_key=None,  # Don't save PRNG - we keep in-memory key
+                param_norm=ckpt_param_norm,
+                force=True,
+            )
+
+            # Restore from the checkpoint we just saved
+            restored = debug_roundtrip_mngr.load_training(
+                models["encoder"],
+                models["objective"],
+                models["probe"],
+                opt_state,
+                encoder_config=cfg.model,
+            )
+            msg = f"CKPT_ROUNDTRIP_TEST: no checkpoint found after forced save at step {step}"
+            assert restored is not None, msg
+            encoder, objective, probe, restored_opt_state, restored_step, _ = restored
+            msg = f"CKPT_ROUNDTRIP_TEST: restored step {restored_step} != current step {step}"
+            assert restored_step == step, msg
+
+            # Validate restored state matches pre-save state (within tolerance)
+            restored_models = {
+                "encoder": encoder,
+                "objective": objective,
+                "probe": probe,
+            }
+            restored_state = (restored_models, restored_opt_state)
+
+            def check_allclose(pre, post):
+                if not eqx.is_inexact_array(pre):
+                    return True
+                return bool(jnp.allclose(pre, post, atol=1e-6, rtol=1e-5))
+
+            mismatches = []
+            pre_leaves, pre_treedef = jax.tree.flatten(pre_save_state)
+            post_leaves, post_treedef = jax.tree.flatten(restored_state)
+            for i, (pre, post) in enumerate(zip(pre_leaves, post_leaves)):
+                if eqx.is_inexact_array(pre) and not check_allclose(pre, post):
+                    max_diff = float(jnp.max(jnp.abs(pre - post)))
+                    mismatches.append((i, max_diff))
+
+            if mismatches:
+                logger.warning(
+                    "CKPT_ROUNDTRIP_TEST: %d leaf mismatches at step %d: %s",
+                    len(mismatches),
+                    step,
+                    mismatches[:5],
+                )
+
+            # Replace in-memory state with restored values (keep PRNG unchanged)
+            models = restored_models
+            opt_state = restored_opt_state
+            models, opt_state = jax.tree.map(
+                lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
+                (models, opt_state),
+            )
+
+            # Clear JIT cache to force re-trace
+            jax.clear_caches()
+
+            logger.info(
+                "CKPT_ROUNDTRIP_TEST: Restore complete at step %d, continuing training",
+                step,
+            )
 
         # Log peak memory usage after first step (includes JIT compilation overhead)
         if step == 1:
