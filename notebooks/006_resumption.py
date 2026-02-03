@@ -11,6 +11,7 @@ def _():
     import matplotlib.pyplot as plt
     import numpy as np
     import wandb
+
     return mo, np, pl, plt, wandb
 
 
@@ -1031,7 +1032,7 @@ def _(
     elif n_cols == 1:
         _axes = np.array([[_ax] for _ax in _axes])
 
-    _colors [ "#1f77b4","#ff7f0e"]
+    _colors = ["#1f77b4", "#ff7f0e"]
 
     def _ema(values, alpha=0.1):
         ema = np.zeros_like(values)
@@ -1133,6 +1134,275 @@ def _(
     _out_fpath = f"docs/issues/006-resume-loss-jump/idea4-prng-step{_resume_step}.png"
     _fig.savefig(_out_fpath, dpi=200)
     _fig
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    # Idea 5: Checkpoint Roundtrip Without Dataloader Restart
+
+    ## Hypothesis
+
+    If the loss jump is caused by checkpoint save/load itself (serialization errors, restore mismatches, or a subtle interaction with JIT/static state), then we should be able to reproduce the discontinuity by saving a checkpoint and immediately restoring it in-process, while continuing to consume batches from the same dataloader iterator.
+
+    Conversely, if the in-process checkpoint roundtrip is smooth, then the loss jump must come from process-level resume effects (Rust loader restart, cold shuffle buffer, multithreaded nondeterminism, etc.), not Orbax restore.
+
+    ## Experiment
+
+    - 6 runs total (3 PRNG modes x 2 conditions)
+    - Roundtrip runs perform in-process checkpoint save/restore at steps 500, 1000, 1500
+    - Control runs have no roundtrips
+    - 2000 steps per run
+    """)
+    return
+
+
+@app.cell
+def _(pl, wandb):
+    idea5_runs = {
+        "stateless_roundtrip": "gxny1ntz",
+        "stateless_control": "fqjqlszz",
+        "checkpointed_roundtrip": "c2q6ird2",
+        "checkpointed_control": "938qmw48",
+        "no_stochastic_roundtrip": "d5oxsq0w",
+        "no_stochastic_control": "55w8cml1",
+    }
+
+    def _fetch_idea5_history(run_id: str, label: str):
+        api = wandb.Api(timeout=60)
+        run = api.run(f"samuelstevens/birdjepa/{run_id}")
+        keys = [
+            "step",
+            "_step",
+            "train/probe",
+            "train/ce",
+            "train/update_norm",
+            "train/param_norm",
+            "train/grad_norm",
+            "train/opt_state_l2",
+            "train/opt_state_abs_mean",
+            "train/opt_state_abs_max",
+            "_timestamp",
+            "lr",
+        ]
+        rows = []
+        for row in run.scan_history(keys=keys):
+            step = row.get("step")
+            if step is None:
+                step = row.get("_step")
+            loss_pr = row.get("train/probe")
+            loss_ce = row.get("train/ce")
+            update_norm = row.get("train/update_norm")
+            param_norm = row.get("train/param_norm")
+            grad_norm = row.get("train/grad_norm")
+            opt_state_l2 = row.get("train/opt_state_l2")
+            opt_state_abs_mean = row.get("train/opt_state_abs_mean")
+            opt_state_abs_max = row.get("train/opt_state_abs_max")
+            ts = row.get("_timestamp")
+            lr = row.get("lr")
+            has_metrics = any(
+                v is not None
+                for v in (loss_pr, loss_ce, update_norm, param_norm, grad_norm)
+            )
+            if step is None or not has_metrics:
+                continue
+            prng_mode = label.rsplit("_", 1)[0]
+            condition = label.rsplit("_", 1)[1]
+            rows.append({
+                "run_label": label,
+                "run_id": run_id,
+                "prng_mode": prng_mode,
+                "condition": condition,
+                "step": int(step),
+                "loss_pr": float(loss_pr) if loss_pr is not None else None,
+                "loss_ce": float(loss_ce) if loss_ce is not None else None,
+                "update_norm": float(update_norm) if update_norm is not None else None,
+                "param_norm": float(param_norm) if param_norm is not None else None,
+                "grad_norm": float(grad_norm) if grad_norm is not None else None,
+                "opt_state_l2": float(opt_state_l2)
+                if opt_state_l2 is not None
+                else None,
+                "opt_state_abs_mean": float(opt_state_abs_mean)
+                if opt_state_abs_mean is not None
+                else None,
+                "opt_state_abs_max": float(opt_state_abs_max)
+                if opt_state_abs_max is not None
+                else None,
+                "timestamp": ts,
+                "lr": float(lr) if lr is not None else None,
+            })
+        schema = {
+            "run_label": pl.Utf8,
+            "run_id": pl.Utf8,
+            "prng_mode": pl.Utf8,
+            "condition": pl.Utf8,
+            "step": pl.Int64,
+            "loss_pr": pl.Float64,
+            "loss_ce": pl.Float64,
+            "update_norm": pl.Float64,
+            "param_norm": pl.Float64,
+            "grad_norm": pl.Float64,
+            "opt_state_l2": pl.Float64,
+            "opt_state_abs_mean": pl.Float64,
+            "opt_state_abs_max": pl.Float64,
+            "timestamp": pl.Float64,
+            "lr": pl.Float64,
+        }
+        if not rows:
+            return pl.DataFrame(schema=schema)
+        return pl.DataFrame(rows, schema=schema)
+
+    idea5_df = pl.concat([
+        _fetch_idea5_history(run_id, label) for label, run_id in idea5_runs.items()
+    ])
+    idea5_df
+    return (idea5_df,)
+
+
+@app.cell
+def _(idea5_df, mo, pl):
+    idea5_run_summary = (
+        idea5_df
+        .group_by(["run_label", "prng_mode", "condition"])
+        .agg([
+            pl.col("step").min().alias("min_step"),
+            pl.col("step").max().alias("max_step"),
+            pl.len().alias("n_rows"),
+        ])
+        .sort("run_label")
+    )
+    mo.vstack([
+        mo.md("### Idea 5 Run Summary"),
+        idea5_run_summary,
+    ])
+    return
+
+
+@app.cell
+def _(idea5_df, mo, np, pl, plt):
+    mo.stop(
+        len(idea5_df) == 0,
+        mo.md("No Idea 5 data available yet. Runs may still be in progress."),
+    )
+
+    _window_df = idea5_df.filter((pl.col("step") >= 0) & (pl.col("step") <= 1500))
+
+    def _ema(values, alpha=0.1):
+        ema = np.zeros_like(values)
+        ema[0] = values[0]
+        for i in range(1, len(values)):
+            ema[i] = alpha * values[i] + (1 - alpha) * ema[i - 1]
+        return ema
+
+    _prng_modes = ["stateless", "checkpointed"]
+    _metric_specs = [
+        ("loss_pr", "Loss (probe)"),
+        ("loss_ce", "Loss (ce)"),
+        ("update_norm", "Update norm"),
+        ("param_norm", "Param norm"),
+        ("grad_norm", "Grad norm"),
+        ("opt_state_l2", "Opt state L2"),
+        ("opt_state_abs_mean", "Opt state abs mean"),
+        ("opt_state_abs_max", "Opt state abs max"),
+    ]
+    _metrics = []
+    for _key, _label in _metric_specs:
+        if _key in _window_df.columns:
+            _has_values = _window_df.select(pl.col(_key).is_not_null().any()).item()
+            if _has_values:
+                _metrics.append((_key, _label))
+
+    _fig, _axes = plt.subplots(
+        nrows=len(_metrics),
+        ncols=len(_prng_modes),
+        figsize=(4 * len(_prng_modes), 2.5 * len(_metrics)),
+        dpi=150,
+        sharex=True,
+        sharey="row",
+        layout="constrained",
+    )
+    if len(_metrics) == 1 and len(_prng_modes) == 1:
+        _axes = np.array([[_axes]])
+    elif len(_metrics) == 1:
+        _axes = np.array([_axes])
+    elif len(_prng_modes) == 1:
+        _axes = np.array([[_ax] for _ax in _axes])
+
+    _colors = {"roundtrip": "#d62728", "control": "#1f77b4"}
+
+    for _row, (_metric_key, _metric_label) in enumerate(_metrics):
+        for _col, _prng_mode in enumerate(_prng_modes):
+            _ax = _axes[_row, _col]
+            for _condition in ["roundtrip", "control"]:
+                _subset = _window_df.filter(
+                    (pl.col("prng_mode") == _prng_mode)
+                    & (pl.col("condition") == _condition)
+                ).sort("step")
+                if len(_subset) == 0:
+                    continue
+                _subset_metric = _subset.filter(pl.col(_metric_key).is_not_null())
+                if len(_subset_metric) == 0:
+                    continue
+                _steps = _subset_metric["step"].to_numpy()
+                _values = _subset_metric[_metric_key].to_numpy()
+                _ema_values = _ema(_values, alpha=0.1)
+                _ax.plot(
+                    _steps,
+                    _values,
+                    "-",
+                    color=_colors[_condition],
+                    alpha=0.2,
+                    linewidth=0.5,
+                )
+                _ax.plot(
+                    _steps,
+                    _ema_values,
+                    "-",
+                    color=_colors[_condition],
+                    alpha=1.0,
+                    linewidth=1.5,
+                    label=_condition if _row == 0 else None,
+                )
+            _ax.axvline(500, color="black", linestyle="--", alpha=0.5)
+            _ax.axvline(1000, color="black", linestyle="--", alpha=0.5)
+            _ax.set_xlim(0, 1500)
+            _ax.grid(True, alpha=0.3)
+            if _row == 0:
+                _ax.set_title(_prng_mode)
+                _ax.legend(loc="upper right")
+            if _col == 0:
+                _ax.set_ylabel(_metric_label)
+            if _row == len(_metrics) - 1:
+                _ax.set_xlabel("Step")
+
+    _fig.suptitle("Idea 5: Roundtrip vs Control (steps 0-1500)")
+    _out_fpath = "docs/issues/006-resume-loss-jump/idea5-roundtrip.png"
+    _fig.savefig(_out_fpath, dpi=200)
+
+    _metric_cols = [k for k, _ in _metrics]
+    _csv_df = (
+        _window_df
+        .filter(pl.col("prng_mode").is_in(_prng_modes))
+        .select(["prng_mode", "condition", "step"] + _metric_cols)
+        .sort(["prng_mode", "condition", "step"])
+    )
+    _csv_fpath = "docs/issues/006-resume-loss-jump/idea5-roundtrip.csv"
+    _csv_df.write_csv(_csv_fpath)
+
+    _fig
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Idea 5 Results
+
+    The in-process checkpoint roundtrip (save + immediate restore without restarting the process) shows **no discontinuity** at steps 500 and 1000. The roundtrip (red) and control (blue) curves track each other closely.
+
+    **Conclusion:** Checkpoint save/restore itself is not causing the loss jump. The issue must be related to process-level resume effects (dataloader restart, shuffle buffer refill, batch ordering, etc.).
+    """)
     return
 
 

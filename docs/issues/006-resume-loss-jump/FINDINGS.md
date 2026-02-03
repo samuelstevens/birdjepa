@@ -1,6 +1,6 @@
 # Training Loss Jumps at Checkpoint Resume
 
-Last updated: 2026-02-02
+Last updated: 2026-02-03
 
 # Summary
 
@@ -151,7 +151,23 @@ Manual analysis in notebook after runs complete. Compare loss_pr/loss_ce around 
 
 ## Results
 
-TBD (not run yet).
+Data: `docs/issues/006-resume-loss-jump/idea5-roundtrip.csv` and `docs/issues/006-resume-loss-jump/idea5-roundtrip-step{500,1000,1500}.png`.
 
-- If the roundtrip is continuous, we should focus on mitigating data-stream changes across preemption resumes (loader state + shuffle warmup), not checkpoint restore correctness.
-- If the roundtrip produces a jump, then we should focus on checkpoint restore correctness (Orbax save/restore, numpy conversion, missing non-parameter state).
+Main result: the in-process save->restore roundtrip does not reproduce the large loss discontinuities seen under true preemption resumes.
+
+- Note: `idea5-roundtrip.csv` only contains the stateless + checkpointed PRNG modes (no `no_stochastic` rows in this export).
+- No discrete loss discontinuity at the in-process roundtrip steps (500 and 1000). Loss changes across the 10-step window (center-5 -> center+5) are small and not consistently larger under roundtrip than control:
+
+| Window | PRNG mode | Control d_loss_pr / d_loss_ce | Roundtrip d_loss_pr / d_loss_ce |
+|---|---|---:|---:|
+| 495->505 (around step 500) | stateless | +0.300 / +0.268 | +0.048 / +0.022 |
+| 495->505 (around step 500) | checkpointed | +0.131 / +0.244 | +0.169 / +0.098 |
+| 995->1005 (around step 1000) | stateless | +0.068 / +0.098 | +0.073 / +0.089 |
+| 995->1005 (around step 1000) | checkpointed | -0.081 / -0.041 | +0.008 / -0.051 |
+
+- By step 1500 the runs have drifted substantially (roundtrip-control at step 1500), but this looks like smooth trajectory divergence rather than a sharp jump at the roundtrip boundary:
+  - stateless: loss_pr -0.969, loss_ce -0.948
+  - checkpointed: loss_pr +0.273, loss_ce +0.282
+- Optimizer-state diagnostics are "boring" (good sign): `opt_state_abs_max` is constant (4.775) and `opt_state_l2`/`opt_state_abs_mean` evolve smoothly with no visible kinks at the roundtrip steps.
+
+Conclusion: the big loss jumps are unlikely to be caused by Orbax serialization/restore itself; focus should remain on process-level resume effects (Rust dataloader restart, cold shuffle buffer, PRNG/worker nondeterminism, etc.).

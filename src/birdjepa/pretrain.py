@@ -646,11 +646,10 @@ def worker_fn(cfg: Config):
     debug_roundtrip_steps_set: set[int] = set()
     debug_roundtrip_mngr = None
     if cfg.debug_roundtrip_steps:
-        for s in cfg.debug_roundtrip_steps:
-            assert s > 0, f"debug_roundtrip_steps must be > 0, got {s}"
-            assert s <= cfg.n_steps, (
-                f"debug_roundtrip_steps must be <= n_steps ({cfg.n_steps}), got {s}"
-            )
+        msg = f"debug_roundtrip_steps must be > 0, got {cfg.debug_roundtrip_steps}"
+        assert all(s > 0 for s in cfg.debug_roundtrip_steps), msg
+        msg = f"debug_roundtrip_steps must be <= n_steps ({cfg.n_steps}), got {cfg.debug_roundtrip_steps}"
+        assert all(s <= cfg.n_steps for s in cfg.debug_roundtrip_steps), msg
         debug_roundtrip_steps_set = set(cfg.debug_roundtrip_steps)
         assert wandb.run is not None, "wandb.run must be initialized"
         debug_ckpt_dir = pathlib.Path(wandb.run.dir) / "debug_ckpt"
