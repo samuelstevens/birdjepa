@@ -378,6 +378,7 @@ class RustXenoCantoLoader:
         ds = datasets.load_dataset("samuelstevens/BirdSet", cfg.subset, split=cfg.split)
         arrow_fpaths = [f["filename"] for f in ds.cache_files]
         assert arrow_fpaths, f"No Arrow files found for {cfg.subset}/{cfg.split}"
+        self._n_shards = len(arrow_fpaths)
 
         # Get class labels for int2str conversion
         self._class_labels = ds.features["ebird_code"]
@@ -416,6 +417,10 @@ class RustXenoCantoLoader:
     def __len__(self) -> int:
         return self._n_samples
 
+    @property
+    def n_shards(self) -> int:
+        return self._n_shards
+
     def __getitem__(self, idx: int) -> dict:
         raise NotImplementedError(
             f"RustXenoCantoLoader does not support __getitem__ (idx={idx}); use IndexedXenoCantoDataset for random access"
@@ -452,6 +457,7 @@ class RustXenoCantoLoader:
         spec_flat = batch["spectrogram"]  # [B, n_mels * n_frames]
         labels = batch["labels"]  # [B]
         indices = batch["indices"]  # [B]
+        shard_ids = batch["shard_ids"]  # [B]
         n_mels = batch["n_mels"]  # 128
         n_frames = batch["n_frames"]  # 498 for 5s audio
 
@@ -488,10 +494,15 @@ class RustXenoCantoLoader:
             for lbl in labels
         ]
 
+        msg = f"shard_ids out of range: [{shard_ids.min()}, {shard_ids.max()}] not in [0, {self._n_shards})"
+        assert shard_ids.min() >= 0, msg
+        assert shard_ids.max() < self._n_shards, msg
+
         return {
             "data": spec.astype(np.float32),
             # Converts list to numpy; None values stay as object dtype
             "target": np.asarray(labels),
             "label": str_labels,
             "index": indices,
+            "shard_id": shard_ids,
         }

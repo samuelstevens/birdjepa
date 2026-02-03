@@ -29,6 +29,7 @@ struct RawSample {
     audio_bytes: Vec<u8>,
     label: Option<i64>,
     index: i64,
+    shard_id: i64,
     seed: u64,
 }
 
@@ -37,6 +38,7 @@ struct ProcessedSample {
     spectrogram: Vec<f32>,
     label: Option<i64>,
     index: i64,
+    shard_id: i64,
 }
 
 /// Pipeline statistics for diagnostics.
@@ -428,6 +430,7 @@ impl Loader {
 
         let mut spec_data = vec![0.0f32; batch_size * spec_len];
         let mut index_data = Vec::with_capacity(batch_size);
+        let mut shard_id_data = Vec::with_capacity(batch_size);
 
         // Build labels as Python list to support None values
         let labels = PyList::empty(py);
@@ -437,17 +440,20 @@ impl Loader {
                 .copy_from_slice(&sample.spectrogram[..src_len]);
             labels.append(sample.label)?;
             index_data.push(sample.index);
+            shard_id_data.push(sample.shard_id);
         }
 
         let spectrogram = PyArray1::from_vec(py, spec_data)
             .reshape([batch_size, spec_len])
             .expect("reshape failed");
         let indices = PyArray1::from_vec(py, index_data);
+        let shard_ids = PyArray1::from_vec(py, shard_id_data);
 
         let dict = PyDict::new(py);
         dict.set_item("spectrogram", spectrogram)?;
         dict.set_item("labels", labels)?;
         dict.set_item("indices", indices)?;
+        dict.set_item("shard_ids", shard_ids)?;
         dict.set_item("n_mels", n_mels)?;
         dict.set_item("n_frames", n_frames)?;
 
@@ -505,7 +511,15 @@ fn io_thread_main(
 
                 match sample_result {
                     Ok(sample) => {
-                        if !send_sample(&raw_tx, &shutdown, sample, epoch_seed, augment, &stats) {
+                        if !send_sample(
+                            &raw_tx,
+                            &shutdown,
+                            sample,
+                            file_idx as i64,
+                            epoch_seed,
+                            augment,
+                            &stats,
+                        ) {
                             return;
                         }
                         n_sent += 1;
@@ -533,6 +547,7 @@ fn send_sample(
     raw_tx: &Sender<RawSample>,
     shutdown: &Arc<AtomicBool>,
     sample: Sample,
+    shard_id: i64,
     epoch_seed: u64,
     augment: bool,
     stats: &Arc<PipelineStats>,
@@ -541,6 +556,7 @@ fn send_sample(
         audio_bytes: sample.audio_bytes,
         label: sample.label,
         index: sample.index,
+        shard_id,
         seed: if augment {
             epoch_seed.wrapping_add(sample.index as u64)
         } else {
@@ -625,6 +641,7 @@ fn worker_thread_main(
             spectrogram: spec,
             label: raw.label,
             index: raw.index,
+            shard_id: raw.shard_id,
         };
 
         if !shuffle_buffer.push(processed) {

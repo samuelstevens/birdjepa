@@ -1,3 +1,4 @@
+import collections
 import dataclasses
 import logging
 import os
@@ -678,16 +679,146 @@ def worker_fn(cfg: Config):
             infinite=True,
         )
 
+    # IID sampling diagnostics (computed every step; logged every log_every)
+    n_buckets = 256
+    n_buckets_overlap = 4096
+    dataset_size = len(train_loader)
+    n_shards = train_loader.n_shards
+
+    prev_bucket_hist_mod: np.ndarray | None = None
+    prev_bucket_hist_div: np.ndarray | None = None
+    prev_bucket_hist_hash: np.ndarray | None = None
+    prev_bucket_hist_overlap: np.ndarray | None = None
+    prev_shard_hist: np.ndarray | None = None
+    prev_unique_i: np.ndarray | None = None
+    prev_unique_counts: np.ndarray | None = None
+
+    window_size = 100
+    index_window: collections.deque[set[int]] = collections.deque()
+    window_counts: dict[int, int] = {}
+
+    def compute_bucket_hist(
+        indices: np.ndarray, method: str, *, n_buckets: int
+    ) -> np.ndarray:
+        if method == "mod":
+            buckets = indices % n_buckets
+        elif method == "div":
+            bucket_size = max(1, dataset_size // n_buckets)
+            buckets = np.clip(indices // bucket_size, 0, n_buckets - 1)
+        elif method == "hash":
+            buckets = (indices.astype(np.uint64) * 2654435761) % n_buckets
+            buckets = buckets.astype(np.int64)
+        else:
+            raise ValueError(f"Unknown bucket method: {method}")
+
+        return np.bincount(buckets, minlength=n_buckets).astype(np.float64)
+
+    def chi_sq_uniform(hist: np.ndarray) -> float:
+        n = float(hist.sum())
+        if n == 0.0:
+            return 0.0
+        expected = n / float(hist.size)
+        return float(np.sum((hist - expected) ** 2 / expected))
+
+    def hist_acf(hist: np.ndarray, prev_hist: np.ndarray | None) -> float:
+        if prev_hist is None:
+            return 1.0
+
+        h1 = hist - hist.mean()
+        h2 = prev_hist - prev_hist.mean()
+        denom = np.sqrt((h1**2).sum() * (h2**2).sum())
+        if denom < 1e-10:
+            return 1.0
+        return float((h1 * h2).sum() / denom)
+
     # TODO: total is wrong when resuming (should be cfg.n_steps - step)
     last_step_time = time.time()
     train_iter = iter(train_loader)
     while step < cfg.n_steps:
-        batch = next(train_iter)
+        batch_raw = next(train_iter)
+        indices_np = batch_raw["index"]
+        shard_ids_np = batch_raw["shard_id"]
 
         # Store targets for entropy computation (only computed when logging)
-        targets_np = batch["target"]
+        targets_np = batch_raw["target"]
 
-        batch = _batch_to_device(batch, data_sharding)
+        bucket_hist_mod = compute_bucket_hist(indices_np, "mod", n_buckets=n_buckets)
+        bucket_hist_div = compute_bucket_hist(indices_np, "div", n_buckets=n_buckets)
+        bucket_hist_hash = compute_bucket_hist(indices_np, "hash", n_buckets=n_buckets)
+        bucket_hist_overlap = compute_bucket_hist(
+            indices_np,
+            "hash",
+            n_buckets=n_buckets_overlap,
+        )
+        shard_hist = np.bincount(shard_ids_np, minlength=n_shards).astype(np.float64)
+
+        indices_unique, indices_counts = np.unique(indices_np, return_counts=True)
+        n_unique = int(indices_unique.size)
+
+        overlap_exact = 0
+        if prev_unique_i is not None and prev_unique_counts is not None:
+            _, curr_i, prev_i = np.intersect1d(
+                indices_unique,
+                prev_unique_i,
+                return_indices=True,
+            )
+            overlap_exact = int(
+                np.minimum(indices_counts[curr_i], prev_unique_counts[prev_i]).sum()
+            )
+
+        overlap_bucket = 0
+        if prev_bucket_hist_overlap is not None:
+            overlap_bucket = int(
+                np.minimum(bucket_hist_overlap, prev_bucket_hist_overlap).sum()
+            )
+
+        indices_set = {int(i) for i in indices_unique}
+        if len(index_window) == window_size:
+            removed = index_window.popleft()
+            for i in removed:
+                n = window_counts[i]
+                if n == 1:
+                    del window_counts[i]
+                else:
+                    window_counts[i] = n - 1
+
+        index_window.append(indices_set)
+        for i in indices_set:
+            window_counts[i] = window_counts.get(i, 0) + 1
+
+        n_unique_window = len(window_counts)
+        w_batches = len(index_window)
+        actual_batch_size = int(len(indices_np))
+        expected_unique_iid = dataset_size * (
+            1 - (1 - 1 / dataset_size) ** (w_batches * actual_batch_size)
+        )
+
+        dataloader_metrics = {
+            "bucket_chi_sq_mod": chi_sq_uniform(bucket_hist_mod),
+            "bucket_chi_sq_div": chi_sq_uniform(bucket_hist_div),
+            "bucket_chi_sq_hash": chi_sq_uniform(bucket_hist_hash),
+            "bucket_acf_mod_lag1": hist_acf(bucket_hist_mod, prev_bucket_hist_mod),
+            "bucket_acf_div_lag1": hist_acf(bucket_hist_div, prev_bucket_hist_div),
+            "bucket_acf_hash_lag1": hist_acf(bucket_hist_hash, prev_bucket_hist_hash),
+            "shard_chi_sq": chi_sq_uniform(shard_hist),
+            "shard_acf_lag1": hist_acf(shard_hist, prev_shard_hist),
+            "n_unique_indices": n_unique,
+            "overlap_exact": overlap_exact,
+            "overlap_bucket": overlap_bucket,
+            "n_unique_window": n_unique_window,
+            "expected_unique_iid": expected_unique_iid,
+            "actual_batch_size": actual_batch_size,
+        }
+
+        prev_bucket_hist_mod = bucket_hist_mod
+        prev_bucket_hist_div = bucket_hist_div
+        prev_bucket_hist_hash = bucket_hist_hash
+        prev_bucket_hist_overlap = bucket_hist_overlap
+        prev_shard_hist = shard_hist
+        prev_unique_i = indices_unique
+        prev_unique_counts = indices_counts
+
+        batch = _batch_to_device(batch_raw, data_sharding)
 
         if cfg.prng_mode == "stateless":
             step_key = jr.fold_in(base_key, step)
@@ -880,6 +1011,8 @@ def worker_fn(cfg: Config):
                     log_dict[f"train/{k}"] = float(v)
 
             # Dataloader diagnostics
+            for k, v in dataloader_metrics.items():
+                log_dict[f"dataloader/{k}"] = v
             for k, v in train_loader.diagnostics().items():
                 log_dict[f"dataloader/{k}"] = v
 
