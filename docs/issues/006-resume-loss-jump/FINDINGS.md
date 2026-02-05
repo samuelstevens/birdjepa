@@ -257,7 +257,9 @@ self._n_shards = len(arrow_fpaths)  # No Rust API change needed
 In `RustXenoCantoLoader._postprocess()`, pass through `shard_ids` with validation:
 ```python
 shard_ids = batch["shard_ids"]
-assert shard_ids.max() < self._n_shards, f"shard_id {shard_ids.max()} >= n_shards {self._n_shards}"
+assert shard_ids.max() < self._n_shards, (
+    f"shard_id {shard_ids.max()} >= n_shards {self._n_shards}"
+)
 
 return {
     "data": spec.astype(np.float32),
@@ -299,7 +301,9 @@ index_window: collections.deque[set[int]] = collections.deque(maxlen=window_size
 
 Add helper functions:
 ```python
-def compute_bucket_hist(indices: np.ndarray, method: str, n_buckets: int, dataset_size: int) -> np.ndarray:
+def compute_bucket_hist(
+    indices: np.ndarray, method: str, n_buckets: int, dataset_size: int
+) -> np.ndarray:
     if method == "mod":
         buckets = indices % n_buckets
     elif method == "div":
@@ -313,6 +317,7 @@ def compute_bucket_hist(indices: np.ndarray, method: str, n_buckets: int, datase
         raise ValueError(f"Unknown bucket method: {method}")
     return np.bincount(buckets, minlength=n_buckets).astype(np.float64)
 
+
 def chi_sq_uniform(hist: np.ndarray) -> float:
     n = hist.sum()
     if n == 0:
@@ -320,12 +325,13 @@ def chi_sq_uniform(hist: np.ndarray) -> float:
     expected = n / len(hist)
     return float(np.sum((hist - expected) ** 2 / expected))
 
+
 def hist_acf(hist: np.ndarray, prev_hist: np.ndarray | None) -> float:
     if prev_hist is None:
         return 1.0  # Self-correlation sentinel for first step
     h1 = hist - hist.mean()
     h2 = prev_hist - prev_hist.mean()
-    denom = np.sqrt((h1 ** 2).sum() * (h2 ** 2).sum())
+    denom = np.sqrt((h1**2).sum() * (h2**2).sum())
     if denom < 1e-10:
         return 1.0
     return float((h1 * h2).sum() / denom)
@@ -342,7 +348,9 @@ bucket_hist_div = compute_bucket_hist(indices_np, "div", n_buckets, dataset_size
 bucket_hist_hash = compute_bucket_hist(indices_np, "hash", n_buckets, dataset_size)
 
 # Separate 4096-bucket histogram for overlap (less collision noise)
-bucket_hist_overlap = compute_bucket_hist(indices_np, "hash", n_buckets_overlap, dataset_size)
+bucket_hist_overlap = compute_bucket_hist(
+    indices_np, "hash", n_buckets_overlap, dataset_size
+)
 
 # Shard histogram
 shard_hist = np.bincount(shard_ids_np, minlength=n_shards).astype(np.float64)
@@ -355,10 +363,16 @@ n_unique = len(indices_unique)
 if prev_indices_counts is not None:
     shared_indices = np.intersect1d(indices_unique, list(prev_indices_counts.keys()))
     curr_counts = dict(zip(indices_unique, indices_counts))
-    overlap_exact = sum(min(curr_counts[i], prev_indices_counts[i]) for i in shared_indices)
+    overlap_exact = sum(
+        min(curr_counts[i], prev_indices_counts[i]) for i in shared_indices
+    )
 else:
     overlap_exact = 0
-overlap_bucket = int(np.minimum(bucket_hist_overlap, prev_bucket_hist_overlap).sum()) if prev_bucket_hist_overlap is not None else 0
+overlap_bucket = (
+    int(np.minimum(bucket_hist_overlap, prev_bucket_hist_overlap).sum())
+    if prev_bucket_hist_overlap is not None
+    else 0
+)
 
 # Sliding window uniqueness (uses set for unique count only)
 index_window.append(set(indices_unique))
@@ -366,7 +380,9 @@ all_indices_in_window = set().union(*index_window)
 n_unique_window = len(all_indices_in_window)
 # Expected under IID: N * (1 - (1 - 1/N)^(W*B))
 w_batches = len(index_window)
-expected_unique_iid = dataset_size * (1 - (1 - 1/dataset_size) ** (w_batches * cfg.batch_size))
+expected_unique_iid = dataset_size * (
+    1 - (1 - 1 / dataset_size) ** (w_batches * cfg.batch_size)
+)
 
 log_dict.update({
     "dataloader/bucket_chi_sq_mod": chi_sq_uniform(bucket_hist_mod),
@@ -374,7 +390,9 @@ log_dict.update({
     "dataloader/bucket_chi_sq_hash": chi_sq_uniform(bucket_hist_hash),
     "dataloader/bucket_acf_mod_lag1": hist_acf(bucket_hist_mod, prev_bucket_hist_mod),
     "dataloader/bucket_acf_div_lag1": hist_acf(bucket_hist_div, prev_bucket_hist_div),
-    "dataloader/bucket_acf_hash_lag1": hist_acf(bucket_hist_hash, prev_bucket_hist_hash),
+    "dataloader/bucket_acf_hash_lag1": hist_acf(
+        bucket_hist_hash, prev_bucket_hist_hash
+    ),
     "dataloader/shard_chi_sq": chi_sq_uniform(shard_hist),
     "dataloader/shard_acf_lag1": hist_acf(shard_hist, prev_shard_hist),
     "dataloader/n_unique_indices": n_unique,
@@ -455,4 +473,35 @@ Qualitative:
 
 ## Results
 
-(Pending experiment)
+### Runs analyzed (many resumptions via low `n_hours`)
+
+These runs are the ones used in `docs/issues/006-resume-loss-jump/idea6-dataloader-metrics.png`.
+
+| Seed | W&B run_id | Slurm job_id |
+|---:|---|---:|
+| 1 | eju0jfrh | 3509298 |
+| 2 | hvgpkgyx | 3509299 |
+| 3 | ywi8293i | 3509300 |
+
+Artifacts:
+- Config snapshot: `docs/issues/006-resume-loss-jump/idea6-config.csv`
+- Per-step metrics export: `docs/issues/006-resume-loss-jump/idea6-dataloader.csv`
+- Overview plot: `docs/issues/006-resume-loss-jump/idea6-dataloader-metrics.png`
+- Zoom plots: `docs/issues/006-resume-loss-jump/idea6-zoom-resume*.png`
+
+Key observations:
+- The Rust loader is far from IID: shard histogram ACF lag-1 is ~0.8 and bucket-division ACF lag-1 is ~0.8, indicating strong temporal correlation and shard-level clustering.
+- Sliding-window uniqueness `n_unique_window` tracks the maximum possible for W=100 (i.e., near W*B) and is consistently above `expected_unique_iid`, indicating the sampler is closer to quasi-without-replacement than with-replacement.
+- Around some resume boundaries (notably ~2005 and ~4505), shard chi-squared and bucket-division chi-squared shift substantially, consistent with a cold-start / different-stream-position effect when the Rust loader process restarts.
+
+Conclusion: resume events change the effective sampling distribution (shard mix + temporal correlation), and these shifts coincide with (and plausibly drive) the large loss discontinuities.
+
+### Runs queued (rerun)
+
+Sweep file: `docs/issues/006-resume-loss-jump/idea6_iid_diagnostics.py`.
+
+| Seed | W&B run_id | Slurm job_id |
+|---:|---|---:|
+| 1 | w9cvxoag | 3504066 |
+| 2 | ug3nudi5 | 3504067 |
+| 3 | dzldvhb2 | 3504068 |
